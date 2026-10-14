@@ -1,4 +1,4 @@
--- GenWorx AP Assistant initial schema based on supplied LLD.
+Get-ChildItem C:\Users\User\Desktop\AP\AP-Core\src\api\rest\routers -Name-- GenWorx AP Assistant initial schema based on supplied LLD.
 -- Local/sample-data use only. UUID PK and standard audit columns on each business table.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 

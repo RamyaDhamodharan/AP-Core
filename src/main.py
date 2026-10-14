@@ -1,12 +1,10 @@
-from fastapi import FastAPI
 
-app = FastAPI(
-    title="GenWorx AP Core Service",
-    version="0.1.0",
-    description="Document ingestion, AP processing, matching and review API.",
-)
+import uvicorn
 
-
-@app.get("/health", summary="AP Core health", description="Returns service health.")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "ap-core"}
+if __name__ == "__main__":
+    uvicorn.run(
+        "src.api.rest.app:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+    )

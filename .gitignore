@@ -13,3 +13,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+*.egg-info/
+build/
