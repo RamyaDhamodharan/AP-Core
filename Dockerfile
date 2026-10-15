@@ -12,9 +12,8 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --locked --no-dev --extra documents
-
-COPY src ./src
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir ".[documents]"
 
 EXPOSE 8000
 

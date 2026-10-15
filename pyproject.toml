@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-documents = ["docling"]
 dev = ["pytest", "httpx", "ruff", "mypy"]
+documents = ["docling"]
 
 [tool.ruff]
 line-length = 88
@@ -40,3 +40,4 @@ python_version = "3.11"
 strict = true
 disallow_untyped_defs = true
 no_implicit_optional = true
+
