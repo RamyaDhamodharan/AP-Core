@@ -4,8 +4,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TYPE user_role AS ENUM ('associate', 'admin');
 CREATE TYPE doc_type AS ENUM ('po', 'invoice', 'other');
-CREATE TYPE doc_status AS ENUM ('received', 'parsing', 'classified', 'extracted', 'needs_vendor_review', 'processed', 'ignored', 'incomplete', 'duplicate_blocked', 'failed');
-CREATE TYPE match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'ready_for_review', 'match_issues', 'no_match');
+CREATE TYPE doc_status AS ENUM ('received', 'parsing', 'parsed', 'classified', 'extracted', 'needs_vendor_review', 'processed', 'ignored', 'incomplete', 'duplicate_blocked', 'failed');CREATE TYPE match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'ready_for_review', 'match_issues', 'no_match');
 CREATE TYPE match_result AS ENUM ('match_ok', 'match_issues', 'no_match');
 CREATE TYPE review_decision AS ENUM ('approved', 'rejected', 'on_hold');
 CREATE TYPE step_result AS ENUM ('success', 'warning', 'error');

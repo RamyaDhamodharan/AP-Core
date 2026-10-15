@@ -28,6 +28,7 @@ class Document(Base):
     ENUM(
         "received",
         "parsing",
+        "parsed",
         "classified",
         "extracted",
         "needs_vendor_review",

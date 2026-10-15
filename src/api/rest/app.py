@@ -1,7 +1,8 @@
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.rest.routers import vendors
+from src.api.rest.routers import document_router, vendors
 
 app = FastAPI(
     title="GenWorx AP Core Service",
@@ -16,6 +17,7 @@ def health_check():
 
 
 app.include_router(vendors.router)
+app.include_router(document_router.router)
 
 app.add_middleware(
     CORSMiddleware,

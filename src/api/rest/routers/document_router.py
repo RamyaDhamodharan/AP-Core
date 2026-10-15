@@ -1,5 +1,6 @@
-
+# Hot reload test
 import hashlib
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -27,17 +28,27 @@ async def upload_document(
     extension = Path(filename).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type",
+        )
 
     content = await file.read(MAX_FILE_SIZE + 1)
 
     if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty",
+        )
 
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 20 MB limit")
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds 20 MB limit",
+        )
 
     file_hash = hashlib.sha256(content).hexdigest()
+
     existing = db.query(Document).filter_by(file_hash=file_hash).first()
 
     if existing:
@@ -48,6 +59,7 @@ async def upload_document(
         }
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
     document_id = uuid.uuid4()
     storage_path = UPLOAD_DIR / f"{document_id}{extension}"
     storage_path.write_bytes(content)
@@ -64,10 +76,16 @@ async def upload_document(
         db.add(document)
         db.commit()
         db.refresh(document)
+
     except IntegrityError:
         db.rollback()
         storage_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=409, detail="Duplicate file upload") from None
+
+        raise HTTPException(
+            status_code=409,
+            detail="Duplicate file upload",
+        ) from None
+
     except Exception:
         db.rollback()
         storage_path.unlink(missing_ok=True)
@@ -79,6 +97,7 @@ async def upload_document(
         "status": document.status,
     }
 
+
 @router.post("/{document_id}/parse")
 def parse_document(
     document_id: uuid.UUID,
@@ -89,10 +108,16 @@ def parse_document(
     document = db.query(Document).filter_by(id=document_id).first()
 
     if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
 
     if not document.storage_path or not Path(document.storage_path).is_file():
-        raise HTTPException(status_code=404, detail="Stored file not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Stored file not found",
+        )
 
     try:
         document.status = "parsing"
@@ -102,11 +127,13 @@ def parse_document(
         result = converter.convert(document.storage_path)
         raw_text = result.document.export_to_text()
 
-        if not raw_text.strip():
+        if not raw_text or not raw_text.strip():
             raise ValueError("No text could be extracted from the document")
 
         document.raw_text = raw_text
         document.status = "parsed"
+        document.failure_message = None
+
         db.commit()
         db.refresh(document)
 
@@ -117,12 +144,24 @@ def parse_document(
         }
 
     except Exception as exc:
+        logging.exception(
+            "Document parsing failed for %s",
+            document_id,
+        )
+
         db.rollback()
-        document = db.query(Document).filter_by(id=document_id).first()
-        if document:
-            document.status = "failed"
-            document.failure_message = str(exc)[:500]
-            db.commit()
+
+        try:
+            document = db.query(Document).filter_by(id=document_id).first()
+
+            if document:
+                document.status = "failed"
+                document.failure_message = str(exc)[:500]
+                db.commit()
+
+        except Exception:
+            db.rollback()
+            logging.exception("Failed to update document failure status")
 
         raise HTTPException(
             status_code=500,
