@@ -1,6 +1,15 @@
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 
-from src.api.rest.app import app
+CORE_ROOT = Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(CORE_ROOT))
+load_dotenv(CORE_ROOT / ".env")
+
+from src.api.rest.app import app  # noqa: E402
 
 client = TestClient(app)
 
