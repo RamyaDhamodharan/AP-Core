@@ -71,9 +71,15 @@ def test_parse_document_success(monkeypatch):
         document_router,
         "extract_document",
         lambda text, doc_type: {
-            "invoice_number": "INV-101",
-            "total": 1500,
-        },
+    "document_type": "invoice",
+    "vendor": "ABC Supplies",
+    "invoice_number": "INV-101",
+    "invoice_date": "2026-10-01",
+    "subtotal": 1500,
+    "tax": 0,
+    "total": 1500,
+    "line_items": [],
+}
     )
 
     # Override FastAPI database dependency
@@ -99,8 +105,14 @@ def test_parse_document_success(monkeypatch):
     assert document.status == "extracted"
     assert document.doc_type == "invoice"
     assert document.extracted_json == {
+        "document_type": "invoice",
+        "vendor": "ABC Supplies",
         "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "subtotal": 1500,
+        "tax": 0,
         "total": 1500,
+        "line_items": [],
     }
 
 def test_parse_document_not_found(monkeypatch):

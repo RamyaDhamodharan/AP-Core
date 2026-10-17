@@ -3,7 +3,8 @@ import json
 import logging
 import os
 from typing import Any
-
+from decimal import Decimal, InvalidOperation
+import re
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -208,3 +209,184 @@ def extract_document(
         api_key,
         fallback_model,
     )
+def _to_decimal(value: Any) -> Decimal | None:
+    """Convert a monetary value into Decimal safely."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            result = Decimal(str(value))
+            return result if result.is_finite() else None
+        except InvalidOperation:
+            return None
+
+    if isinstance(value, str):
+        cleaned = re.sub(r"[₹$€£,\s]", "", value.strip())
+        cleaned = cleaned.replace("(", "-").replace(")", "")
+
+        try:
+            result = Decimal(cleaned)
+            return result if result.is_finite() else None
+        except InvalidOperation:
+            return None
+
+    return None
+
+
+def validate_extracted_data(
+    data: dict[str, Any],
+    doc_type: str,
+) -> list[str]:
+    """Return review issues without modifying extracted values."""
+    issues: list[str] = []
+
+    if not isinstance(data, dict):
+        return ["Extracted data must be a JSON object"]
+
+    if doc_type not in DOCUMENT_TYPES:
+        return [f"Unsupported document type: {doc_type}"]
+
+    # Validate the document type returned by the extractor, if present.
+    extracted_type = data.get("document_type")
+    if extracted_type is not None:
+        normalized_type = str(extracted_type).strip().lower()
+        aliases = {"purchase_order": "po", "purchase order": "po"}
+
+        if aliases.get(normalized_type, normalized_type) != doc_type:
+            issues.append(
+                f"Document type mismatch: expected {doc_type}"
+            )
+
+    if doc_type == "invoice":
+        required_fields = (
+            "vendor",
+            "invoice_number",
+            "invoice_date",
+            "total",
+        )
+    elif doc_type == "po":
+        required_fields = ("vendor", "order_number", "total")
+    else:
+        required_fields = ()
+
+    for field in required_fields:
+        value = data.get(field)
+        if value is None or (
+            isinstance(value, str) and not value.strip()
+        ):
+            issues.append(f"Missing required field: {field}")
+
+    amounts = {
+        field: _to_decimal(data.get(field))
+        for field in ("subtotal", "tax", "total")
+    }
+
+    for field, amount in amounts.items():
+        value = data.get(field)
+        if value is not None and amount is None:
+            issues.append(f"Invalid monetary value: {field}")
+
+    subtotal = amounts["subtotal"]
+    tax = amounts["tax"]
+    total = amounts["total"]
+
+    # Compare amounts only when all three values are available.
+    # Allow a one-cent rounding difference.
+    if subtotal is not None and tax is not None and total is not None:
+        if abs(subtotal + tax - total) > Decimal("0.01"):
+            issues.append(
+                "Amount mismatch: subtotal plus tax does not equal total"
+            )
+
+    line_items = data.get("line_items")
+    if line_items is not None:
+        if not isinstance(line_items, list):
+            issues.append("line_items must be a list")
+        else:
+            for index, item in enumerate(line_items):
+                if not isinstance(item, dict):
+                    issues.append(
+                        f"Line item {index + 1} must be an object"
+                    )
+
+    return issues
+
+def test_validate_extracted_data_accepts_valid_invoice():
+    data = {
+        "document_type": "invoice",
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "subtotal": 1500,
+        "tax": 0,
+        "total": 1500,
+        "line_items": [],
+    }
+
+    assert validate_extracted_data(data, "invoice") == []
+
+
+def test_validate_extracted_data_detects_missing_invoice_number():
+    data = {
+        "vendor": "ABC Supplies",
+        "invoice_date": "2026-10-01",
+        "total": 1500,
+    }
+
+    issues = validate_extracted_data(data, "invoice")
+
+    assert "Missing required field: invoice_number" in issues
+
+
+def test_validate_extracted_data_detects_amount_mismatch():
+    data = {
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "subtotal": 1000,
+        "tax": 100,
+        "total": 1200,
+    }
+
+    issues = validate_extracted_data(data, "invoice")
+
+    assert "Amount mismatch: subtotal plus tax does not equal total" in issues
+
+
+def test_validate_extracted_data_detects_invalid_total():
+    data = {
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "total": "unknown",
+    }
+
+    issues = validate_extracted_data(data, "invoice")
+
+    assert "Invalid monetary value: total" in issues
+
+
+def test_validate_extracted_data_accepts_valid_purchase_order():
+    data = {
+        "document_type": "po",
+        "vendor": "ABC Supplies",
+        "order_number": "PO-101",
+        "total": 2500,
+    }
+
+    assert validate_extracted_data(data, "po") == []
+
+
+def test_validate_extracted_data_rejects_invalid_line_items():
+    data = {
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "total": 1500,
+        "line_items": "not-a-list",
+    }
+
+    issues = validate_extracted_data(data, "invoice")
+
+    assert "line_items must be a list" in issues

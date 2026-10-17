@@ -1,21 +1,31 @@
-﻿
-import hashlib
-
+﻿import hashlib
+import importlib
+import logging
 import os
 import tempfile
 import threading
 import uuid
-import logging
-import tempfile
-import uuid
 from pathlib import Path
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from minio.error import S3Error
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
 from ....db.session import SessionLocal, get_db
 from ....models.documents_models import Document
-from ....services.llm_pipeline import classify_document, extract_document
+from ....services.llm_pipeline import (
+    classify_document,
+    extract_document,
+    validate_extracted_data,
+)
 from ....storage.minio_storage import (
     upload_file,
     download_file,
@@ -251,9 +261,30 @@ def parse_document(
         # Step 4: Extract structured fields using Groq
         extracted_data = extract_document(raw_text, doc_type)
 
+        # Step 5: Validate extracted fields
+        validation_issues = validate_extracted_data(
+            extracted_data,
+            doc_type,
+        )
+
+        # Preserve the original extraction for manual review.
         document.extracted_json = extracted_data
-        document.status = "extracted"
-        document.failure_message = None
+
+        if validation_issues:
+            document.status = "needs_vendor_review"
+            document.failure_message = "; ".join(
+                validation_issues
+            )[:500]
+
+            logger.warning(
+                "Document %s requires review: %s",
+                document_id,
+                validation_issues,
+            )
+        else:
+            document.status = "extracted"
+            document.failure_message = None
+
         db.commit()
         db.refresh(document)
 
@@ -262,6 +293,7 @@ def parse_document(
             "status": document.status,
             "doc_type": document.doc_type,
             "extracted_json": document.extracted_json,
+            "validation_issues": validation_issues,
         }
 
     except Exception as exc:
