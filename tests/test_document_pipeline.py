@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
-from src.api.rest.routers import document_router
+from src.api.rest.routers import document_routers
 
 client = TestClient(app)
 
@@ -32,7 +32,7 @@ def test_parse_document_success(monkeypatch):
 
     # Mock file download from MinIO
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "download_file",
         lambda path: b"fake PDF content",
     )
@@ -62,13 +62,13 @@ def test_parse_document_success(monkeypatch):
 
     # Mock classification and extraction; no real LLM API calls
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "classify_document",
         lambda text: "invoice",
     )
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "extract_document",
         lambda text, doc_type: {
     "document_type": "invoice",
@@ -83,7 +83,7 @@ def test_parse_document_success(monkeypatch):
     )
 
     # Override FastAPI database dependency
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     app.dependency_overrides[get_db] = lambda: db
 
@@ -116,7 +116,7 @@ def test_parse_document_success(monkeypatch):
     }
 
 def test_parse_document_not_found(monkeypatch):
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = None
@@ -134,7 +134,7 @@ def test_parse_document_not_found(monkeypatch):
 
 
 def test_parse_document_download_failure(monkeypatch):
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
 
@@ -156,7 +156,7 @@ def test_parse_document_download_failure(monkeypatch):
         raise RuntimeError("MinIO download failed")
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "download_file",
         fail_download,
     )
@@ -174,7 +174,7 @@ def test_parse_document_download_failure(monkeypatch):
 
 
 def test_parse_document_classification_failure(monkeypatch):
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
 
@@ -193,7 +193,7 @@ def test_parse_document_classification_failure(monkeypatch):
     db.query.return_value.filter_by.return_value.first.return_value = document
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "download_file",
         lambda path: b"fake PDF content",
     )
@@ -221,7 +221,7 @@ def test_parse_document_classification_failure(monkeypatch):
         raise RuntimeError("Classification failed")
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "classify_document",
         fail_classification,
     )
@@ -239,7 +239,7 @@ def test_parse_document_classification_failure(monkeypatch):
 
 
 def test_parse_document_extraction_failure(monkeypatch):
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
 
@@ -258,7 +258,7 @@ def test_parse_document_extraction_failure(monkeypatch):
     db.query.return_value.filter_by.return_value.first.return_value = document
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "download_file",
         lambda path: b"fake PDF content",
     )
@@ -283,7 +283,7 @@ def test_parse_document_extraction_failure(monkeypatch):
     )
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "classify_document",
         lambda text: "invoice",
     )
@@ -292,7 +292,7 @@ def test_parse_document_extraction_failure(monkeypatch):
         raise RuntimeError("Extraction failed")
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "extract_document",
         fail_extraction,
     )
@@ -327,7 +327,7 @@ def test_duplicate_invoice_detected_for_same_vendor_and_number():
         doc_type="invoice",
     )
 
-    result = document_router._find_duplicate_invoice(
+    result = document_routers._find_duplicate_invoice(
         db,
         new_document,
         {
@@ -358,7 +358,7 @@ def test_duplicate_invoice_not_detected_for_different_vendor():
         doc_type="invoice",
     )
 
-    result = document_router._find_duplicate_invoice(
+    result = document_routers._find_duplicate_invoice(
         db,
         new_document,
         {
@@ -378,7 +378,7 @@ def test_duplicate_invoice_skipped_when_invoice_number_missing():
         doc_type="invoice",
     )
 
-    result = document_router._find_duplicate_invoice(
+    result = document_routers._find_duplicate_invoice(
         db,
         new_document,
         {
@@ -399,7 +399,7 @@ def test_duplicate_invoice_skipped_for_purchase_order():
         doc_type="po",
     )
 
-    result = document_router._find_duplicate_invoice(
+    result = document_routers._find_duplicate_invoice(
         db,
         new_document,
         {
@@ -412,7 +412,7 @@ def test_duplicate_invoice_skipped_for_purchase_order():
     db.query.assert_not_called()
 
 def test_parse_document_flags_duplicate_invoice(monkeypatch):
-    from src.db.session import get_db
+    from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
     existing_id = uuid.uuid4()
@@ -445,7 +445,7 @@ def test_parse_document_flags_duplicate_invoice(monkeypatch):
     ]
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "download_file",
         lambda path: b"fake PDF content",
     )
@@ -472,13 +472,13 @@ def test_parse_document_flags_duplicate_invoice(monkeypatch):
     )
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "classify_document",
         lambda text: "invoice",
     )
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "extract_document",
         lambda text, doc_type: {
             "document_type": "invoice",
@@ -493,7 +493,7 @@ def test_parse_document_flags_duplicate_invoice(monkeypatch):
     )
 
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "validate_extracted_data",
         lambda data, doc_type: [],
     )

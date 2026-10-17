@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
-from src.api.rest.routers import document_router
-from src.db.session import get_db
+from src.api.rest.routers import document_routers
+from src.db.session_db import get_db
 
 client = TestClient(app)
 
@@ -15,17 +15,17 @@ client = TestClient(app)
 def setup_db(monkeypatch, db):
     app.dependency_overrides[get_db] = lambda: db
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "upload_file",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "delete_file",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "_process_in_background",
         lambda *args, **kwargs: None,
     )
@@ -179,7 +179,7 @@ def test_upload_triggers_auto_processing(monkeypatch):
 
     started = []
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "_process_in_background",
         lambda document_id: started.append(document_id),
     )
@@ -204,7 +204,7 @@ def test_duplicate_upload_does_not_trigger_processing(monkeypatch):
 
     started = []
     monkeypatch.setattr(
-        document_router,
+        document_routers,
         "_process_in_background",
         lambda document_id: started.append(document_id),
     )
