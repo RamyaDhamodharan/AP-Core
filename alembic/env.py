@@ -9,8 +9,8 @@ from sqlalchemy import engine_from_config, pool
 
 load_dotenv()
 
-from src.models.vendor import Base
-from src.models import documents_models  # noqa: F401
+from src.models.vendor_models import Base
+from src.models import document_models  # noqa: F401
 
 
 config = context.config
@@ -64,3 +64,4 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
+

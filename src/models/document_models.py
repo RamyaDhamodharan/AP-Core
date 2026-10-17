@@ -7,7 +7,7 @@ from sqlalchemy import DateTime, String, Text, func, text
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.models.vendor import Base
+from src.models.vendor_models import Base
 
 
 class Document(Base):

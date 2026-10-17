@@ -2,7 +2,7 @@
 import httpx
 import pytest
 
-from src.services.llm_pipeline import (
+from src.services.llm_pipeline_services import (
     classify_document,
     extract_document,
     validate_extracted_data,
@@ -31,7 +31,7 @@ def test_classify_document_returns_invoice(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.services.llm_pipeline.httpx.post",
+        "src.services.llm_pipeline_services.httpx.post",
         mock_post,
     )
 
@@ -58,7 +58,7 @@ def test_classify_document_rejects_invalid_type(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.services.llm_pipeline.httpx.post",
+        "src.services.llm_pipeline_services.httpx.post",
         mock_post,
     )
 
@@ -90,7 +90,7 @@ def test_extract_document_returns_json(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.services.llm_pipeline.httpx.post",
+        "src.services.llm_pipeline_services.httpx.post",
         mock_post,
     )
 
@@ -131,7 +131,7 @@ def test_extract_document_uses_fallback_model(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "src.services.llm_pipeline.httpx.post",
+        "src.services.llm_pipeline_services.httpx.post",
         mock_post,
     )
 
@@ -152,7 +152,7 @@ def test_extract_document_raises_when_both_models_fail(monkeypatch):
         raise httpx.HTTPError("Model unavailable")
 
     monkeypatch.setattr(
-        "src.services.llm_pipeline.httpx.post",
+        "src.services.llm_pipeline_services.httpx.post",
         mock_post,
     )
 

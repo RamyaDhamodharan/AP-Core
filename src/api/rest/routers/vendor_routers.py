@@ -4,9 +4,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.api.rest.dependencies import get_current_user
-from src.db.session import get_db
-from src.models.vendor import Vendor
-from src.schemas.vendor import VendorCreate, VendorResponse
+from src.db.session_db import get_db
+from src.models.vendor_models import Vendor
+from src.schemas.vendor_schemas import VendorCreate, VendorResponse
 
 router = APIRouter(prefix="/api/vendors", tags=["Vendors"])
 
