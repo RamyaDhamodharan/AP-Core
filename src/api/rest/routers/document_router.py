@@ -2,6 +2,7 @@
 import importlib
 import logging
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -38,12 +39,13 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
-# Limit how many documents are processed at once (Docling + LLM are heavy).
+
+# Limit concurrent document processing.
 _PROCESS_SLOTS = threading.BoundedSemaphore(
     int(os.getenv("PROCESS_CONCURRENCY", "2"))
 )
 
-# Docling loads big models when created, so build one converter and reuse it.
+# Reuse Docling converters instead of creating one for every document.
 _converters: dict = {}
 
 
@@ -53,23 +55,103 @@ def _get_converter(converter_cls):
     return _converters[converter_cls]
 
 
+def _normalize_invoice_value(value: object) -> str:
+    """Normalize vendor names and invoice numbers for comparison."""
+    if value is None:
+        return ""
+
+    return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+
+def _find_duplicate_invoice(
+    db: Session,
+    document: Document,
+    extracted_data: dict,
+) -> Document | None:
+    """
+    Find an existing invoice with the same vendor and invoice number.
+
+    Comparison is case-insensitive and ignores extra whitespace.
+    """
+    if document.doc_type != "invoice":
+        return None
+
+    vendor = _normalize_invoice_value(
+        extracted_data.get("vendor")
+    )
+    invoice_number = _normalize_invoice_value(
+        extracted_data.get("invoice_number")
+    )
+
+    # Avoid matching documents when essential identifiers are missing.
+    if not vendor or not invoice_number:
+        return None
+
+    candidates = (
+        db.query(Document)
+        .filter(
+            Document.doc_type == "invoice",
+            Document.id != document.id,
+            Document.extracted_json.isnot(None),
+        )
+        .all()
+    )
+
+    for candidate in candidates:
+        data = candidate.extracted_json or {}
+
+        if not isinstance(data, dict):
+            continue
+
+        existing_vendor = _normalize_invoice_value(
+            data.get("vendor")
+        )
+        existing_number = _normalize_invoice_value(
+            data.get("invoice_number")
+        )
+
+        if (
+            existing_vendor == vendor
+            and existing_number == invoice_number
+        ):
+            return candidate
+
+    return None
+
+
 def _process_in_background(document_id: uuid.UUID) -> None:
-    """Auto-run parse -> classify -> extract right after upload."""
+    """Automatically run parsing, classification, and extraction."""
     with _PROCESS_SLOTS:
         db = SessionLocal()
+
         try:
-            document = db.query(Document).filter_by(id=document_id).first()
+            document = (
+                db.query(Document)
+                .filter_by(id=document_id)
+                .first()
+            )
+
             if document is None or document.status != "received":
-                return  # already handled
+                return
+
             parse_document(document_id=document_id, db=db)
+
         except HTTPException as exc:
             logger.error(
-                "Auto processing failed for %s: %s", document_id, exc.detail
+                "Auto processing failed for %s: %s",
+                document_id,
+                exc.detail,
             )
+
         except Exception:
-            logger.exception("Auto processing crashed for %s", document_id)
+            logger.exception(
+                "Auto processing crashed for %s",
+                document_id,
+            )
+
         finally:
             db.close()
+
 
 @router.post("/upload", status_code=201)
 async def upload_document(
@@ -100,9 +182,14 @@ async def upload_document(
             detail="File exceeds 20 MB limit",
         )
 
+    # Detect exact duplicate files using SHA-256.
     file_hash = hashlib.sha256(content).hexdigest()
 
-    existing = db.query(Document).filter_by(file_hash=file_hash).first()
+    existing = (
+        db.query(Document)
+        .filter_by(file_hash=file_hash)
+        .first()
+    )
 
     if existing:
         return {
@@ -120,8 +207,10 @@ async def upload_document(
             content,
             file.content_type or "application/octet-stream",
         )
+
     except Exception:
         logger.exception("MinIO upload failed")
+
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable. Check MinIO logs.",
@@ -146,7 +235,9 @@ async def upload_document(
         try:
             delete_file(storage_path)
         except Exception:
-            logger.exception("MinIO cleanup failed after duplicate upload")
+            logger.exception(
+                "MinIO cleanup failed after duplicate upload"
+            )
 
         raise HTTPException(
             status_code=409,
@@ -159,10 +250,17 @@ async def upload_document(
         try:
             delete_file(storage_path)
         except Exception:
-            logger.exception("MinIO cleanup failed after database error")
+            logger.exception(
+                "MinIO cleanup failed after database error"
+            )
 
         raise
-    background_tasks.add_task(_process_in_background, document.id)
+
+    background_tasks.add_task(
+        _process_in_background,
+        document.id,
+    )
+
     return {
         "id": str(document.id),
         "original_filename": document.original_filename,
@@ -175,7 +273,11 @@ def parse_document(
     document_id: uuid.UUID,
     db: Session = Depends(get_db),
 ):
-    document = db.query(Document).filter_by(id=document_id).first()
+    document = (
+        db.query(Document)
+        .filter_by(id=document_id)
+        .first()
+    )
 
     if not document:
         raise HTTPException(
@@ -193,13 +295,18 @@ def parse_document(
         content = download_file(document.storage_path)
 
     except S3Error as exc:
-        if exc.code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket"}:
+        if exc.code in {
+            "NoSuchKey",
+            "NoSuchObject",
+            "NoSuchBucket",
+        }:
             raise HTTPException(
                 status_code=404,
                 detail="Stored file not found",
             ) from None
 
         logger.exception("MinIO download failed")
+
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable",
@@ -207,6 +314,7 @@ def parse_document(
 
     except Exception:
         logger.exception("MinIO download failed")
+
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable",
@@ -215,9 +323,11 @@ def parse_document(
     temp_path = None
 
     try:
-        # Step 1: Prepare the document for parsing
+        # Step 1: Prepare the document for parsing.
         with tempfile.NamedTemporaryFile(
-            suffix=Path(document.original_filename).suffix.lower(),
+            suffix=Path(
+                document.original_filename
+            ).suffix.lower(),
             delete=False,
         ) as temp_file:
             temp_file.write(content)
@@ -227,28 +337,28 @@ def parse_document(
         document.failure_message = None
         db.commit()
 
-        # Step 2: Parse document using Docling
-        import importlib
-
+        # Step 2: Parse the document using Docling.
         DocumentConverter = importlib.import_module(
             "docling.document_converter"
         ).DocumentConverter
+
         converter = _get_converter(DocumentConverter)
         result = converter.convert(temp_path)
 
         raw_text = result.document.export_to_markdown()
 
         if not raw_text or not raw_text.strip():
-            raise ValueError("No text could be extracted from the document")
+            raise ValueError(
+                "No text could be extracted from the document"
+            )
 
         document.raw_text = raw_text
         document.status = "parsed"
         db.commit()
 
-        # Step 3: Classify document using OpenRouter
+        # Step 3: Classify the document using OpenRouter.
         doc_type = classify_document(raw_text)
 
-        # Supported database values: invoice, po, other
         if doc_type not in {"invoice", "po", "other"}:
             raise ValueError(
                 f"Unsupported document type returned: {doc_type}"
@@ -258,18 +368,32 @@ def parse_document(
         document.status = "classified"
         db.commit()
 
-        # Step 4: Extract structured fields using Groq
-        extracted_data = extract_document(raw_text, doc_type)
+        # Step 4: Extract structured fields using Groq.
+        extracted_data = extract_document(
+            raw_text,
+            doc_type,
+        )
 
-        # Step 5: Validate extracted fields
+        # Step 5: Validate the extracted fields.
         validation_issues = validate_extracted_data(
             extracted_data,
             doc_type,
         )
 
-        # Preserve the original extraction for manual review.
+        # Step 6: Check for semantic duplicate invoices.
+        duplicate_invoice = None
+
+        if doc_type == "invoice" and not validation_issues:
+            duplicate_invoice = _find_duplicate_invoice(
+                db,
+                document,
+                extracted_data,
+            )
+
+        # Preserve extracted data for review, including duplicates.
         document.extracted_json = extracted_data
 
+        # Step 7: Set the final status.
         if validation_issues:
             document.status = "needs_vendor_review"
             document.failure_message = "; ".join(
@@ -281,6 +405,21 @@ def parse_document(
                 document_id,
                 validation_issues,
             )
+
+        elif duplicate_invoice is not None:
+            document.status = "needs_vendor_review"
+            document.failure_message = (
+                "Possible duplicate invoice. "
+                f"Matches document ID: {duplicate_invoice.id}"
+            )[:500]
+
+            logger.warning(
+                "Possible duplicate invoice %s matches "
+                "existing document %s",
+                document.id,
+                duplicate_invoice.id,
+            )
+
         else:
             document.status = "extracted"
             document.failure_message = None
@@ -288,23 +427,35 @@ def parse_document(
         db.commit()
         db.refresh(document)
 
+        # Step 8: Return extraction and duplicate-check results.
         return {
             "id": str(document.id),
             "status": document.status,
             "doc_type": document.doc_type,
             "extracted_json": document.extracted_json,
             "validation_issues": validation_issues,
+            "duplicate_of": (
+                str(duplicate_invoice.id)
+                if duplicate_invoice is not None
+                else None
+            ),
         }
 
     except Exception as exc:
         logger.exception(
-            "Document parse/classification/extraction failed for %s",
+            "Document parse/classification/extraction failed "
+            "for %s",
             document_id,
         )
+
         db.rollback()
 
         try:
-            document = db.query(Document).filter_by(id=document_id).first()
+            document = (
+                db.query(Document)
+                .filter_by(id=document_id)
+                .first()
+            )
 
             if document:
                 document.status = "failed"
@@ -313,7 +464,9 @@ def parse_document(
 
         except Exception:
             db.rollback()
-            logger.exception("Failed to update document failure status")
+            logger.exception(
+                "Failed to update document failure status"
+            )
 
         raise HTTPException(
             status_code=500,
