@@ -24,6 +24,11 @@ def setup_db(monkeypatch, db):
         "delete_file",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        document_router,
+        "_process_in_background",
+        lambda *args, **kwargs: None,
+    )
 
 
 def teardown_db():
@@ -167,3 +172,49 @@ def test_upload_blocks_duplicate_file(monkeypatch):
 
     db.add.assert_not_called()
     db.commit.assert_not_called()
+def test_upload_triggers_auto_processing(monkeypatch):
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = None
+    setup_db(monkeypatch, db)
+
+    started = []
+    monkeypatch.setattr(
+        document_router,
+        "_process_in_background",
+        lambda document_id: started.append(document_id),
+    )
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.pdf", b"pdf bytes", "application/pdf")},
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 201
+    assert started == [uuid.UUID(response.json()["id"])]
+
+
+def test_duplicate_upload_does_not_trigger_processing(monkeypatch):
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = (
+        SimpleNamespace(id=uuid.uuid4())
+    )
+    setup_db(monkeypatch, db)
+
+    started = []
+    monkeypatch.setattr(
+        document_router,
+        "_process_in_background",
+        lambda document_id: started.append(document_id),
+    )
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.pdf", b"pdf bytes", "application/pdf")},
+        )
+    finally:
+        teardown_db()
+
+    assert response.json()["status"] == "duplicate_blocked"
+    assert started == []

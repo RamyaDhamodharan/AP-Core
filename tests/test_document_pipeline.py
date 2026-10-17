@@ -42,7 +42,7 @@ def test_parse_document_success(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_text=lambda: (
+                    export_to_markdown=lambda: (
                         "Supplier invoice INV-101. Total: 1500"
                     )
                 )
@@ -190,7 +190,7 @@ def test_parse_document_classification_failure(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_text=lambda: "Invoice INV-101. Total 1500"
+                    export_to_markdown=lambda: "Invoice INV-101. Total 1500"
                 )
             )
 
@@ -255,7 +255,7 @@ def test_parse_document_extraction_failure(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_text=lambda: "Invoice INV-101. Total 1500"
+                    export_to_markdown=lambda: "Invoice INV-101. Total 1500"
                 )
             )
 

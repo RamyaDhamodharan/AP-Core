@@ -1,16 +1,19 @@
 ﻿
 import hashlib
+
+import os
+import tempfile
+import threading
+import uuid
 import logging
 import tempfile
 import uuid
 from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from minio.error import S3Error
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
-from ....db.session import get_db
+from ....db.session import SessionLocal, get_db
 from ....models.documents_models import Document
 from ....services.llm_pipeline import classify_document, extract_document
 from ....storage.minio_storage import (
@@ -25,10 +28,42 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
+# Limit how many documents are processed at once (Docling + LLM are heavy).
+_PROCESS_SLOTS = threading.BoundedSemaphore(
+    int(os.getenv("PROCESS_CONCURRENCY", "2"))
+)
 
+# Docling loads big models when created, so build one converter and reuse it.
+_converters: dict = {}
+
+
+def _get_converter(converter_cls):
+    if converter_cls not in _converters:
+        _converters[converter_cls] = converter_cls()
+    return _converters[converter_cls]
+
+
+def _process_in_background(document_id: uuid.UUID) -> None:
+    """Auto-run parse -> classify -> extract right after upload."""
+    with _PROCESS_SLOTS:
+        db = SessionLocal()
+        try:
+            document = db.query(Document).filter_by(id=document_id).first()
+            if document is None or document.status != "received":
+                return  # already handled
+            parse_document(document_id=document_id, db=db)
+        except HTTPException as exc:
+            logger.error(
+                "Auto processing failed for %s: %s", document_id, exc.detail
+            )
+        except Exception:
+            logger.exception("Auto processing crashed for %s", document_id)
+        finally:
+            db.close()
 
 @router.post("/upload", status_code=201)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -117,7 +152,7 @@ async def upload_document(
             logger.exception("MinIO cleanup failed after database error")
 
         raise
-
+    background_tasks.add_task(_process_in_background, document.id)
     return {
         "id": str(document.id),
         "original_filename": document.original_filename,
@@ -188,10 +223,10 @@ def parse_document(
         DocumentConverter = importlib.import_module(
             "docling.document_converter"
         ).DocumentConverter
-        converter = DocumentConverter()
+        converter = _get_converter(DocumentConverter)
         result = converter.convert(temp_path)
 
-        raw_text = result.document.export_to_text()
+        raw_text = result.document.export_to_markdown()
 
         if not raw_text or not raw_text.strip():
             raise ValueError("No text could be extracted from the document")
