@@ -1,31 +1,69 @@
-﻿# Hot reload test
+﻿
 import hashlib
+
+import os
+import tempfile
+import threading
+import uuid
 import logging
 import tempfile
 import uuid
 from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from minio.error import S3Error
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
-from src.db.session import get_db
-from src.models.documents_models import Document
-from src.storage.minio_storage import (
+from ....db.session import SessionLocal, get_db
+from ....models.documents_models import Document
+from ....services.llm_pipeline import classify_document, extract_document
+from ....storage.minio_storage import (
     upload_file,
     download_file,
     delete_file,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
+# Limit how many documents are processed at once (Docling + LLM are heavy).
+_PROCESS_SLOTS = threading.BoundedSemaphore(
+    int(os.getenv("PROCESS_CONCURRENCY", "2"))
+)
 
+# Docling loads big models when created, so build one converter and reuse it.
+_converters: dict = {}
+
+
+def _get_converter(converter_cls):
+    if converter_cls not in _converters:
+        _converters[converter_cls] = converter_cls()
+    return _converters[converter_cls]
+
+
+def _process_in_background(document_id: uuid.UUID) -> None:
+    """Auto-run parse -> classify -> extract right after upload."""
+    with _PROCESS_SLOTS:
+        db = SessionLocal()
+        try:
+            document = db.query(Document).filter_by(id=document_id).first()
+            if document is None or document.status != "received":
+                return  # already handled
+            parse_document(document_id=document_id, db=db)
+        except HTTPException as exc:
+            logger.error(
+                "Auto processing failed for %s: %s", document_id, exc.detail
+            )
+        except Exception:
+            logger.exception("Auto processing crashed for %s", document_id)
+        finally:
+            db.close()
 
 @router.post("/upload", status_code=201)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -33,15 +71,24 @@ async def upload_document(
     extension = Path(filename).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type",
+        )
 
     content = await file.read(MAX_FILE_SIZE + 1)
 
     if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty",
+        )
 
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 20 MB limit")
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds 20 MB limit",
+        )
 
     file_hash = hashlib.sha256(content).hexdigest()
 
@@ -64,7 +111,7 @@ async def upload_document(
             file.content_type or "application/octet-stream",
         )
     except Exception:
-        logging.exception("MinIO upload failed")
+        logger.exception("MinIO upload failed")
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable. Check MinIO logs.",
@@ -85,10 +132,11 @@ async def upload_document(
 
     except IntegrityError:
         db.rollback()
+
         try:
             delete_file(storage_path)
         except Exception:
-            logging.exception("MinIO cleanup failed after duplicate upload")
+            logger.exception("MinIO cleanup failed after duplicate upload")
 
         raise HTTPException(
             status_code=409,
@@ -97,12 +145,14 @@ async def upload_document(
 
     except Exception:
         db.rollback()
+
         try:
             delete_file(storage_path)
         except Exception:
-            logging.exception("MinIO cleanup failed after database error")
-        raise
+            logger.exception("MinIO cleanup failed after database error")
 
+        raise
+    background_tasks.add_task(_process_in_background, document.id)
     return {
         "id": str(document.id),
         "original_filename": document.original_filename,
@@ -118,13 +168,20 @@ def parse_document(
     document = db.query(Document).filter_by(id=document_id).first()
 
     if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
 
     if not document.storage_path:
-        raise HTTPException(status_code=404, detail="Stored file not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Stored file not found",
+        )
 
     try:
         content = download_file(document.storage_path)
+
     except S3Error as exc:
         if exc.code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket"}:
             raise HTTPException(
@@ -132,13 +189,14 @@ def parse_document(
                 detail="Stored file not found",
             ) from None
 
-        logging.exception("MinIO download failed")
+        logger.exception("MinIO download failed")
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable",
         ) from None
+
     except Exception:
-        logging.exception("MinIO download failed")
+        logger.exception("MinIO download failed")
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable",
@@ -147,6 +205,7 @@ def parse_document(
     temp_path = None
 
     try:
+        # Step 1: Prepare the document for parsing
         with tempfile.NamedTemporaryFile(
             suffix=Path(document.original_filename).suffix.lower(),
             delete=False,
@@ -155,32 +214,61 @@ def parse_document(
             temp_path = temp_file.name
 
         document.status = "parsing"
+        document.failure_message = None
         db.commit()
 
-        from docling.document_converter import DocumentConverter
+        # Step 2: Parse document using Docling
+        import importlib
 
-        converter = DocumentConverter()
+        DocumentConverter = importlib.import_module(
+            "docling.document_converter"
+        ).DocumentConverter
+        converter = _get_converter(DocumentConverter)
         result = converter.convert(temp_path)
-        raw_text = "\n".join(item.text for item in result.document.texts if getattr(item, "text", "").strip())
+
+        raw_text = result.document.export_to_markdown()
 
         if not raw_text or not raw_text.strip():
             raise ValueError("No text could be extracted from the document")
 
         document.raw_text = raw_text
         document.status = "parsed"
-        document.failure_message = None
+        db.commit()
 
+        # Step 3: Classify document using OpenRouter
+        doc_type = classify_document(raw_text)
+
+        # Supported database values: invoice, po, other
+        if doc_type not in {"invoice", "po", "other"}:
+            raise ValueError(
+                f"Unsupported document type returned: {doc_type}"
+            )
+
+        document.doc_type = doc_type
+        document.status = "classified"
+        db.commit()
+
+        # Step 4: Extract structured fields using Groq
+        extracted_data = extract_document(raw_text, doc_type)
+
+        document.extracted_json = extracted_data
+        document.status = "extracted"
+        document.failure_message = None
         db.commit()
         db.refresh(document)
 
         return {
             "id": str(document.id),
             "status": document.status,
-            "raw_text": document.raw_text,
+            "doc_type": document.doc_type,
+            "extracted_json": document.extracted_json,
         }
 
     except Exception as exc:
-        logging.exception("Document parsing failed for %s", document_id)
+        logger.exception(
+            "Document parse/classification/extraction failed for %s",
+            document_id,
+        )
         db.rollback()
 
         try:
@@ -190,13 +278,17 @@ def parse_document(
                 document.status = "failed"
                 document.failure_message = str(exc)[:500]
                 db.commit()
+
         except Exception:
             db.rollback()
-            logging.exception("Failed to update document failure status")
+            logger.exception("Failed to update document failure status")
 
         raise HTTPException(
             status_code=500,
-            detail="Document parsing failed. Check Core service logs.",
+            detail=(
+                "Document processing failed. "
+                "Check Core service logs."
+            ),
         ) from None
 
     finally:
