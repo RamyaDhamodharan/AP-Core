@@ -33,6 +33,7 @@ from ....services.llm_pipeline_services import (
     extract_document,
     validate_extracted_data,
 )
+from ....services.vendor_resolution_services import resolve_vendor
 from ....storage.minio_storage import (
     delete_file,
     download_file,
@@ -306,18 +307,7 @@ def _save_invoice_from_extraction(
     )
 
     vendor_name = str(data.get("vendor") or "").strip() or None
-    vendor = None
-
-    if vendor_name:
-        vendor = (
-            db.query(Vendor)
-            .filter(
-                func.lower(func.trim(Vendor.name))
-                == vendor_name.casefold(),
-                Vendor.is_active.is_(True),
-            )
-            .first()
-        )
+    vendor = resolve_vendor(db, vendor_name)
 
     invoice_no = (
         str(data.get("invoice_number") or "").strip() or None
@@ -634,15 +624,7 @@ def parse_document(
                 extracted_data.get("vendor") or ""
             ).strip()
             if vendor_name:
-                po_vendor = (
-                    db.query(Vendor)
-                    .filter(
-                        func.lower(func.trim(Vendor.name))
-                        == vendor_name.casefold(),
-                        Vendor.is_active.is_(True),
-                    )
-                    .first()
-                )
+                po_vendor = resolve_vendor(db, vendor_name)
                 if po_vendor is None:
                     validation_issues.append(
                         f"Vendor not found or inactive: {vendor_name}"

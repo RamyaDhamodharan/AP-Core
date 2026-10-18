@@ -17,6 +17,7 @@ client = TestClient(app)
 
 def _setup(db=None):
     db = db or MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {
         "sub": str(uuid.uuid4()),
@@ -101,7 +102,7 @@ def test_create_vendor_rejects_invalid_fields(payload):
 
 def test_create_vendor_rejects_case_insensitive_duplicate():
     db, teardown = _setup()
-    db.scalars.return_value.first.return_value = _vendor()
+    db.query.return_value.filter.return_value.first.return_value = _vendor()
 
     try:
         response = client.post(
@@ -267,7 +268,7 @@ def test_update_vendor_rejects_duplicate_name():
     vendor = _vendor()
     db, teardown = _setup()
     db.get.return_value = vendor
-    db.scalars.return_value.first.return_value = _vendor(
+    db.query.return_value.filter.return_value.first.return_value = _vendor(
         id=uuid.uuid4(),
         name="Other Vendor",
     )
