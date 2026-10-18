@@ -144,58 +144,6 @@ def _purchase_order_persistence_issues(data: dict) -> list[str]:
     return issues
 
 
-def _find_duplicate_invoice(
-    db: Session,
-    document: Document,
-    extracted_data: dict,
-) -> Document | None:
-    """Find another invoice with the same vendor and invoice number."""
-
-    if document.doc_type != "invoice":
-        return None
-
-    vendor = _normalize_invoice_value(
-        extracted_data.get("vendor")
-    )
-    invoice_number = _normalize_invoice_value(
-        extracted_data.get("invoice_number")
-    )
-
-    if not vendor or not invoice_number:
-        return None
-
-    candidates = (
-        db.query(Document)
-        .filter(
-            Document.doc_type == "invoice",
-            Document.id != document.id,
-            Document.extracted_json.isnot(None),
-        )
-        .all()
-    )
-
-    for candidate in candidates:
-        data = candidate.extracted_json or {}
-
-        if not isinstance(data, dict):
-            continue
-
-        existing_vendor = _normalize_invoice_value(
-            data.get("vendor")
-        )
-        existing_number = _normalize_invoice_value(
-            data.get("invoice_number")
-        )
-
-        if (
-            existing_vendor == vendor
-            and existing_number == invoice_number
-        ):
-            return candidate
-
-    return None
-
-
 def _process_in_background(document_id: uuid.UUID) -> None:
     """Automatically run document parsing and extraction."""
 
@@ -350,9 +298,10 @@ def _save_invoice_from_extraction(
 ) -> Invoice:
     """Create or refresh an invoice and evaluate its PO match."""
 
-    existing = (
+    source_invoice = (
         db.query(Invoice)
         .filter(Invoice.source_document_id == document.id)
+        .with_for_update()
         .first()
     )
 
@@ -456,16 +405,45 @@ def _save_invoice_from_extraction(
         "match_status": match_status,
     }
 
-    # Important: update an existing invoice instead of returning it unchanged.
-    if existing:
-        for field, value in invoice_values.items():
-            setattr(existing, field, value)
+    if source_invoice is not None:
+        if not source_invoice.is_current:
+            return source_invoice
 
+        for field, value in invoice_values.items():
+            setattr(source_invoice, field, value)
         db.flush()
-        return existing
+        return source_invoice
+
+    version_no = 1
+    prior_versions = []
+
+    if vendor is not None and invoice_no:
+        prior_versions = (
+            db.query(Invoice)
+            .filter(
+                Invoice.vendor_id == vendor.id,
+                Invoice.invoice_no == invoice_no,
+            )
+            .order_by(Invoice.version_no.desc())
+            .with_for_update()
+            .all()
+        )
+        if prior_versions:
+            version_no = max(
+                invoice.version_no for invoice in prior_versions
+            ) + 1
+            demoted_current = False
+            for prior_invoice in prior_versions:
+                if prior_invoice.is_current:
+                    prior_invoice.is_current = False
+                    demoted_current = True
+            if demoted_current:
+                db.flush()
 
     invoice = Invoice(
         source_document_id=document.id,
+        version_no=version_no,
+        is_current=True,
         **invoice_values,
     )
 
@@ -473,6 +451,28 @@ def _save_invoice_from_extraction(
     db.flush()
 
     return invoice
+
+
+def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
+    """Identify conflicts covered by the invoice version constraints."""
+    constraint_name = getattr(
+        getattr(exc.orig, "diag", None),
+        "constraint_name",
+        None,
+    )
+    if constraint_name in {
+        "uq_invoice_version",
+        "uq_current_vendor_invoice",
+    }:
+        return True
+
+    error_message = str(exc.orig)
+    return (
+        "invoices.vendor_id, invoices.invoice_no, invoices.version_no"
+        in error_message
+        or "uq_invoice_version" in error_message
+        or "uq_current_vendor_invoice" in error_message
+    )
 
 
 def _save_purchase_order_from_extraction(
@@ -648,17 +648,10 @@ def parse_document(
                         f"Vendor not found or inactive: {vendor_name}"
                     )
 
-        # Step 6: Check semantic duplicates.
-        duplicate_invoice = None
+        # Step 6: Check current purchase order duplicates.
         duplicate_purchase_order = None
 
-        if doc_type == "invoice" and not validation_issues:
-            duplicate_invoice = _find_duplicate_invoice(
-                db,
-                document,
-                extracted_data,
-            )
-        elif (
+        if (
             doc_type == "po"
             and not validation_issues
             and po_vendor is not None
@@ -671,19 +664,34 @@ def parse_document(
         # Preserve extracted data for review.
         document.extracted_json = extracted_data
 
-        # Save only valid, non-duplicate invoices.
-        saved_invoice = None
+        # Save valid invoices as new versions when their vendor and number
+        # identify an existing invoice.
+        if doc_type == "invoice" and not validation_issues:
+            try:
+                _save_invoice_from_extraction(
+                    db,
+                    document,
+                    extracted_data,
+                )
+            except IntegrityError as exc:
+                if not _is_invoice_version_conflict(exc):
+                    raise
 
-        if (
-            doc_type == "invoice"
-            and not validation_issues
-            and duplicate_invoice is None
-        ):
-            saved_invoice = _save_invoice_from_extraction(
-                db,
-                document,
-                extracted_data,
-            )
+                db.rollback()
+                document = (
+                    db.query(Document)
+                    .filter_by(id=document_id)
+                    .first()
+                )
+                if document is None:
+                    raise RuntimeError(
+                        "Document disappeared during invoice versioning"
+                    ) from exc
+
+                document.extracted_json = extracted_data
+                validation_issues.append(
+                    "Invoice version conflict; document requires review"
+                )
 
         if doc_type == "po" and not validation_issues:
             if duplicate_purchase_order is not None:
@@ -738,20 +746,6 @@ def parse_document(
                 validation_issues,
             )
 
-        elif duplicate_invoice is not None:
-            document.status = "needs_vendor_review"
-            document.failure_message = (
-                "Possible duplicate invoice. "
-                f"Matches document ID: {duplicate_invoice.id}"
-            )[:500]
-
-            logger.warning(
-                "Possible duplicate invoice %s matches "
-                "existing document %s",
-                document.id,
-                duplicate_invoice.id,
-            )
-
         else:
             document.status = "extracted"
             document.failure_message = None
@@ -767,15 +761,8 @@ def parse_document(
             "extracted_json": document.extracted_json,
             "validation_issues": validation_issues,
             "duplicate_of": (
-                str(
-                    duplicate_invoice.id
-                    if duplicate_invoice is not None
-                    else duplicate_purchase_order.id
-                )
-                if (
-                    duplicate_invoice is not None
-                    or duplicate_purchase_order is not None
-                )
+                str(duplicate_purchase_order.id)
+                if duplicate_purchase_order is not None
                 else None
             ),
         }
