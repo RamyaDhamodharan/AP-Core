@@ -1,7 +1,10 @@
 
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from src.services.vendor_resolution_services import normalize_vendor_name
 
 
 class VendorResponse(BaseModel):
@@ -76,3 +79,49 @@ class VendorUpdate(BaseModel):
         if value is None:
             raise ValueError("is_active must not be null")
         return value
+
+
+class VendorAliasCreate(BaseModel):
+    alias: str = Field(min_length=1, max_length=200)
+
+    @field_validator("alias", mode="before")
+    @classmethod
+    def normalize_alias(cls, value: object) -> str:
+        normalized = normalize_vendor_name(value)
+        if not normalized:
+            raise ValueError("Vendor alias must not be blank")
+        return normalized
+
+
+class VendorAliasUpdate(BaseModel):
+    alias: str | None = Field(default=None, min_length=1, max_length=200)
+    vendor_id: uuid.UUID | None = None
+    is_active: bool | None = None
+
+    @field_validator("alias", mode="before")
+    @classmethod
+    def normalize_alias(cls, value: object) -> str:
+        if value is None:
+            raise ValueError("Vendor alias must not be null")
+        normalized = normalize_vendor_name(value)
+        if not normalized:
+            raise ValueError("Vendor alias must not be blank")
+        return normalized
+
+    @field_validator("vendor_id", "is_active", mode="before")
+    @classmethod
+    def reject_null_updates(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("Updated fields must not be null")
+        return value
+
+
+class VendorAliasResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    alias_norm: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime

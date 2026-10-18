@@ -3,16 +3,21 @@
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-load_dotenv()
-
+from alembic import context
+from src.models import (
+    audit_models,  # noqa: F401
+    document_models,  # noqa: F401
+    invoice_models,  # noqa: F401
+    notification_models,  # noqa: F401
+    purchase_order_models,  # noqa: F401
+    user_models,  # noqa: F401
+)
 from src.models.vendor_models import Base
-from src.models import document_models  # noqa: F401
 
-
+load_dotenv()
 config = context.config
 
 if config.config_file_name is not None:
@@ -27,6 +32,14 @@ config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 
+def include_object(object, name, type_, reflected, compare_to):
+    return not (
+        reflected
+        and compare_to is None
+        and type_ in {"table", "column"}
+    )
+
+
 def run_migrations_offline() -> None:
     context.configure(
         url=database_url,
@@ -34,6 +47,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=include_object,
         version_table="core_alembic_version",
     )
 
@@ -53,6 +67,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            include_object=include_object,
             version_table="core_alembic_version",
         )
 
