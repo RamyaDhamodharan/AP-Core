@@ -2,9 +2,10 @@
 import json
 import logging
 import os
-from typing import Any
-from decimal import Decimal, InvalidOperation
 import re
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -108,8 +109,9 @@ def _groq_extract(
                         "JSON object. Do not invent values; use null "
                         "for missing values. Include document_type, "
                         "vendor, invoice_number, order_number, "
-                        "invoice_date, due_date, currency, subtotal, "
-                        "tax, total, and line_items when applicable. "
+                        "po_number, invoice_date, po_date, due_date, "
+                        "currency, subtotal, tax, total, and line_items "
+                        "when applicable. "
                         "Preserve values as they appear in the source."
                     ),
                 },
@@ -210,29 +212,36 @@ def extract_document(
         fallback_model,
     )
 def _to_decimal(value: Any) -> Decimal | None:
-    """Convert a monetary value into Decimal safely."""
+    """Convert monetary values with currency codes and symbols to Decimal."""
     if value is None or isinstance(value, bool):
         return None
 
-    if isinstance(value, (int, float, Decimal)):
-        try:
+    try:
+        if isinstance(value, (int, float, Decimal)):
             result = Decimal(str(value))
             return result if result.is_finite() else None
-        except InvalidOperation:
+
+        if not isinstance(value, str) or not value.strip():
             return None
 
-    if isinstance(value, str):
-        cleaned = re.sub(r"[₹$€£,\s]", "", value.strip())
-        cleaned = cleaned.replace("(", "-").replace(")", "")
+        cleaned = value.strip()
+        cleaned = re.sub(
+            r"(?i)\b(?:INR|USD|EUR|GBP|RS\.?|RUPEES?)\b",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[?$??,\s]", "", cleaned)
 
-        try:
-            result = Decimal(cleaned)
-            return result if result.is_finite() else None
-        except InvalidOperation:
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+
+        if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", cleaned):
             return None
 
-    return None
-
+        result = Decimal(cleaned)
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError):
+        return None
 
 def validate_extracted_data(
     data: dict[str, Any],
@@ -266,7 +275,7 @@ def validate_extracted_data(
             "total",
         )
     elif doc_type == "po":
-        required_fields = ("vendor", "order_number", "total")
+        required_fields = ("vendor", "total")
     else:
         required_fields = ()
 
@@ -276,6 +285,16 @@ def validate_extracted_data(
             isinstance(value, str) and not value.strip()
         ):
             issues.append(f"Missing required field: {field}")
+
+    if doc_type == "po" and not any(
+        data.get(field) is not None
+        and not (
+            isinstance(data[field], str)
+            and not data[field].strip()
+        )
+        for field in ("order_number", "po_number")
+    ):
+        issues.append("Missing required field: order_number")
 
     amounts = {
         field: _to_decimal(data.get(field))
