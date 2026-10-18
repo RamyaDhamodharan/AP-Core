@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.rest.routers import (
     document_routers,
     invoice_routers,
+    notification_routers,
     vendor_routers,
 )
 
@@ -23,6 +24,7 @@ def health_check():
 app.include_router(vendor_routers.router)
 app.include_router(document_routers.router)
 app.include_router(invoice_routers.router)
+app.include_router(notification_routers.router)
 
 app.add_middleware(
     CORSMiddleware,
