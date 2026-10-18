@@ -210,29 +210,36 @@ def extract_document(
         fallback_model,
     )
 def _to_decimal(value: Any) -> Decimal | None:
-    """Convert a monetary value into Decimal safely."""
+    """Convert monetary values with currency codes and symbols to Decimal."""
     if value is None or isinstance(value, bool):
         return None
 
-    if isinstance(value, (int, float, Decimal)):
-        try:
+    try:
+        if isinstance(value, (int, float, Decimal)):
             result = Decimal(str(value))
             return result if result.is_finite() else None
-        except InvalidOperation:
+
+        if not isinstance(value, str) or not value.strip():
             return None
 
-    if isinstance(value, str):
-        cleaned = re.sub(r"[₹$€£,\s]", "", value.strip())
-        cleaned = cleaned.replace("(", "-").replace(")", "")
+        cleaned = value.strip()
+        cleaned = re.sub(
+            r"(?i)\b(?:INR|USD|EUR|GBP|RS\.?|RUPEES?)\b",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[?$??,\s]", "", cleaned)
 
-        try:
-            result = Decimal(cleaned)
-            return result if result.is_finite() else None
-        except InvalidOperation:
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+
+        if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", cleaned):
             return None
 
-    return None
-
+        result = Decimal(cleaned)
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError):
+        return None
 
 def validate_extracted_data(
     data: dict[str, Any],

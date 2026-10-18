@@ -7,6 +7,14 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
+from datetime import datetime
+
+from sqlalchemy import func
+
+from ....models.invoice_models import Invoice
+from ....models.vendor_models import Vendor
+from ....models.purchase_order_models import PurchaseOrder
+from ....services.llm_pipeline_services import _to_decimal
 
 from fastapi import (
     APIRouter,
@@ -40,12 +48,10 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
-# Limit concurrent document processing.
 _PROCESS_SLOTS = threading.BoundedSemaphore(
     int(os.getenv("PROCESS_CONCURRENCY", "2"))
 )
 
-# Reuse Docling converters instead of creating one for every document.
 _converters: dict = {}
 
 
@@ -68,11 +74,8 @@ def _find_duplicate_invoice(
     document: Document,
     extracted_data: dict,
 ) -> Document | None:
-    """
-    Find an existing invoice with the same vendor and invoice number.
+    """Find another invoice with the same vendor and invoice number."""
 
-    Comparison is case-insensitive and ignores extra whitespace.
-    """
     if document.doc_type != "invoice":
         return None
 
@@ -83,7 +86,6 @@ def _find_duplicate_invoice(
         extracted_data.get("invoice_number")
     )
 
-    # Avoid matching documents when essential identifiers are missing.
     if not vendor or not invoice_number:
         return None
 
@@ -120,7 +122,8 @@ def _find_duplicate_invoice(
 
 
 def _process_in_background(document_id: uuid.UUID) -> None:
-    """Automatically run parsing, classification, and extraction."""
+    """Automatically run document parsing and extraction."""
+
     with _PROCESS_SLOTS:
         db = SessionLocal()
 
@@ -182,7 +185,6 @@ async def upload_document(
             detail="File exceeds 20 MB limit",
         )
 
-    # Detect exact duplicate files using SHA-256.
     file_hash = hashlib.sha256(content).hexdigest()
 
     existing = (
@@ -266,8 +268,159 @@ async def upload_document(
         "original_filename": document.original_filename,
         "status": document.status,
     }
+def _save_invoice_from_extraction(
+    db: Session,
+    document: Document,
+    data: dict,
+) -> Invoice:
+    """Create or refresh an invoice and evaluate its PO match."""
 
+    existing = (
+        db.query(Invoice)
+        .filter(Invoice.source_document_id == document.id)
+        .first()
+    )
 
+    def parse_date(value):
+        if not value:
+            return None
+
+        for fmt in (
+            "%B %d, %Y",
+            "%Y-%m-%d",
+            "%d-%m-%Y",
+            "%b %d, %Y",
+        ):
+            try:
+                return datetime.strptime(
+                    str(value).strip(),
+                    fmt,
+                ).date()
+            except ValueError:
+                continue
+
+        return None
+
+    vendor_name = str(data.get("vendor") or "").strip() or None
+    vendor = None
+
+    if vendor_name:
+        vendor = (
+            db.query(Vendor)
+            .filter(
+                func.lower(func.trim(Vendor.name))
+                == vendor_name.casefold(),
+                Vendor.is_active.is_(True),
+            )
+            .first()
+        )
+
+    invoice_no = (
+        str(data.get("invoice_number") or "").strip() or None
+    )
+
+    po_number = (
+        str(
+            data.get("order_number")
+            or data.get("po_number")
+            or ""
+        ).strip()
+        or None
+    )
+
+    currency = (
+        str(data.get("currency") or "").strip().upper() or None
+    )
+
+    subtotal = _to_decimal(data.get("subtotal"))
+    tax_amount = _to_decimal(data.get("tax"))
+    total_amount = _to_decimal(data.get("total"))
+
+    po = None
+    match_issues = []
+
+    if not vendor:
+        match_status = "needs_vendor_review"
+
+    elif not po_number:
+        match_status = "no_match"
+
+    else:
+        po = (
+            db.query(PurchaseOrder)
+            .filter(
+                func.lower(PurchaseOrder.po_number)
+                == po_number.casefold(),
+                PurchaseOrder.is_current.is_(True),
+            )
+            .first()
+        )
+
+        if po is None:
+            match_status = "waiting_for_po"
+
+        else:
+            if po.vendor_id != vendor.id:
+                match_issues.append(
+                    "Vendor does not match purchase order"
+                )
+
+            if (
+                po.currency
+                and currency
+                and po.currency.upper() != currency
+            ):
+                match_issues.append(
+                    "Currency does not match purchase order"
+                )
+
+            if (
+                po.total_amount is not None
+                and total_amount is not None
+                and abs(po.total_amount - total_amount) > 0.01
+            ):
+                match_issues.append(
+                    "Invoice total does not match purchase order"
+                )
+
+            if match_issues:
+                match_status = "match_issues"
+            else:
+                match_status = "ready_for_review"
+
+    invoice_values = {
+        "invoice_no": invoice_no,
+        "vendor_id": vendor.id if vendor else None,
+        "vendor_name_raw": vendor_name,
+        "vendor_tax_id_raw": data.get("vendor_tax_id"),
+        "invoice_date": parse_date(data.get("invoice_date")),
+        "due_date": parse_date(data.get("due_date")),
+        "currency": currency,
+        "subtotal": subtotal,
+        "tax_amount": tax_amount,
+        "total_amount": total_amount,
+        "po_number_raw": po_number,
+        "po_id": po.id if po else None,
+        "match_status": match_status,
+    }
+
+    # Important: update an existing invoice instead of returning it unchanged.
+    if existing:
+        for field, value in invoice_values.items():
+            setattr(existing, field, value)
+
+        db.flush()
+        return existing
+
+    invoice = Invoice(
+        source_document_id=document.id,
+        **invoice_values,
+    )
+
+    db.add(invoice)
+    db.flush()
+
+    return invoice
 @router.post("/{document_id}/parse")
 def parse_document(
     document_id: uuid.UUID,
@@ -323,7 +476,7 @@ def parse_document(
     temp_path = None
 
     try:
-        # Step 1: Prepare the document for parsing.
+        # Step 1: Prepare the document.
         with tempfile.NamedTemporaryFile(
             suffix=Path(
                 document.original_filename
@@ -337,7 +490,7 @@ def parse_document(
         document.failure_message = None
         db.commit()
 
-        # Step 2: Parse the document using Docling.
+        # Step 2: Parse using Docling.
         DocumentConverter = importlib.import_module(
             "docling.document_converter"
         ).DocumentConverter
@@ -356,7 +509,7 @@ def parse_document(
         document.status = "parsed"
         db.commit()
 
-        # Step 3: Classify the document using OpenRouter.
+        # Step 3: Classify using OpenRouter.
         doc_type = classify_document(raw_text)
 
         if doc_type not in {"invoice", "po", "other"}:
@@ -368,7 +521,7 @@ def parse_document(
         document.status = "classified"
         db.commit()
 
-        # Step 4: Extract structured fields using Groq.
+        # Step 4: Extract fields using the configured LLM pipeline.
         extracted_data = extract_document(
             raw_text,
             doc_type,
@@ -380,7 +533,7 @@ def parse_document(
             doc_type,
         )
 
-        # Step 6: Check for semantic duplicate invoices.
+        # Step 6: Check semantic duplicates.
         duplicate_invoice = None
 
         if doc_type == "invoice" and not validation_issues:
@@ -390,10 +543,24 @@ def parse_document(
                 extracted_data,
             )
 
-        # Preserve extracted data for review, including duplicates.
+        # Preserve extracted data for review.
         document.extracted_json = extracted_data
 
-        # Step 7: Set the final status.
+        # Save only valid, non-duplicate invoices.
+        saved_invoice = None
+
+        if (
+            doc_type == "invoice"
+            and not validation_issues
+            and duplicate_invoice is None
+        ):
+            saved_invoice = _save_invoice_from_extraction(
+                db,
+                document,
+                extracted_data,
+            )
+
+        # Step 7: Set final document status.
         if validation_issues:
             document.status = "needs_vendor_review"
             document.failure_message = "; ".join(
