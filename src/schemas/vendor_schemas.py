@@ -1,7 +1,7 @@
 
 import uuid
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class VendorResponse(BaseModel):
@@ -22,5 +22,57 @@ class VendorCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     tax_id: str | None = Field(default=None, max_length=30)
     contact_name: str | None = Field(default=None, max_length=120)
-    contact_email: EmailStr | None = None
+    contact_email: EmailStr | None = Field(default=None, max_length=200)
     contact_phone: str | None = Field(default=None, max_length=40)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Vendor name must not be blank")
+        return value
+
+    @field_validator("tax_id", "contact_name", "contact_phone", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+
+class VendorUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    tax_id: str | None = Field(default=None, max_length=30)
+    contact_name: str | None = Field(default=None, max_length=120)
+    contact_email: EmailStr | None = Field(default=None, max_length=200)
+    contact_phone: str | None = Field(default=None, max_length=40)
+    is_active: bool | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("Vendor name must not be null")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Vendor name must not be blank")
+        return value
+
+    @field_validator("tax_id", "contact_name", "contact_phone", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("is_active", mode="before")
+    @classmethod
+    def require_active_value_when_provided(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("is_active must not be null")
+        return value
