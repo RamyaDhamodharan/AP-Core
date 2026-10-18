@@ -148,9 +148,7 @@ def _groq_extract(
 
         if lines and lines[0].strip().lower() in {
             "```json", "json"
-        }:
-            lines = lines[1:]
-        elif lines and lines[0].strip().startswith("```"):
+        } or lines and lines[0].strip().startswith("```"):
             lines = lines[1:]
 
         content = "\n".join(lines).strip()
@@ -312,11 +310,15 @@ def validate_extracted_data(
 
     # Compare amounts only when all three values are available.
     # Allow a one-cent rounding difference.
-    if subtotal is not None and tax is not None and total is not None:
-        if abs(subtotal + tax - total) > Decimal("0.01"):
-            issues.append(
-                "Amount mismatch: subtotal plus tax does not equal total"
-            )
+    if (
+        subtotal is not None
+        and tax is not None
+        and total is not None
+        and abs(subtotal + tax - total) > Decimal("0.01")
+    ):
+        issues.append(
+            "Amount mismatch: subtotal plus tax does not equal total"
+        )
 
     line_items = data.get("line_items")
     if line_items is not None:
