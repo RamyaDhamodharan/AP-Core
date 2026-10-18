@@ -12,6 +12,87 @@ from src.api.rest.routers import document_routers
 client = TestClient(app)
 
 
+def _run_purchase_order_parse(monkeypatch, extracted_data, vendor=None, duplicate=None):
+    from src.db.session_db import get_db
+    from src.models.document_models import Document
+    from src.models.purchase_order_models import PurchaseOrder
+    from src.models.vendor_models import Vendor
+
+    document_id = uuid.uuid4()
+    document = SimpleNamespace(
+        id=document_id,
+        original_filename="purchase-order.pdf",
+        storage_path=f"documents/{document_id}.pdf",
+        status="received",
+        doc_type=None,
+        raw_text=None,
+        extracted_json=None,
+        failure_message=None,
+    )
+
+    document_query = MagicMock()
+    document_query.filter_by.return_value.first.return_value = document
+    vendor_query = MagicMock()
+    vendor_query.filter.return_value.first.return_value = vendor
+    purchase_order_query = MagicMock()
+    purchase_order_query.filter.return_value.first.return_value = duplicate
+
+    db = MagicMock()
+
+    def query_model(model):
+        return {
+            Document: document_query,
+            Vendor: vendor_query,
+            PurchaseOrder: purchase_order_query,
+        }[model]
+
+    db.query.side_effect = query_model
+
+    monkeypatch.setattr(
+        document_routers,
+        "download_file",
+        lambda path: b"fake PDF content",
+    )
+
+    class FakeConverter:
+        def convert(self, path):
+            return SimpleNamespace(
+                document=SimpleNamespace(
+                    export_to_markdown=lambda: "Purchase order PO-101"
+                )
+            )
+
+    fake_docling = ModuleType("docling")
+    fake_converter_module = ModuleType("docling.document_converter")
+    fake_converter_module.DocumentConverter = FakeConverter
+    monkeypatch.setitem(sys.modules, "docling", fake_docling)
+    monkeypatch.setitem(
+        sys.modules,
+        "docling.document_converter",
+        fake_converter_module,
+    )
+    monkeypatch.setattr(
+        document_routers,
+        "classify_document",
+        lambda text: "po",
+    )
+    monkeypatch.setattr(
+        document_routers,
+        "extract_document",
+        lambda text, doc_type: extracted_data,
+    )
+    app.dependency_overrides[get_db] = lambda: db
+
+    try:
+        response = client.post(
+            f"/api/documents/{document_id}/parse"
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    return response, document, db
+
+
 def test_parse_document_success(monkeypatch):
     document_id = uuid.uuid4()
 
@@ -114,6 +195,131 @@ def test_parse_document_success(monkeypatch):
         "total": 1500,
         "line_items": [],
     }
+
+
+def test_parse_document_persists_valid_purchase_order(monkeypatch):
+    from datetime import date
+    from decimal import Decimal
+
+    from src.models.purchase_order_models import PurchaseOrder
+
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    data = {
+        "document_type": "po",
+        "vendor": "ABC Supplies",
+        "po_number": "PO-101",
+        "po_date": "2026-10-01",
+        "currency": "usd",
+        "subtotal": "100.00",
+        "tax": "10.00",
+        "total": "110.00",
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=vendor,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "extracted"
+    assert document.doc_type == "po"
+    assert document.extracted_json == data
+    db.add.assert_called_once()
+    purchase_order = db.add.call_args.args[0]
+    assert isinstance(purchase_order, PurchaseOrder)
+    assert purchase_order.po_number == "PO-101"
+    assert purchase_order.vendor_id == vendor.id
+    assert purchase_order.po_date == date(2026, 10, 1)
+    assert purchase_order.currency == "USD"
+    assert purchase_order.subtotal == Decimal("100.00")
+    assert purchase_order.tax_amount == Decimal("10.00")
+    assert purchase_order.total_amount == Decimal("110.00")
+    assert purchase_order.source_document_id == document.id
+
+
+def test_parse_document_does_not_persist_incomplete_purchase_order(
+    monkeypatch,
+):
+    data = {
+        "vendor": "ABC Supplies",
+        "po_number": "PO-101",
+        "currency": "USD",
+        "total": "110.00",
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=SimpleNamespace(id=uuid.uuid4()),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_vendor_review"
+    assert "Missing required field: po_date" in response.json()[
+        "validation_issues"
+    ]
+    assert document.extracted_json == data
+    db.add.assert_not_called()
+
+
+def test_parse_document_flags_duplicate_current_purchase_order(
+    monkeypatch,
+):
+    duplicate_id = uuid.uuid4()
+    duplicate = SimpleNamespace(id=duplicate_id)
+    data = {
+        "vendor": "ABC Supplies",
+        "po_number": "PO-101",
+        "po_date": "2026-10-01",
+        "currency": "USD",
+        "total": "110.00",
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=SimpleNamespace(id=uuid.uuid4()),
+        duplicate=duplicate,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_vendor_review"
+    assert response.json()["duplicate_of"] == str(duplicate_id)
+    assert any(
+        "Duplicate current purchase order number" in issue
+        for issue in response.json()["validation_issues"]
+    )
+    assert document.status == "needs_vendor_review"
+    db.add.assert_not_called()
+
+
+def test_parse_document_requires_known_vendor_for_purchase_order(
+    monkeypatch,
+):
+    data = {
+        "vendor": "Unknown Supplies",
+        "po_number": "PO-101",
+        "po_date": "2026-10-01",
+        "currency": "USD",
+        "total": "110.00",
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=None,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_vendor_review"
+    assert (
+        "Vendor not found or inactive: Unknown Supplies"
+        in response.json()["validation_issues"]
+    )
+    assert document.extracted_json == data
+    db.add.assert_not_called()
+
 
 def test_parse_document_not_found(monkeypatch):
     from src.db.session_db import get_db
@@ -511,5 +717,4 @@ def test_parse_document_flags_duplicate_invoice(monkeypatch):
     assert response.json()["status"] == "needs_vendor_review"
     assert response.json()["duplicate_of"] == str(existing_id)
     assert document.status == "needs_vendor_review"
-
 

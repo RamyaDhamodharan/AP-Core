@@ -6,15 +6,8 @@ import re
 import tempfile
 import threading
 import uuid
+from datetime import date, datetime
 from pathlib import Path
-from datetime import datetime
-
-from sqlalchemy import func
-
-from ....models.invoice_models import Invoice
-from ....models.vendor_models import Vendor
-from ....models.purchase_order_models import PurchaseOrder
-from ....services.llm_pipeline_services import _to_decimal
 
 from fastapi import (
     APIRouter,
@@ -25,20 +18,25 @@ from fastapi import (
     UploadFile,
 )
 from minio.error import S3Error
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ....db.session_db import SessionLocal, get_db
 from ....models.document_models import Document
+from ....models.invoice_models import Invoice
+from ....models.purchase_order_models import PurchaseOrder
+from ....models.vendor_models import Vendor
 from ....services.llm_pipeline_services import (
+    _to_decimal,
     classify_document,
     extract_document,
     validate_extracted_data,
 )
 from ....storage.minio_storage import (
-    upload_file,
-    download_file,
     delete_file,
+    download_file,
+    upload_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,6 +65,83 @@ def _normalize_invoice_value(value: object) -> str:
         return ""
 
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+
+def _parse_document_date(value: object) -> date | None:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    for fmt in (
+        "%B %d, %Y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%b %d, %Y",
+    ):
+        try:
+            return datetime.strptime(str(value).strip(), fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+
+def _purchase_order_number(data: dict) -> str:
+    return str(
+        data.get("po_number") or data.get("order_number") or ""
+    ).strip()
+
+
+def _find_duplicate_purchase_order(
+    db: Session,
+    po_number: str,
+) -> PurchaseOrder | None:
+    normalized_number = _normalize_invoice_value(po_number)
+    if not normalized_number:
+        return None
+
+    return (
+        db.query(PurchaseOrder)
+        .filter(
+            func.lower(func.trim(PurchaseOrder.po_number))
+            == normalized_number,
+            PurchaseOrder.is_current.is_(True),
+        )
+        .first()
+    )
+
+
+def _purchase_order_persistence_issues(data: dict) -> list[str]:
+    issues = []
+    po_number = _purchase_order_number(data)
+    po_date = data.get("po_date") or data.get("order_date")
+    currency = str(data.get("currency") or "").strip()
+    total = _to_decimal(data.get("total"))
+
+    if not po_number:
+        issues.append("Missing required field: order_number")
+    elif len(po_number) > 60:
+        issues.append("Invalid purchase order number: maximum length is 60")
+
+    if not po_date:
+        issues.append("Missing required field: po_date")
+    elif _parse_document_date(po_date) is None:
+        issues.append("Invalid date value: po_date")
+
+    if not currency:
+        issues.append("Missing required field: currency")
+    elif not re.fullmatch(r"[A-Za-z]{3}", currency):
+        issues.append("Invalid currency: expected a three-letter code")
+
+    if data.get("total") is not None and total is None:
+        issues.append("Invalid monetary value: total")
+
+    return issues
 
 
 def _find_duplicate_invoice(
@@ -281,26 +356,6 @@ def _save_invoice_from_extraction(
         .first()
     )
 
-    def parse_date(value):
-        if not value:
-            return None
-
-        for fmt in (
-            "%B %d, %Y",
-            "%Y-%m-%d",
-            "%d-%m-%Y",
-            "%b %d, %Y",
-        ):
-            try:
-                return datetime.strptime(
-                    str(value).strip(),
-                    fmt,
-                ).date()
-            except ValueError:
-                continue
-
-        return None
-
     vendor_name = str(data.get("vendor") or "").strip() or None
     vendor = None
 
@@ -393,8 +448,8 @@ def _save_invoice_from_extraction(
         "vendor_id": vendor.id if vendor else None,
         "vendor_name_raw": vendor_name,
         "vendor_tax_id_raw": data.get("vendor_tax_id"),
-        "invoice_date": parse_date(data.get("invoice_date")),
-        "due_date": parse_date(data.get("due_date")),
+        "invoice_date": _parse_document_date(data.get("invoice_date")),
+        "due_date": _parse_document_date(data.get("due_date")),
         "currency": currency,
         "subtotal": subtotal,
         "tax_amount": tax_amount,
@@ -421,6 +476,33 @@ def _save_invoice_from_extraction(
     db.flush()
 
     return invoice
+
+
+def _save_purchase_order_from_extraction(
+    db: Session,
+    document: Document,
+    data: dict,
+    vendor: Vendor,
+) -> PurchaseOrder:
+    """Persist a validated purchase order against its source document."""
+    po_date = data.get("po_date") or data.get("order_date")
+    purchase_order = PurchaseOrder(
+        po_number=_purchase_order_number(data),
+        vendor_id=vendor.id,
+        source_document_id=document.id,
+        po_date=_parse_document_date(po_date),
+        currency=str(data["currency"]).strip().upper(),
+        subtotal=_to_decimal(data.get("subtotal")),
+        tax_amount=_to_decimal(
+            data.get("tax")
+            if data.get("tax") is not None
+            else data.get("tax_amount")
+        ),
+        total_amount=_to_decimal(data.get("total")),
+    )
+    db.add(purchase_order)
+    db.flush()
+    return purchase_order
 @router.post("/{document_id}/parse")
 def parse_document(
     document_id: uuid.UUID,
@@ -527,20 +609,66 @@ def parse_document(
             doc_type,
         )
 
+        validation_data = extracted_data
+        if doc_type == "po" and isinstance(extracted_data, dict):
+            validation_data = dict(extracted_data)
+            if not validation_data.get("order_number"):
+                validation_data["order_number"] = validation_data.get(
+                    "po_number"
+                )
+            if (
+                validation_data.get("tax") is None
+                and validation_data.get("tax_amount") is not None
+            ):
+                validation_data["tax"] = validation_data["tax_amount"]
+
         # Step 5: Validate the extracted fields.
         validation_issues = validate_extracted_data(
-            extracted_data,
+            validation_data,
             doc_type,
         )
 
+        po_vendor = None
+        if doc_type == "po" and isinstance(extracted_data, dict):
+            validation_issues.extend(
+                _purchase_order_persistence_issues(extracted_data)
+            )
+            vendor_name = str(
+                extracted_data.get("vendor") or ""
+            ).strip()
+            if vendor_name:
+                po_vendor = (
+                    db.query(Vendor)
+                    .filter(
+                        func.lower(func.trim(Vendor.name))
+                        == vendor_name.casefold(),
+                        Vendor.is_active.is_(True),
+                    )
+                    .first()
+                )
+                if po_vendor is None:
+                    validation_issues.append(
+                        f"Vendor not found or inactive: {vendor_name}"
+                    )
+
         # Step 6: Check semantic duplicates.
         duplicate_invoice = None
+        duplicate_purchase_order = None
 
         if doc_type == "invoice" and not validation_issues:
             duplicate_invoice = _find_duplicate_invoice(
                 db,
                 document,
                 extracted_data,
+            )
+        elif (
+            doc_type == "po"
+            and not validation_issues
+            and po_vendor is not None
+        ):
+            duplicate_purchase_order = _find_duplicate_purchase_order(
+                db,
+                _purchase_order_number(extracted_data),
             )
 
         # Preserve extracted data for review.
@@ -559,6 +687,46 @@ def parse_document(
                 document,
                 extracted_data,
             )
+
+        if doc_type == "po" and not validation_issues:
+            if duplicate_purchase_order is not None:
+                validation_issues.append(
+                    "Duplicate current purchase order number: "
+                    f"{_purchase_order_number(extracted_data)}"
+                )
+            elif po_vendor is not None:
+                try:
+                    _save_purchase_order_from_extraction(
+                        db,
+                        document,
+                        extracted_data,
+                        po_vendor,
+                    )
+                except IntegrityError as exc:
+                    db.rollback()
+                    duplicate_purchase_order = (
+                        _find_duplicate_purchase_order(
+                            db,
+                            _purchase_order_number(extracted_data),
+                        )
+                    )
+                    if duplicate_purchase_order is None:
+                        raise
+
+                    document = (
+                        db.query(Document)
+                        .filter_by(id=document_id)
+                        .first()
+                    )
+                    if document is None:
+                        raise RuntimeError(
+                            "Document disappeared during PO persistence"
+                        ) from exc
+                    document.extracted_json = extracted_data
+                    validation_issues.append(
+                        "Duplicate current purchase order number: "
+                        f"{_purchase_order_number(extracted_data)}"
+                    )
 
         # Step 7: Set final document status.
         if validation_issues:
@@ -602,8 +770,15 @@ def parse_document(
             "extracted_json": document.extracted_json,
             "validation_issues": validation_issues,
             "duplicate_of": (
-                str(duplicate_invoice.id)
-                if duplicate_invoice is not None
+                str(
+                    duplicate_invoice.id
+                    if duplicate_invoice is not None
+                    else duplicate_purchase_order.id
+                )
+                if (
+                    duplicate_invoice is not None
+                    or duplicate_purchase_order is not None
+                )
                 else None
             ),
         }

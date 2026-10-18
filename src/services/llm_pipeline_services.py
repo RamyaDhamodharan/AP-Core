@@ -2,9 +2,10 @@
 import json
 import logging
 import os
-from typing import Any
-from decimal import Decimal, InvalidOperation
 import re
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -108,8 +109,9 @@ def _groq_extract(
                         "JSON object. Do not invent values; use null "
                         "for missing values. Include document_type, "
                         "vendor, invoice_number, order_number, "
-                        "invoice_date, due_date, currency, subtotal, "
-                        "tax, total, and line_items when applicable. "
+                        "po_number, invoice_date, po_date, due_date, "
+                        "currency, subtotal, tax, total, and line_items "
+                        "when applicable. "
                         "Preserve values as they appear in the source."
                     ),
                 },
@@ -273,7 +275,7 @@ def validate_extracted_data(
             "total",
         )
     elif doc_type == "po":
-        required_fields = ("vendor", "order_number", "total")
+        required_fields = ("vendor", "total")
     else:
         required_fields = ()
 
@@ -283,6 +285,16 @@ def validate_extracted_data(
             isinstance(value, str) and not value.strip()
         ):
             issues.append(f"Missing required field: {field}")
+
+    if doc_type == "po" and not any(
+        data.get(field) is not None
+        and not (
+            isinstance(data[field], str)
+            and not data[field].strip()
+        )
+        for field in ("order_number", "po_number")
+    ):
+        issues.append("Missing required field: order_number")
 
     amounts = {
         field: _to_decimal(data.get(field))
