@@ -12,6 +12,52 @@ from src.api.rest.routers import document_routers
 client = TestClient(app)
 
 
+def _save_invoice_for_matching(
+    *,
+    vendor,
+    purchase_order,
+    existing_invoice=None,
+    extracted_data=None,
+):
+    from src.models.invoice_models import Invoice
+    from src.models.purchase_order_models import PurchaseOrder
+    from src.models.vendor_models import Vendor
+
+    document = SimpleNamespace(id=uuid.uuid4())
+    data = {
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "order_number": "PO-101",
+        "invoice_date": "2026-10-01",
+        "currency": "USD",
+        "subtotal": "1500.00",
+        "tax": "0",
+        "total": "1500.00",
+    }
+    if extracted_data:
+        data.update(extracted_data)
+
+    invoice_query = MagicMock()
+    invoice_query.filter.return_value.first.return_value = existing_invoice
+    vendor_query = MagicMock()
+    vendor_query.filter.return_value.first.return_value = vendor
+    po_query = MagicMock()
+    po_query.filter.return_value.first.return_value = purchase_order
+    db = MagicMock()
+    db.query.side_effect = {
+        Invoice: invoice_query,
+        Vendor: vendor_query,
+        PurchaseOrder: po_query,
+    }.__getitem__
+
+    invoice = document_routers._save_invoice_from_extraction(
+        db,
+        document,
+        data,
+    )
+    return invoice, db, document
+
+
 def _run_purchase_order_parse(monkeypatch, extracted_data, vendor=None, duplicate=None):
     from src.db.session_db import get_db
     from src.models.document_models import Document
@@ -195,6 +241,151 @@ def test_parse_document_success(monkeypatch):
         "total": 1500,
         "line_items": [],
     }
+
+
+def test_invoice_matching_sets_po_and_ready_status():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, db, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+    )
+
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "ready_for_review"
+    db.add.assert_called_once_with(invoice)
+
+
+def test_invoice_matching_waits_when_po_is_missing():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=None,
+    )
+
+    assert invoice.po_id is None
+    assert invoice.match_status == "waiting_for_po"
+
+
+def test_invoice_matching_flags_vendor_mismatch():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=uuid.uuid4(),
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+    )
+
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "match_issues"
+
+
+def test_invoice_matching_flags_currency_mismatch():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="EUR",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+    )
+
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "match_issues"
+
+
+def test_invoice_matching_flags_amount_mismatch():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+        extracted_data={"total": "1800.00"},
+    )
+
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "match_issues"
+
+
+def test_invoice_matching_keeps_existing_one_cent_tolerance():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+        extracted_data={"total": "1500.01"},
+    )
+
+    assert invoice.match_status == "ready_for_review"
+
+
+def test_invoice_matching_requires_vendor_review_when_unresolved():
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=uuid.uuid4(),
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=None,
+        purchase_order=po,
+    )
+
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "needs_vendor_review"
+
+
+def test_invoice_matching_updates_existing_record_on_rerun():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+    existing_invoice = SimpleNamespace()
+
+    invoice, db, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+        existing_invoice=existing_invoice,
+        extracted_data={"total": "1600.00"},
+    )
+
+    assert invoice is existing_invoice
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "match_issues"
+    assert invoice.total_amount == 1600
+    db.add.assert_not_called()
 
 
 def test_parse_document_persists_valid_purchase_order(monkeypatch):
@@ -717,4 +908,3 @@ def test_parse_document_flags_duplicate_invoice(monkeypatch):
     assert response.json()["status"] == "needs_vendor_review"
     assert response.json()["duplicate_of"] == str(existing_id)
     assert document.status == "needs_vendor_review"
-

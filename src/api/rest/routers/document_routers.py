@@ -394,54 +394,51 @@ def _save_invoice_from_extraction(
     po = None
     match_issues = []
 
-    if not vendor:
-        match_status = "needs_vendor_review"
-
-    elif not po_number:
-        match_status = "no_match"
-
-    else:
+    if po_number:
         po = (
             db.query(PurchaseOrder)
             .filter(
-                func.lower(PurchaseOrder.po_number)
-                == po_number.casefold(),
+                func.lower(func.trim(PurchaseOrder.po_number))
+                == _normalize_invoice_value(po_number),
                 PurchaseOrder.is_current.is_(True),
             )
             .first()
         )
 
-        if po is None:
-            match_status = "waiting_for_po"
+    if not vendor:
+        match_status = "needs_vendor_review"
 
+    elif po is None:
+        match_status = "waiting_for_po"
+
+    else:
+        if po.vendor_id != vendor.id:
+            match_issues.append(
+                "Vendor does not match purchase order"
+            )
+
+        if (
+            not po.currency
+            or not currency
+            or po.currency.upper() != currency
+        ):
+            match_issues.append(
+                "Currency does not match purchase order"
+            )
+
+        if (
+            po.total_amount is None
+            or total_amount is None
+            or abs(po.total_amount - total_amount) > 0.01
+        ):
+            match_issues.append(
+                "Invoice total does not match purchase order"
+            )
+
+        if match_issues:
+            match_status = "match_issues"
         else:
-            if po.vendor_id != vendor.id:
-                match_issues.append(
-                    "Vendor does not match purchase order"
-                )
-
-            if (
-                po.currency
-                and currency
-                and po.currency.upper() != currency
-            ):
-                match_issues.append(
-                    "Currency does not match purchase order"
-                )
-
-            if (
-                po.total_amount is not None
-                and total_amount is not None
-                and abs(po.total_amount - total_amount) > 0.01
-            ):
-                match_issues.append(
-                    "Invoice total does not match purchase order"
-                )
-
-            if match_issues:
-                match_status = "match_issues"
-            else:
-                match_status = "ready_for_review"
+            match_status = "ready_for_review"
 
     invoice_values = {
         "invoice_no": invoice_no,
