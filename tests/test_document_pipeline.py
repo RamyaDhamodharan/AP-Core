@@ -144,7 +144,8 @@ def _run_purchase_order_parse(
     )
     purchase_order_query = MagicMock()
     purchase_order_query.filter.return_value.first.return_value = duplicate
-
+    invoice_query = MagicMock()
+    invoice_query.filter.return_value.with_for_update.return_value.all.return_value = []
 
     db = MagicMock()
 
