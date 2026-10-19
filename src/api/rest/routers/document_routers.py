@@ -33,6 +33,7 @@ from ....services.llm_pipeline_services import (
     extract_document,
     validate_extracted_data,
 )
+from ....services.vendor_resolution_services import resolve_vendor
 from ....storage.minio_storage import (
     delete_file,
     download_file,
@@ -146,7 +147,6 @@ def _purchase_order_persistence_issues(data: dict) -> list[str]:
 
 def _process_in_background(document_id: uuid.UUID) -> None:
     """Automatically run document parsing and extraction."""
-
     with _PROCESS_SLOTS:
         db = SessionLocal()
 
@@ -232,10 +232,8 @@ async def upload_document(
             content,
             file.content_type or "application/octet-stream",
         )
-
     except Exception:
         logger.exception("MinIO upload failed")
-
         raise HTTPException(
             status_code=503,
             detail="File storage is unavailable. Check MinIO logs.",
@@ -256,7 +254,6 @@ async def upload_document(
 
     except IntegrityError:
         db.rollback()
-
         try:
             delete_file(storage_path)
         except Exception:
@@ -271,14 +268,12 @@ async def upload_document(
 
     except Exception:
         db.rollback()
-
         try:
             delete_file(storage_path)
         except Exception:
             logger.exception(
                 "MinIO cleanup failed after database error"
             )
-
         raise
 
     background_tasks.add_task(
@@ -291,6 +286,8 @@ async def upload_document(
         "original_filename": document.original_filename,
         "status": document.status,
     }
+
+
 def _save_invoice_from_extraction(
     db: Session,
     document: Document,
@@ -306,18 +303,7 @@ def _save_invoice_from_extraction(
     )
 
     vendor_name = str(data.get("vendor") or "").strip() or None
-    vendor = None
-
-    if vendor_name:
-        vendor = (
-            db.query(Vendor)
-            .filter(
-                func.lower(func.trim(Vendor.name))
-                == vendor_name.casefold(),
-                Vendor.is_active.is_(True),
-            )
-            .first()
-        )
+    vendor = resolve_vendor(db, vendor_name)
 
     invoice_no = (
         str(data.get("invoice_number") or "").strip() or None
@@ -356,10 +342,8 @@ def _save_invoice_from_extraction(
 
     if not vendor:
         match_status = "needs_vendor_review"
-
     elif po is None:
         match_status = "waiting_for_po"
-
     else:
         if po.vendor_id != vendor.id:
             match_issues.append(
@@ -384,10 +368,9 @@ def _save_invoice_from_extraction(
                 "Invoice total does not match purchase order"
             )
 
-        if match_issues:
-            match_status = "match_issues"
-        else:
-            match_status = "ready_for_review"
+        match_status = (
+            "match_issues" if match_issues else "ready_for_review"
+        )
 
     invoice_values = {
         "invoice_no": invoice_no,
@@ -428,15 +411,18 @@ def _save_invoice_from_extraction(
             .with_for_update()
             .all()
         )
+
         if prior_versions:
             version_no = max(
                 invoice.version_no for invoice in prior_versions
             ) + 1
             demoted_current = False
+
             for prior_invoice in prior_versions:
                 if prior_invoice.is_current:
                     prior_invoice.is_current = False
                     demoted_current = True
+
             if demoted_current:
                 db.flush()
 
@@ -451,8 +437,6 @@ def _save_invoice_from_extraction(
     db.flush()
 
     return invoice
-
-
 def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
     """Identify conflicts covered by the invoice version constraints."""
     constraint_name = getattr(
@@ -460,6 +444,7 @@ def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
         "constraint_name",
         None,
     )
+
     if constraint_name in {
         "uq_invoice_version",
         "uq_current_vendor_invoice",
@@ -536,6 +521,7 @@ def _save_purchase_order_from_extraction(
 ) -> PurchaseOrder:
     """Persist a validated purchase order against its source document."""
     po_date = data.get("po_date") or data.get("order_date")
+
     purchase_order = PurchaseOrder(
         po_number=_purchase_order_number(data),
         vendor_id=vendor.id,
@@ -550,17 +536,13 @@ def _save_purchase_order_from_extraction(
         ),
         total_amount=_to_decimal(data.get("total")),
     )
+
     db.add(purchase_order)
     db.flush()
 
-    rematched = _rematch_waiting_invoices_for_po(db, purchase_order)
-    logger.info(
-        "Saved PO %s; rematched %s waiting invoice(s)",
-        purchase_order.po_number,
-        rematched,
-    )
-
     return purchase_order
+
+
 @router.post("/{document_id}/parse")
 def parse_document(
     document_id: uuid.UUID,
@@ -631,11 +613,11 @@ def parse_document(
         db.commit()
 
         # Step 2: Parse using Docling.
-        DocumentConverter = importlib.import_module(
+        document_converter = importlib.import_module(
             "docling.document_converter"
         ).DocumentConverter
 
-        converter = _get_converter(DocumentConverter)
+        converter = _get_converter(document_converter)
         result = converter.convert(temp_path)
 
         raw_text = result.document.export_to_markdown()
@@ -668,12 +650,15 @@ def parse_document(
         )
 
         validation_data = extracted_data
+
         if doc_type == "po" and isinstance(extracted_data, dict):
             validation_data = dict(extracted_data)
+
             if not validation_data.get("order_number"):
                 validation_data["order_number"] = validation_data.get(
                     "po_number"
                 )
+
             if (
                 validation_data.get("tax") is None
                 and validation_data.get("tax_amount") is not None
@@ -687,23 +672,19 @@ def parse_document(
         )
 
         po_vendor = None
+
         if doc_type == "po" and isinstance(extracted_data, dict):
             validation_issues.extend(
                 _purchase_order_persistence_issues(extracted_data)
             )
+
             vendor_name = str(
                 extracted_data.get("vendor") or ""
             ).strip()
+
             if vendor_name:
-                po_vendor = (
-                    db.query(Vendor)
-                    .filter(
-                        func.lower(func.trim(Vendor.name))
-                        == vendor_name.casefold(),
-                        Vendor.is_active.is_(True),
-                    )
-                    .first()
-                )
+                po_vendor = resolve_vendor(db, vendor_name)
+
                 if po_vendor is None:
                     validation_issues.append(
                         f"Vendor not found or inactive: {vendor_name}"
@@ -734,16 +715,19 @@ def parse_document(
                     document,
                     extracted_data,
                 )
+
             except IntegrityError as exc:
                 if not _is_invoice_version_conflict(exc):
                     raise
 
                 db.rollback()
+
                 document = (
                     db.query(Document)
                     .filter_by(id=document_id)
                     .first()
                 )
+
                 if document is None:
                     raise RuntimeError(
                         "Document disappeared during invoice versioning"
@@ -753,13 +737,13 @@ def parse_document(
                 validation_issues.append(
                     "Invoice version conflict; document requires review"
                 )
-
         if doc_type == "po" and not validation_issues:
             if duplicate_purchase_order is not None:
                 validation_issues.append(
                     "Duplicate current purchase order number: "
                     f"{_purchase_order_number(extracted_data)}"
                 )
+
             elif po_vendor is not None:
                 try:
                     _save_purchase_order_from_extraction(
@@ -768,14 +752,17 @@ def parse_document(
                         extracted_data,
                         po_vendor,
                     )
+
                 except IntegrityError as exc:
                     db.rollback()
+
                     duplicate_purchase_order = (
                         _find_duplicate_purchase_order(
                             db,
                             _purchase_order_number(extracted_data),
                         )
                     )
+
                     if duplicate_purchase_order is None:
                         raise
 
@@ -784,10 +771,12 @@ def parse_document(
                         .filter_by(id=document_id)
                         .first()
                     )
+
                     if document is None:
                         raise RuntimeError(
                             "Document disappeared during PO persistence"
                         ) from exc
+
                     document.extracted_json = extracted_data
                     validation_issues.append(
                         "Duplicate current purchase order number: "

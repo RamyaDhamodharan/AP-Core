@@ -12,12 +12,12 @@ CREATE TYPE notify_status AS ENUM ('queued', 'sent', 'failed');
 
 CREATE TABLE users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name varchar(120) NOT NULL,
-  email varchar(200) NOT NULL UNIQUE,
-  role user_role NOT NULL DEFAULT 'associate',
+  name varchar NOT NULL,
+  email varchar NOT NULL UNIQUE,
+  role user_role NOT NULL,
   is_active boolean NOT NULL DEFAULT true,
-  password_hash varchar(255) NOT NULL,
-  must_change_password boolean NOT NULL DEFAULT true,
+  password_hash varchar NOT NULL,
+  must_change_password boolean NOT NULL DEFAULT false,
   temp_password_expires_at timestamptz,
   failed_login_count integer NOT NULL DEFAULT 0,
   locked_until timestamptz,
@@ -181,6 +181,8 @@ CREATE TABLE exchange_rates (
   rate_date date NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES users(id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid,
   CONSTRAINT uq_exchange_rate UNIQUE(from_currency, to_currency, rate_date)
 );
 
@@ -195,6 +197,8 @@ CREATE TABLE match_runs (
   differences jsonb NOT NULL DEFAULT '[]'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES users(id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid,
   CONSTRAINT uq_match_run_no UNIQUE(invoice_id, run_no)
 );
 ALTER TABLE invoices ADD CONSTRAINT fk_invoice_final_run
@@ -212,7 +216,9 @@ CREATE TABLE audit_log (
   technical_detail text,
   request_id varchar(100),
   created_at timestamptz NOT NULL DEFAULT now(),
-  created_by uuid REFERENCES users(id)
+  created_by uuid REFERENCES users(id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid
 );
 CREATE INDEX ix_audit_entity_timeline ON audit_log(entity_type, entity_id, created_at);
 

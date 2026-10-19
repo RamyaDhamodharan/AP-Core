@@ -19,10 +19,12 @@ def _save_invoice_for_matching(
     existing_invoice=None,
     prior_versions=None,
     extracted_data=None,
+    alias_vendor=None,
+    alias_matches=None,
 ):
     from src.models.invoice_models import Invoice
     from src.models.purchase_order_models import PurchaseOrder
-    from src.models.vendor_models import Vendor
+    from src.models.vendor_models import Vendor, VendorAlias
 
     document = SimpleNamespace(id=uuid.uuid4())
     data = {
@@ -58,12 +60,25 @@ def _save_invoice_for_matching(
     db_version_query = versions_query
     invoice_query_count = 0
     vendor_query = MagicMock()
-    vendor_query.filter.return_value.first.return_value = vendor
+    vendor_query.filter.return_value.all.return_value = (
+        [vendor] if vendor is not None else []
+    )
+    alias_query = MagicMock()
+    alias_query.join.return_value.filter.return_value.all.return_value = (
+        alias_matches
+        if alias_matches is not None
+        else (
+            [(SimpleNamespace(), alias_vendor)]
+            if alias_vendor is not None
+            else []
+        )
+    )
     po_query = MagicMock()
     po_query.filter.return_value.first.return_value = purchase_order
     db = MagicMock()
 
-    def query_model(model):
+    def query_model(*models):
+        model = models[0]
         nonlocal invoice_query_count
         if model is Invoice:
             invoice_query_count += 1
@@ -74,6 +89,8 @@ def _save_invoice_for_matching(
             )
         if model is Vendor:
             return vendor_query
+        if model is VendorAlias or models == (VendorAlias, Vendor):
+            return alias_query
         if model is PurchaseOrder:
             return po_query
         raise AssertionError(f"Unexpected queried model: {model}")
@@ -89,11 +106,17 @@ def _save_invoice_for_matching(
     return invoice, db, document
 
 
-def _run_purchase_order_parse(monkeypatch, extracted_data, vendor=None, duplicate=None):
+def _run_purchase_order_parse(
+    monkeypatch,
+    extracted_data,
+    vendor=None,
+    duplicate=None,
+    alias_vendor=None,
+):
     from src.db.session_db import get_db
     from src.models.document_models import Document
     from src.models.purchase_order_models import PurchaseOrder
-    from src.models.vendor_models import Vendor
+    from src.models.vendor_models import Vendor, VendorAlias
 
     document_id = uuid.uuid4()
     document = SimpleNamespace(
@@ -110,20 +133,27 @@ def _run_purchase_order_parse(monkeypatch, extracted_data, vendor=None, duplicat
     document_query = MagicMock()
     document_query.filter_by.return_value.first.return_value = document
     vendor_query = MagicMock()
-    vendor_query.filter.return_value.first.return_value = vendor
+    vendor_query.filter.return_value.all.return_value = (
+        [vendor] if vendor is not None else []
+    )
+    alias_query = MagicMock()
+    alias_query.join.return_value.filter.return_value.all.return_value = (
+        [(SimpleNamespace(), alias_vendor)]
+        if alias_vendor is not None
+        else []
+    )
     purchase_order_query = MagicMock()
     purchase_order_query.filter.return_value.first.return_value = duplicate
 
 
     db = MagicMock()
 
-    invoice_query = MagicMock()
-    invoice_query.filter.return_value.with_for_update.return_value.all.return_value = []
-
-    def query_model(model):
+    def query_model(*models):
+        model = models[0]
         return {
             Document: document_query,
             Vendor: vendor_query,
+            VendorAlias: alias_query,
             PurchaseOrder: purchase_order_query,
             Invoice: invoice_query,
         }[model]
@@ -299,6 +329,46 @@ def test_invoice_matching_sets_po_and_ready_status():
     db.add.assert_called_once_with(invoice)
 
 
+def test_invoice_matching_accepts_normalized_canonical_vendor_name():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=po,
+        extracted_data={"vendor": "  aBc   sUPPLIES  "},
+    )
+
+    assert invoice.vendor_id == vendor.id
+    assert invoice.match_status == "ready_for_review"
+
+
+def test_invoice_matching_resolves_vendor_alias():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=None,
+        alias_vendor=vendor,
+        purchase_order=po,
+        extracted_data={"vendor": "  aLtErNaTe   SuPpLiEr "},
+    )
+
+    assert invoice.vendor_id == vendor.id
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "ready_for_review"
+
+
 def test_invoice_matching_waits_when_po_is_missing():
     vendor = SimpleNamespace(id=uuid.uuid4())
 
@@ -465,6 +535,29 @@ def test_invoice_matching_requires_vendor_review_when_unresolved():
     assert invoice.match_status == "needs_vendor_review"
 
 
+def test_invoice_matching_requires_review_for_ambiguous_vendor_alias():
+    first_vendor = SimpleNamespace(id=uuid.uuid4())
+    second_vendor = SimpleNamespace(id=uuid.uuid4())
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        vendor_id=first_vendor.id,
+        currency="USD",
+        total_amount=1500,
+    )
+
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=None,
+        purchase_order=po,
+        alias_matches=[
+            (SimpleNamespace(), first_vendor),
+            (SimpleNamespace(), second_vendor),
+        ],
+    )
+
+    assert invoice.vendor_id is None
+    assert invoice.match_status == "needs_vendor_review"
+
+
 def test_invoice_matching_updates_existing_record_on_rerun():
     vendor = SimpleNamespace(id=uuid.uuid4())
     po = SimpleNamespace(
@@ -601,6 +694,33 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert purchase_order.tax_amount == Decimal("10.00")
     assert purchase_order.total_amount == Decimal("110.00")
     assert purchase_order.source_document_id == document.id
+
+
+def test_parse_document_resolves_purchase_order_vendor_alias(monkeypatch):
+    from src.models.purchase_order_models import PurchaseOrder
+
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    data = {
+        "vendor": "  Alternate   Supplier ",
+        "po_number": "PO-ALT-1",
+        "po_date": "2026-10-01",
+        "currency": "usd",
+        "subtotal": "100.00",
+        "tax": "10.00",
+        "total": "110.00",
+    }
+
+    response, _, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        alias_vendor=vendor,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "extracted"
+    purchase_order = db.add.call_args.args[0]
+    assert isinstance(purchase_order, PurchaseOrder)
+    assert purchase_order.vendor_id == vendor.id
 
 
 def test_parse_document_does_not_persist_incomplete_purchase_order(
