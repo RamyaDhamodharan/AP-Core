@@ -39,6 +39,7 @@ from ....storage.minio_storage import (
     download_file,
     upload_file,
 )
+from ....worker.dispatch import dispatch_document_processing
 
 logger = logging.getLogger(__name__)
 
@@ -276,9 +277,10 @@ async def upload_document(
             )
         raise
 
-    background_tasks.add_task(
-        _process_in_background,
+    dispatch_document_processing(
+        background_tasks,
         document.id,
+        _process_in_background,
     )
 
     return {
