@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import importlib
 import logging
 import os
@@ -540,6 +540,8 @@ def _save_purchase_order_from_extraction(
     db.add(purchase_order)
     db.flush()
 
+    _rematch_waiting_invoices_for_po(db, purchase_order)
+
     return purchase_order
 
 
@@ -855,3 +857,4 @@ def parse_document(
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
+

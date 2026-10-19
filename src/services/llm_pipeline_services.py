@@ -258,7 +258,12 @@ def validate_extracted_data(
     extracted_type = data.get("document_type")
     if extracted_type is not None:
         normalized_type = str(extracted_type).strip().lower()
-        aliases = {"purchase_order": "po", "purchase order": "po"}
+        aliases = {
+            "purchase_order": "po",
+            "purchase order": "po",
+            "payment advice": "other",
+            "payment_advice": "other",
+        }
 
         if aliases.get(normalized_type, normalized_type) != doc_type:
             issues.append(
