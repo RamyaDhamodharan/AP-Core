@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx", "ruff", "mypy"]
-documents = ["docling"]
+documents = ["docling", "torch", "torchvision"]
 
 [tool.ruff]
 line-length = 88
@@ -64,4 +64,4 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 [tool.uv]
-index-strategy = "unsafe-best-match"
+index-strategy = "first-index"
