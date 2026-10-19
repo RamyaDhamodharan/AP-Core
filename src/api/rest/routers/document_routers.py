@@ -474,6 +474,59 @@ def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
         or "uq_current_vendor_invoice" in error_message
     )
 
+def _rematch_waiting_invoices_for_po(
+    db: Session,
+    po: PurchaseOrder,
+) -> int:
+    """Rematch current invoices waiting for this purchase order."""
+    po_number = _normalize_invoice_value(po.po_number)
+    if not po_number:
+        return 0
+
+    invoices = (
+        db.query(Invoice)
+        .filter(
+            func.lower(func.trim(Invoice.po_number_raw)) == po_number,
+            Invoice.is_current.is_(True),
+            Invoice.match_status == "waiting_for_po",
+        )
+        .with_for_update()
+        .all()
+    )
+
+    rematched = 0
+
+    for invoice in invoices:
+        issues = []
+        invoice.po_id = po.id
+
+        if invoice.vendor_id != po.vendor_id:
+            issues.append("Vendor does not match purchase order")
+
+        invoice_currency = str(invoice.currency or "").strip().upper()
+        po_currency = str(po.currency or "").strip().upper()
+
+        if (
+            not invoice_currency
+            or not po_currency
+            or invoice_currency != po_currency
+        ):
+            issues.append("Currency does not match purchase order")
+
+        if (
+            po.total_amount is None
+            or invoice.total_amount is None
+            or abs(po.total_amount - invoice.total_amount) > 0.01
+        ):
+            issues.append("Invoice total does not match purchase order")
+
+        invoice.match_status = (
+            "match_issues" if issues else "ready_for_review"
+        )
+        rematched += 1
+
+    db.flush()
+    return rematched
 
 def _save_purchase_order_from_extraction(
     db: Session,
@@ -499,6 +552,14 @@ def _save_purchase_order_from_extraction(
     )
     db.add(purchase_order)
     db.flush()
+
+    rematched = _rematch_waiting_invoices_for_po(db, purchase_order)
+    logger.info(
+        "Saved PO %s; rematched %s waiting invoice(s)",
+        purchase_order.po_number,
+        rematched,
+    )
+
     return purchase_order
 @router.post("/{document_id}/parse")
 def parse_document(

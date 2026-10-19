@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
 from src.api.rest.routers import document_routers
-
+from src.models.invoice_models import Invoice
 client = TestClient(app)
 
 
@@ -114,16 +114,22 @@ def _run_purchase_order_parse(monkeypatch, extracted_data, vendor=None, duplicat
     purchase_order_query = MagicMock()
     purchase_order_query.filter.return_value.first.return_value = duplicate
 
+
     db = MagicMock()
+
+    invoice_query = MagicMock()
+    invoice_query.filter.return_value.with_for_update.return_value.all.return_value = []
 
     def query_model(model):
         return {
             Document: document_query,
             Vendor: vendor_query,
             PurchaseOrder: purchase_order_query,
+            Invoice: invoice_query,
         }[model]
 
     db.query.side_effect = query_model
+
 
     monkeypatch.setattr(
         document_routers,
@@ -377,6 +383,70 @@ def test_invoice_matching_keeps_existing_one_cent_tolerance():
 
     assert invoice.match_status == "ready_for_review"
 
+def test_rematch_waiting_invoice_when_po_arrives():
+    from src.models.invoice_models import Invoice
+
+    po_id = uuid.uuid4()
+    vendor_id = uuid.uuid4()
+
+    po = SimpleNamespace(
+        id=po_id,
+        po_number="PO-101",
+        vendor_id=vendor_id,
+        currency="USD",
+        total_amount=1500,
+    )
+    invoice = SimpleNamespace(
+        po_number_raw="PO-101",
+        is_current=True,
+        match_status="waiting_for_po",
+        vendor_id=vendor_id,
+        currency="USD",
+        total_amount=1500,
+        po_id=None,
+    )
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.with_for_update.return_value.all.return_value = [
+        invoice
+    ]
+
+    count = document_routers._rematch_waiting_invoices_for_po(db, po)
+
+    assert count == 1
+    assert invoice.po_id == po_id
+    assert invoice.match_status == "ready_for_review"
+    db.flush.assert_called_once()
+
+
+def test_rematch_waiting_invoice_flags_amount_mismatch():
+    po = SimpleNamespace(
+        id=uuid.uuid4(),
+        po_number="PO-101",
+        vendor_id=uuid.uuid4(),
+        currency="USD",
+        total_amount=1500,
+    )
+    invoice = SimpleNamespace(
+        po_number_raw="PO-101",
+        is_current=True,
+        match_status="waiting_for_po",
+        vendor_id=po.vendor_id,
+        currency="USD",
+        total_amount=1800,
+        po_id=None,
+    )
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.with_for_update.return_value.all.return_value = [
+        invoice
+    ]
+
+    count = document_routers._rematch_waiting_invoices_for_po(db, po)
+
+    assert count == 1
+    assert invoice.po_id == po.id
+    assert invoice.match_status == "match_issues"
 
 def test_invoice_matching_requires_vendor_review_when_unresolved():
     po = SimpleNamespace(
