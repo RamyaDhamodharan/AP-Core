@@ -1,4 +1,3 @@
-
 import httpx
 import pytest
 
@@ -78,10 +77,7 @@ def test_extract_document_returns_json(monkeypatch):
                 "choices": [
                     {
                         "message": {
-                            "content": (
-                                '{"invoice_number": "INV-101", '
-                                '"total": 1500}'
-                            )
+                            "content": ('{"invoice_number": "INV-101", "total": 1500}')
                         }
                     }
                 ]
@@ -102,6 +98,7 @@ def test_extract_document_returns_json(monkeypatch):
     assert result["invoice_number"] == "INV-101"
     assert result["total"] == 1500
 
+
 def test_extract_document_uses_fallback_model(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setenv("GROQ_MODEL", "test-primary")
@@ -119,13 +116,7 @@ def test_extract_document_uses_fallback_model(monkeypatch):
         return httpx.Response(
             200,
             json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"invoice_number": "INV-202"}'
-                        }
-                    }
-                ]
+                "choices": [{"message": {"content": '{"invoice_number": "INV-202"}'}}]
             },
             request=httpx.Request("POST", "https://example.com"),
         )
@@ -139,6 +130,7 @@ def test_extract_document_uses_fallback_model(monkeypatch):
 
     assert attempted_models == ["test-primary", "test-fallback"]
     assert result["invoice_number"] == "INV-202"
+
 
 def test_extract_document_raises_when_both_models_fail(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
@@ -160,7 +152,6 @@ def test_extract_document_raises_when_both_models_fail(monkeypatch):
         extract_document("Supplier invoice INV-101", "invoice")
 
     assert attempted_models == ["test-primary", "test-fallback"]
-
 
 
 def test_validate_extracted_data_accepts_valid_invoice():
@@ -219,6 +210,30 @@ def test_validate_extracted_data_accepts_valid_purchase_order():
         "total": 2500,
     }
     assert validate_extracted_data(data, "po") == []
+
+
+def test_classify_document_normalizes_gr_alias(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"answers": {"doc_type": {"choice": "gr"}}}
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setenv("OPENROUTER_MODEL", "test-model")
+    monkeypatch.setattr(
+        "src.services.llm_pipeline_services.httpx.post",
+        lambda *args, **kwargs: Response(),
+    )
+    assert classify_document("Goods received note") == "goods_receipt"
+
+
+def test_goods_receipt_validation_requires_reference_and_date():
+    issues = validate_extracted_data({"vendor": "ABC"}, "goods_receipt")
+    assert "Missing required field: receipt_date" in issues
+    assert "Missing required field: gr_number" in issues
+    assert "Missing required field: order_number" in issues
 
 
 def test_validate_extracted_data_rejects_invalid_line_items():

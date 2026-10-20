@@ -1,57 +1,53 @@
-
 import uuid
 from datetime import datetime
 from typing import Any
-from sqlalchemy import Index
-from sqlalchemy import DateTime, ForeignKey, String, Text, func, text
-from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
+
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func, text
+from sqlalchemy.dialects.postgresql import CHAR, ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import CHAR
+
 from src.models.vendor_models import Base
 
 
 class Document(Base):
     __tablename__ = "documents"
-    __table_args__ = (
-        Index("ix_documents_status", "status"),
-    )
+    __table_args__ = (Index("ix_documents_status", "status"),)
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     original_filename: Mapped[str] = mapped_column(String(300), nullable=False)
-    file_hash: Mapped[str] = mapped_column(
-        CHAR(64), unique=True, nullable=False
-    )
+    file_hash: Mapped[str] = mapped_column(CHAR(64), unique=True, nullable=False)
     storage_path: Mapped[str | None] = mapped_column(String(500))
     parent_document_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id")
     )
     status: Mapped[str] = mapped_column(
-    ENUM(
-        "received",
-        "parsing",
-        "parsed",
-        "classified",
-        "extracted",
-        "needs_vendor_review",
-        "processed",
-        "ignored",
-        "incomplete",
-        "duplicate_blocked",
-        "failed",
-        name="doc_status",
-        create_type=False,
-    ),
-    nullable=False,
-    server_default=text("'received'"),
+        ENUM(
+            "received",
+            "parsing",
+            "parsed",
+            "classified",
+            "extracted",
+            "needs_vendor_review",
+            "processed",
+            "ignored",
+            "incomplete",
+            "duplicate_blocked",
+            "failed",
+            name="doc_status",
+            create_type=False,
+        ),
+        nullable=False,
+        server_default=text("'received'"),
     )
 
     doc_type: Mapped[str | None] = mapped_column(
         ENUM(
             "po",
             "invoice",
+            "goods_receipt",
             "other",
             name="doc_type",
             create_type=False,

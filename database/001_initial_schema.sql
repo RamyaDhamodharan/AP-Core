@@ -3,7 +3,7 @@ Get-ChildItem C:\Users\User\Desktop\AP\AP-Core\src\api\rest\routers -Name-- GenW
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TYPE user_role AS ENUM ('associate', 'admin');
-CREATE TYPE doc_type AS ENUM ('po', 'invoice', 'other');
+CREATE TYPE doc_type AS ENUM ('po', 'invoice', 'goods_receipt', 'other');
 CREATE TYPE doc_status AS ENUM ('received', 'parsing', 'parsed', 'classified', 'extracted', 'needs_vendor_review', 'processed', 'ignored', 'incomplete', 'duplicate_blocked', 'failed');CREATE TYPE match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'ready_for_review', 'match_issues', 'no_match');
 CREATE TYPE match_result AS ENUM ('match_ok', 'match_issues', 'no_match');
 CREATE TYPE review_decision AS ENUM ('approved', 'rejected', 'on_hold');
@@ -171,6 +171,38 @@ CREATE TABLE invoice_lines (
   created_by uuid REFERENCES users(id),
   updated_at timestamptz NOT NULL DEFAULT now(),
   updated_by uuid REFERENCES users(id)
+);
+
+CREATE TABLE goods_receipts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  gr_number varchar(60) NOT NULL UNIQUE,
+  po_id uuid NOT NULL REFERENCES purchase_orders(id),
+  vendor_id uuid NOT NULL REFERENCES vendors(id),
+  source_document_id uuid REFERENCES documents(id),
+  receipt_date date NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid REFERENCES users(id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid REFERENCES users(id)
+);
+CREATE INDEX ix_goods_receipts_po_id ON goods_receipts(po_id);
+CREATE UNIQUE INDEX uq_goods_receipts_gr_number_norm ON goods_receipts(lower(trim(gr_number)));
+
+CREATE TABLE goods_receipt_lines (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  goods_receipt_id uuid NOT NULL REFERENCES goods_receipts(id) ON DELETE CASCADE,
+  po_line_id uuid NOT NULL REFERENCES po_lines(id),
+  item_code varchar(60),
+  description varchar(300),
+  uom varchar(10),
+  received_qty numeric(14,3) NOT NULL CHECK (received_qty > 0),
+  accepted_qty numeric(14,3) NOT NULL CHECK (accepted_qty >= 0),
+  rejected_qty numeric(14,3) NOT NULL DEFAULT 0 CHECK (rejected_qty >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid REFERENCES users(id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid REFERENCES users(id),
+  CONSTRAINT ck_gr_line_qty_balance CHECK (accepted_qty + rejected_qty = received_qty)
 );
 
 CREATE TABLE exchange_rates (
