@@ -1,7 +1,7 @@
-
+﻿
 import uuid
 from datetime import datetime
-
+from sqlalchemy import Index, UniqueConstraint
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -13,6 +13,7 @@ class Base(DeclarativeBase):
 
 class Vendor(Base):
     __tablename__ = "vendors"
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
@@ -25,18 +26,27 @@ class Vendor(Base):
     contact_email: Mapped[str | None] = mapped_column(String(200))
     contact_phone: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(
-    DateTime(timezone=True), server_default=func.now()
-)
+        DateTime(timezone=True), server_default=func.now()
+    )
     updated_at: Mapped[datetime] = mapped_column(
-    DateTime(timezone=True),
-    server_default=func.now(),
-    onupdate=func.now(),
-)
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
 
 
 class VendorAlias(Base):
     __tablename__ = "vendor_aliases"
-
+    __table_args__ = (
+        UniqueConstraint("vendor_id", "alias_norm", name="uq_vendor_alias"),
+        Index("uq_vendor_alias_norm", "alias_norm", unique=True),
+    )
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
@@ -64,4 +74,10 @@ class VendorAlias(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
     )

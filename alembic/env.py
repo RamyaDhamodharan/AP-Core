@@ -8,12 +8,14 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 from src.models import (
-    audit_models,  # noqa: F401
-    document_models,  # noqa: F401
-    invoice_models,  # noqa: F401
-    notification_models,  # noqa: F401
-    purchase_order_models,  # noqa: F401
-    user_models,  # noqa: F401
+    audit_models,
+    document_models,
+    invoice_models,
+    match_run_models,
+    notification_models,
+    purchase_order_models,
+    user_models,
+    exchange_rate_models,
 )
 from src.models.vendor_models import Base
 

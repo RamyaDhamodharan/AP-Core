@@ -2,27 +2,31 @@
 import uuid
 from datetime import datetime
 from typing import Any
-
-from sqlalchemy import DateTime, String, Text, func, text
+from sqlalchemy import Index
+from sqlalchemy import DateTime, ForeignKey, String, Text, func, text
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
-
+from sqlalchemy.dialects.postgresql import CHAR
 from src.models.vendor_models import Base
 
 
 class Document(Base):
     __tablename__ = "documents"
-
+    __table_args__ = (
+        Index("ix_documents_status", "status"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     original_filename: Mapped[str] = mapped_column(String(300), nullable=False)
-    file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    file_hash: Mapped[str] = mapped_column(
+        CHAR(64), unique=True, nullable=False
+    )
     storage_path: Mapped[str | None] = mapped_column(String(500))
     parent_document_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True)
+        UUID(as_uuid=True), ForeignKey("documents.id")
     )
     status: Mapped[str] = mapped_column(
     ENUM(
@@ -63,11 +67,15 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
     )
-    updated_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )

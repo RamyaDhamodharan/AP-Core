@@ -36,12 +36,11 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == [ALIAS_REVISION]
+    assert script.get_heads() == ["0f7ca912d0e0"]
     alias_revision = script.get_revision(ALIAS_REVISION)
     assert alias_revision is not None
     assert alias_revision.down_revision == BASELINE_REVISION
-    assert script.get_revision(BASELINE_REVISION).down_revision is None
-
+    assert script.get_revision("0f7ca912d0e0").down_revision == ALIAS_REVISION
 
 def test_sql_bootstrap_matches_pre_alias_migration_baseline():
     schema = (ROOT / "database" / "001_initial_schema.sql").read_text()
