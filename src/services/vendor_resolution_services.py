@@ -15,9 +15,7 @@ def normalize_vendor_name(value: object) -> str:
 
 
 def _normalized_name_expression(column: Any) -> Any:
-    return func.lower(
-        func.regexp_replace(func.trim(column), r"\s+", " ", "g")
-    )
+    return func.lower(func.regexp_replace(func.trim(column), r"\s+", " ", "g"))
 
 
 def find_canonical_name_conflict(
@@ -29,9 +27,7 @@ def find_canonical_name_conflict(
     normalized_name = normalize_vendor_name(name)
     if not normalized_name:
         return None
-    filters = [
-        _normalized_name_expression(Vendor.name) == normalized_name
-    ]
+    filters = [_normalized_name_expression(Vendor.name) == normalized_name]
     if exclude_vendor_id is not None:
         filters.append(Vendor.id != exclude_vendor_id)
     return db.query(Vendor).filter(*filters).first()

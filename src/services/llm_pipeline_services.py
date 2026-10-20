@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -14,10 +15,67 @@ OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DOCUMENT_TYPES = {"invoice", "po", "goods_receipt", "other"}
+_E2E_PAYLOAD_PATTERN = re.compile(
+    r"GW_AP_E2E_JSON_BEGIN(.*?)GW_AP_E2E_JSON_END", re.DOTALL
+)
+
+
+def _e2e_mock_enabled() -> bool:
+    """Enable deterministic extraction only in an explicitly marked test app."""
+    enabled = os.getenv("AP_E2E_MOCK_EXTRACTION", "")
+    if not enabled:
+        return False
+    if enabled != "1" or os.getenv("APP_ENV") != "test":
+        raise RuntimeError(
+            "AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1"
+        )
+    return True
+
+
+def _e2e_payload(raw_text: str) -> dict[str, Any]:
+    """Decode the deterministic JSON marker embedded in synthetic test PDFs."""
+    match = _E2E_PAYLOAD_PATTERN.search(raw_text)
+    if match is None:
+        raise ValueError("E2E mock payload is missing from the synthetic document")
+    try:
+        encoded = re.sub(r"\s+", "", match.group(1))
+        payload = json.loads(base64.b64decode(encoded, validate=True))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("E2E mock payload is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("E2E mock payload must be a JSON object")
+    return payload
+
+
+def extract_e2e_test_document_text(content: bytes) -> str:
+    """Read synthetic PDFs without loading or downloading Docling models."""
+    if not _e2e_mock_enabled():
+        raise RuntimeError("The local E2E document parser is test-only")
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(content)
+    try:
+        raw_text = "\n".join(
+            page.get_textpage().get_text_range() for page in document
+        )
+    finally:
+        document.close()
+    if _E2E_PAYLOAD_PATTERN.search(raw_text) is None:
+        raise ValueError("Synthetic E2E PDF does not contain a mock payload")
+    return raw_text
 
 
 def classify_document(raw_text: str) -> str:
     """Classify document text using OpenRouter Luna Decisions."""
+    if _e2e_mock_enabled():
+        doc_type = str(_e2e_payload(raw_text).get("document_type", "")).lower()
+        if doc_type == "gr":
+            doc_type = "goods_receipt"
+        if doc_type not in DOCUMENT_TYPES:
+            raise ValueError(f"Invalid E2E document type: {doc_type!r}")
+        return doc_type
+
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     model = os.getenv("OPENROUTER_MODEL", "")
 
@@ -166,6 +224,17 @@ def extract_document(
     doc_type: str,
 ) -> dict[str, Any]:
     """Extract document fields with primary and fallback Groq models."""
+    if _e2e_mock_enabled():
+        payload = _e2e_payload(raw_text)
+        payload_type = str(payload.get("document_type", "")).lower()
+        if payload_type == "gr":
+            payload_type = "goods_receipt"
+        if payload_type != doc_type:
+            raise ValueError("E2E mock type does not match classified document")
+        return {
+            key: value for key, value in payload.items() if key != "document_type"
+        }
+
     api_key = os.getenv("GROQ_API_KEY", "")
     primary_model = os.getenv("GROQ_MODEL", "")
     fallback_model = os.getenv("GROQ_FALLBACK_MODEL", "")
@@ -257,6 +326,7 @@ def validate_extracted_data(
     if extracted_type is not None:
         normalized_type = str(extracted_type).strip().lower()
         aliases = {
+            "gst bill": "invoice",
             "purchase_order": "po",
             "purchase order": "po",
             "payment advice": "other",

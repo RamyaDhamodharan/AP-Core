@@ -42,9 +42,7 @@ def _setup_alerts(rows=None, total=0):
 def _setup_notification_list(rows=None, total=0):
     user_id = uuid.uuid4()
     user_query = MagicMock()
-    user_query.filter.return_value.scalar.return_value = (
-        "reviewer@example.com"
-    )
+    user_query.filter.return_value.scalar.return_value = "reviewer@example.com"
 
     count_query = MagicMock()
     count_query.filter.return_value = count_query
@@ -139,9 +137,7 @@ def test_exception_alerts_only_include_current_invoices():
     _, query, teardown = _setup_alerts([], total=0)
 
     try:
-        response = client.get(
-            "/api/notifications/exception-alerts?page=2&page_size=5"
-        )
+        response = client.get("/api/notifications/exception-alerts?page=2&page_size=5")
     finally:
         teardown()
 
@@ -150,18 +146,11 @@ def test_exception_alerts_only_include_current_invoices():
         expression.compile(dialect=postgresql.dialect())
         for expression in query.filter.call_args.args
     ]
+    assert any("invoices.is_current" in str(expression) for expression in compiled)
     assert any(
-        "invoices.is_current" in str(expression)
-        for expression in compiled
+        "invoices.final_status IS NULL" in str(expression) for expression in compiled
     )
-    assert any(
-        "invoices.final_status IS NULL" in str(expression)
-        for expression in compiled
-    )
-    assert any(
-        "invoices.match_status IN" in str(expression)
-        for expression in compiled
-    )
+    assert any("invoices.match_status IN" in str(expression) for expression in compiled)
     query.offset.assert_called_once_with(5)
     query.limit.assert_called_once_with(5)
 
@@ -226,9 +215,7 @@ def test_notifications_returns_existing_notification_with_invoice_context():
     assert "last_error" not in item
 
     notification_filter = count_query.filter.call_args.args[0]
-    compiled_filter = notification_filter.compile(
-        dialect=postgresql.dialect()
-    )
+    compiled_filter = notification_filter.compile(dialect=postgresql.dialect())
     assert "notifications.recipient_email" in str(compiled_filter)
     assert "reviewer@example.com" in compiled_filter.params.values()
     assert list_query.filter.call_count == 1

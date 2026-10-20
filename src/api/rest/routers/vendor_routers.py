@@ -142,9 +142,9 @@ def list_vendors(
     if page is not None or page_size is not None:
         resolved_page = page or 1
         resolved_page_size = page_size or 20
-        statement = statement.offset(
-            (resolved_page - 1) * resolved_page_size
-        ).limit(resolved_page_size)
+        statement = statement.offset((resolved_page - 1) * resolved_page_size).limit(
+            resolved_page_size
+        )
 
     return db.scalars(statement).all()
 
@@ -185,11 +185,7 @@ def create_vendor(
         name=payload.name,
         tax_id=payload.tax_id,
         contact_name=payload.contact_name,
-        contact_email=(
-            str(payload.contact_email)
-            if payload.contact_email
-            else None
-        ),
+        contact_email=(str(payload.contact_email) if payload.contact_email else None),
         contact_phone=payload.contact_phone,
     )
 

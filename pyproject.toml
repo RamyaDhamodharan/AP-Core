@@ -18,11 +18,12 @@ dependencies = [
   "minio>=7.2.0",
   "python-multipart>=0.0.20",
   "httpx>=0.28.1",
+  "docling",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx", "ruff", "mypy"]
-documents = ["docling", "torch", "torchvision"]
+documents = ["torch", "torchvision"]
 
 [tool.ruff]
 line-length = 88

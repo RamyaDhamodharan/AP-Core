@@ -1,8 +1,16 @@
-﻿
 import uuid
 from datetime import datetime
-from sqlalchemy import Index, UniqueConstraint
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func, text
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 

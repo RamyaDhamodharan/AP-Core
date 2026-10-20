@@ -17,9 +17,8 @@ client = TestClient(app)
 def _setup_review(invoice):
     reviewer_id = uuid.uuid4()
     query = MagicMock()
-    query.filter.return_value.with_for_update.return_value.first.return_value = (
-        invoice
-    )
+    query.outerjoin.return_value = query
+    query.filter.return_value.with_for_update.return_value.first.return_value = invoice
     db = MagicMock()
     db.query.return_value = query
     app.dependency_overrides[get_db] = lambda: db
@@ -65,9 +64,7 @@ def test_review_invoice_approves_and_audits_decision():
     db.commit.assert_called_once()
 
     audit = next(
-        item
-        for item in db.add.call_args_list[0].args
-        if isinstance(item, AuditLog)
+        item for item in db.add.call_args_list[0].args if isinstance(item, AuditLog)
     )
     assert audit.action == "invoice_review_decision"
     assert audit.entity_type == "invoice"

@@ -8,6 +8,7 @@ from alembic import context
 from src.models import (
     audit_models,
     document_models,
+    document_workflow_models,
     exchange_rate_models,
     goods_receipt_models,
     invoice_models,
@@ -22,6 +23,7 @@ from src.models.vendor_models import Base
 _MODEL_MODULES = (
     audit_models,
     document_models,
+    document_workflow_models,
     exchange_rate_models,
     goods_receipt_models,
     invoice_models,

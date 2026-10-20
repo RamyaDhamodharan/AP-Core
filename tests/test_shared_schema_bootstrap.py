@@ -22,9 +22,7 @@ def test_users_bootstrap_matches_ap_auth_column_and_default_contract():
     assert re.search(r"^\s*email varchar NOT NULL UNIQUE,", users, re.MULTILINE)
     assert re.search(r"^\s*password_hash varchar NOT NULL,", users, re.MULTILINE)
     assert re.search(r"^\s*role user_role NOT NULL,", users, re.MULTILINE)
-    assert (
-        "must_change_password boolean NOT NULL DEFAULT false" in users
-    )
+    assert "must_change_password boolean NOT NULL DEFAULT false" in users
     assert "role user_role NOT NULL DEFAULT" not in users
 
 
@@ -51,9 +49,7 @@ def test_reconciliation_preserves_existing_table_constraints():
         "CONSTRAINT uq_exchange_rate UNIQUE(from_currency, to_currency, rate_date)"
         in exchange_rates
     )
-    assert (
-        "CONSTRAINT uq_match_run_no UNIQUE(invoice_id, run_no)" in match_runs
-    )
+    assert "CONSTRAINT uq_match_run_no UNIQUE(invoice_id, run_no)" in match_runs
     assert (
         "invoice_id uuid NOT NULL REFERENCES invoices(id) ON DELETE CASCADE"
         in match_runs

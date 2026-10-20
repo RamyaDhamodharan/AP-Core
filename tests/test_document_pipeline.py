@@ -1,14 +1,18 @@
-
 import sys
 import uuid
+from datetime import date
+from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
+from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
 from src.models.invoice_models import Invoice
+
 client = TestClient(app)
 
 
@@ -53,8 +57,7 @@ def _save_invoice_for_matching(
     )
     versions_query = MagicMock()
     versions_query_result = (
-        versions_query.filter.return_value
-        .order_by.return_value.with_for_update.return_value
+        versions_query.filter.return_value.order_by.return_value.with_for_update.return_value
     )
     versions_query_result.all.return_value = prior_versions or []
     db_version_query = versions_query
@@ -67,11 +70,7 @@ def _save_invoice_for_matching(
     alias_query.join.return_value.filter.return_value.all.return_value = (
         alias_matches
         if alias_matches is not None
-        else (
-            [(SimpleNamespace(), alias_vendor)]
-            if alias_vendor is not None
-            else []
-        )
+        else ([(SimpleNamespace(), alias_vendor)] if alias_vendor is not None else [])
     )
     po_query = MagicMock()
     po_query.filter.return_value.first.return_value = purchase_order
@@ -82,11 +81,7 @@ def _save_invoice_for_matching(
         nonlocal invoice_query_count
         if model is Invoice:
             invoice_query_count += 1
-            return (
-                invoice_query
-                if invoice_query_count == 1
-                else versions_query
-            )
+            return invoice_query if invoice_query_count == 1 else versions_query
         if model is Vendor:
             return vendor_query
         if model is VendorAlias or models == (VendorAlias, Vendor):
@@ -131,19 +126,24 @@ def _run_purchase_order_parse(
     )
 
     document_query = MagicMock()
-    document_query.filter_by.return_value.first.return_value = document
+    document_query.filter.return_value.first.return_value = document
+    locked_document_query = (
+        document_query.filter.return_value.with_for_update.return_value
+    )
+    locked_document_query.first.return_value = document
     vendor_query = MagicMock()
     vendor_query.filter.return_value.all.return_value = (
         [vendor] if vendor is not None else []
     )
     alias_query = MagicMock()
     alias_query.join.return_value.filter.return_value.all.return_value = (
-        [(SimpleNamespace(), alias_vendor)]
-        if alias_vendor is not None
-        else []
+        [(SimpleNamespace(), alias_vendor)] if alias_vendor is not None else []
     )
     purchase_order_query = MagicMock()
     purchase_order_query.filter.return_value.first.return_value = duplicate
+    (
+        purchase_order_query.filter.return_value.filter.return_value.first.return_value
+    ) = duplicate
     invoice_query = MagicMock()
     invoice_query.filter.return_value.with_for_update.return_value.all.return_value = []
 
@@ -160,7 +160,6 @@ def _run_purchase_order_parse(
         }[model]
 
     db.query.side_effect = query_model
-
 
     monkeypatch.setattr(
         document_routers,
@@ -196,13 +195,13 @@ def _run_purchase_order_parse(
         lambda text, doc_type: extracted_data,
     )
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{document_id}/parse"
-        )
+        response = client.post(f"/api/documents/{document_id}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     return response, document, db
 
@@ -223,7 +222,15 @@ def test_parse_document_success(monkeypatch):
 
     # Mock database session
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = document
+    query = db.query.return_value
+    query.filter.return_value.first.return_value = document
+    locked_query = query.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = document
+    monkeypatch.setattr(
+        document_routers,
+        "_save_invoice_from_extraction",
+        lambda *args, **kwargs: None,
+    )
 
     # Mock file download from MinIO
     monkeypatch.setattr(
@@ -237,9 +244,7 @@ def test_parse_document_success(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_markdown=lambda: (
-                        "Supplier invoice INV-101. Total: 1500"
-                    )
+                    export_to_markdown=lambda: "Supplier invoice INV-101. Total: 1500"
                 )
             )
 
@@ -266,28 +271,28 @@ def test_parse_document_success(monkeypatch):
         document_routers,
         "extract_document",
         lambda text, doc_type: {
-    "document_type": "invoice",
-    "vendor": "ABC Supplies",
-    "invoice_number": "INV-101",
-    "invoice_date": "2026-10-01",
-    "subtotal": 1500,
-    "tax": 0,
-    "total": 1500,
-    "line_items": [],
-}
+            "document_type": "invoice",
+            "vendor": "ABC Supplies",
+            "invoice_number": "INV-101",
+            "invoice_date": "2026-10-01",
+            "subtotal": 1500,
+            "tax": 0,
+            "total": 1500,
+            "line_items": [],
+        },
     )
 
     # Override FastAPI database dependency
     from src.db.session_db import get_db
 
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{document_id}/parse"
-        )
+        response = client.post(f"/api/documents/{document_id}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     # Verify API response
     assert response.status_code == 200
@@ -454,8 +459,8 @@ def test_invoice_matching_keeps_existing_one_cent_tolerance():
 
     assert invoice.match_status == "ready_for_review"
 
+
 def test_rematch_waiting_invoice_when_po_arrives():
-    from src.models.invoice_models import Invoice
 
     po_id = uuid.uuid4()
     vendor_id = uuid.uuid4()
@@ -478,9 +483,9 @@ def test_rematch_waiting_invoice_when_po_arrives():
     )
 
     db = MagicMock()
-    db.query.return_value.filter.return_value.with_for_update.return_value.all.return_value = [
-        invoice
-    ]
+    (
+        db.query.return_value.filter.return_value.with_for_update.return_value.all
+    ).return_value = [invoice]
 
     count = document_routers._rematch_waiting_invoices_for_po(db, po)
 
@@ -509,15 +514,16 @@ def test_rematch_waiting_invoice_flags_amount_mismatch():
     )
 
     db = MagicMock()
-    db.query.return_value.filter.return_value.with_for_update.return_value.all.return_value = [
-        invoice
-    ]
+    (
+        db.query.return_value.filter.return_value.with_for_update.return_value.all
+    ).return_value = [invoice]
 
     count = document_routers._rematch_waiting_invoices_for_po(db, po)
 
     assert count == 1
     assert invoice.po_id == po.id
     assert invoice.match_status == "match_issues"
+
 
 def test_invoice_matching_requires_vendor_review_when_unresolved():
     po = SimpleNamespace(
@@ -559,7 +565,7 @@ def test_invoice_matching_requires_review_for_ambiguous_vendor_alias():
     assert invoice.match_status == "needs_vendor_review"
 
 
-def test_invoice_matching_updates_existing_record_on_rerun():
+def test_invoice_matching_rerun_rejects_changed_extraction_without_overwrite():
     vendor = SimpleNamespace(id=uuid.uuid4())
     po = SimpleNamespace(
         id=uuid.uuid4(),
@@ -567,20 +573,34 @@ def test_invoice_matching_updates_existing_record_on_rerun():
         currency="USD",
         total_amount=1500,
     )
-    existing_invoice = SimpleNamespace()
-
-    invoice, db, _ = _save_invoice_for_matching(
-        vendor=vendor,
-        purchase_order=po,
-        existing_invoice=existing_invoice,
-        extracted_data={"total": "1600.00"},
+    existing_invoice = SimpleNamespace(
+        is_current=True,
+        invoice_no="INV-101",
+        vendor_id=vendor.id,
+        vendor_name_raw="ABC Supplies",
+        vendor_tax_id_raw=None,
+        invoice_date=date(2026, 10, 1),
+        due_date=None,
+        currency="USD",
+        subtotal=Decimal("1500.00"),
+        tax_amount=Decimal("0"),
+        total_amount=Decimal("1500.00"),
+        po_number_raw="PO-101",
+        po_id=po.id,
+        match_status="ready_for_review",
     )
 
-    assert invoice is existing_invoice
-    assert invoice.po_id == po.id
-    assert invoice.match_status == "match_issues"
-    assert invoice.total_amount == 1600
-    db.add.assert_not_called()
+    with pytest.raises(ValueError, match="differs from the previously saved record"):
+        _save_invoice_for_matching(
+            vendor=vendor,
+            purchase_order=po,
+            existing_invoice=existing_invoice,
+            extracted_data={"total": "1600.00"},
+        )
+
+    assert existing_invoice.po_id == po.id
+    assert existing_invoice.match_status == "ready_for_review"
+    assert existing_invoice.total_amount == Decimal("1500.00")
 
 
 def test_invoice_persistence_creates_next_version_and_demotes_current():
@@ -639,6 +659,19 @@ def test_invoice_persistence_rerun_updates_current_source_without_new_version():
         id=uuid.uuid4(),
         is_current=True,
         version_no=4,
+        invoice_no="INV-101",
+        vendor_id=vendor.id,
+        vendor_name_raw="ABC Supplies",
+        vendor_tax_id_raw=None,
+        invoice_date=date(2026, 10, 1),
+        due_date=None,
+        currency="USD",
+        subtotal=Decimal("1500.00"),
+        tax_amount=Decimal("0"),
+        total_amount=Decimal("1500.00"),
+        po_number_raw="PO-101",
+        po_id=None,
+        match_status="waiting_for_po",
     )
 
     invoice, db, _ = _save_invoice_for_matching(
@@ -742,9 +775,7 @@ def test_parse_document_does_not_persist_incomplete_purchase_order(
 
     assert response.status_code == 200
     assert response.json()["status"] == "needs_vendor_review"
-    assert "Missing required field: po_date" in response.json()[
-        "validation_issues"
-    ]
+    assert "Missing required field: po_date" in response.json()["validation_issues"]
     assert document.extracted_json == data
     db.add.assert_not_called()
 
@@ -811,16 +842,19 @@ def test_parse_document_not_found(monkeypatch):
     from src.db.session_db import get_db
 
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = None
+    query = db.query.return_value
+    query.filter.return_value.first.return_value = None
+    locked_query = query.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = None
 
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{uuid.uuid4()}/parse"
-        )
+        response = client.post(f"/api/documents/{uuid.uuid4()}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == 404
 
@@ -842,7 +876,10 @@ def test_parse_document_download_failure(monkeypatch):
     )
 
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = document
+    query = db.query.return_value
+    query.filter.return_value.first.return_value = document
+    locked_query = query.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = document
 
     def fail_download(path):
         raise RuntimeError("MinIO download failed")
@@ -854,13 +891,13 @@ def test_parse_document_download_failure(monkeypatch):
     )
 
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{document_id}/parse"
-        )
+        response = client.post(f"/api/documents/{document_id}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code >= 400
 
@@ -882,7 +919,10 @@ def test_parse_document_classification_failure(monkeypatch):
     )
 
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = document
+    query = db.query.return_value
+    query.filter.return_value.first.return_value = document
+    locked_query = query.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = document
 
     monkeypatch.setattr(
         document_routers,
@@ -919,13 +959,13 @@ def test_parse_document_classification_failure(monkeypatch):
     )
 
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{document_id}/parse"
-        )
+        response = client.post(f"/api/documents/{document_id}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code >= 400
 
@@ -947,7 +987,10 @@ def test_parse_document_extraction_failure(monkeypatch):
     )
 
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = document
+    query = db.query.return_value
+    query.filter.return_value.first.return_value = document
+    locked_query = query.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = document
 
     monkeypatch.setattr(
         document_routers,
@@ -990,12 +1033,12 @@ def test_parse_document_extraction_failure(monkeypatch):
     )
 
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
 
     try:
-        response = client.post(
-            f"/api/documents/{document_id}/parse"
-        )
+        response = client.post(f"/api/documents/{document_id}/parse")
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code >= 400

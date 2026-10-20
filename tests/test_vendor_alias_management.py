@@ -61,9 +61,7 @@ def _alias(
 
 def _resolver_db(canonical_vendors=(), alias_rows=()):
     canonical_query = MagicMock()
-    canonical_query.filter.return_value.all.return_value = list(
-        canonical_vendors
-    )
+    canonical_query.filter.return_value.all.return_value = list(canonical_vendors)
     alias_query = MagicMock()
     alias_query.join.return_value.filter.return_value.all.return_value = list(
         alias_rows
@@ -74,9 +72,7 @@ def _resolver_db(canonical_vendors=(), alias_rows=()):
 
 
 def test_vendor_name_normalization_collapses_whitespace_and_case():
-    assert normalize_vendor_name("  ACME \t  SUPPLIES \n") == (
-        "acme supplies"
-    )
+    assert normalize_vendor_name("  ACME \t  SUPPLIES \n") == ("acme supplies")
 
 
 def test_resolution_prefers_exact_canonical_name():
@@ -143,12 +139,10 @@ def test_resolution_filters_out_inactive_aliases_and_vendors():
         for expression in alias_query.join.return_value.filter.call_args.args
     ]
     assert any(
-        "vendor_aliases.is_active IS true" in str(expression)
-        for expression in compiled
+        "vendor_aliases.is_active IS true" in str(expression) for expression in compiled
     )
     assert any(
-        "vendors.is_active IS true" in str(expression)
-        for expression in compiled
+        "vendors.is_active IS true" in str(expression) for expression in compiled
     )
 
 
@@ -254,13 +248,9 @@ def test_alias_update_changes_only_supplied_fields():
     alias = _alias(vendor.id)
     alias_query = MagicMock()
     alias_query.filter.return_value.first.return_value = None
-    alias_query.filter.return_value.filter.return_value.first.return_value = (
-        None
-    )
+    alias_query.filter.return_value.filter.return_value.first.return_value = None
     db, teardown = _setup()
-    db.get.side_effect = lambda model, _id: (
-        alias if model is VendorAlias else vendor
-    )
+    db.get.side_effect = lambda model, _id: alias if model is VendorAlias else vendor
     db.query.return_value = alias_query
 
     try:
@@ -285,9 +275,7 @@ def test_alias_deactivation_is_soft_and_persistent():
     db.get.return_value = alias
 
     try:
-        response = client.delete(
-            f"/api/vendors/{vendor.id}/aliases/{alias.id}"
-        )
+        response = client.delete(f"/api/vendors/{vendor.id}/aliases/{alias.id}")
     finally:
         teardown()
 

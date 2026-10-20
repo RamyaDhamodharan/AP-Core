@@ -1,4 +1,3 @@
-
 import os
 
 from dotenv import load_dotenv
@@ -22,6 +21,7 @@ SessionLocal = sessionmaker(
     autoflush=False,
     autocommit=False,
 )
+
 
 def get_db():
     db = SessionLocal()

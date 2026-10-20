@@ -1,9 +1,16 @@
 import uuid
 from datetime import datetime
 from typing import Any
-from sqlalchemy import Index
-from sqlalchemy import UniqueConstraint
-from sqlalchemy import DateTime, ForeignKey, String, Text, func, text
+
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -49,8 +56,10 @@ class AuditLog(Base):
         ForeignKey("users.id"),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),

@@ -9,8 +9,10 @@ from sqlalchemy.orm import Session
 from src.api.rest.dependencies import get_current_user
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
+from src.models.document_models import Document
 from src.models.invoice_models import Invoice
 from src.models.vendor_models import Vendor
+from src.schemas.document_workflow_schemas import InvoiceRecommendation
 from src.schemas.invoice_schemas import (
     InvoiceDashboardItem,
     InvoiceDashboardResponse,
@@ -19,19 +21,83 @@ from src.schemas.invoice_schemas import (
     InvoiceReviewRequest,
     InvoiceReviewResponse,
 )
-from src.services.po_matching_services import match_invoice_three_way
+from src.services.document_workflow_services import (
+    recommend_invoice_review,
+)
 
 router = APIRouter(prefix="/api/invoices", tags=["Invoices"])
 
 
+def _owner_id(user: dict) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+
+
+def _invoice_owner_filter(owner_id: uuid.UUID):
+    return or_(
+        Invoice.owner_user_id == owner_id,
+        Invoice.created_by == owner_id,
+        Document.created_by == owner_id,
+    )
+
+
 @router.post("/{invoice_id}/three-way-match", dependencies=[Depends(get_current_user)])
 def three_way_match_invoice(
-    invoice_id: uuid.UUID, db: Session = Depends(get_db)
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
-    invoice = db.get(Invoice, invoice_id)
+    owner_id = _owner_id(current_user)
+    invoice = db.query(Invoice).outerjoin(
+        Document, Invoice.source_document_id == Document.id
+    ).filter(Invoice.id == invoice_id, _invoice_owner_filter(owner_id)).first()
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return match_invoice_three_way(db, invoice)
+    recommendation = recommend_invoice_review(db, invoice, owner_id=owner_id)
+    checks = [item.model_dump(mode="json") for item in recommendation.checks]
+    return {
+        **recommendation.model_dump(mode="json"),
+        "matched": recommendation.matching_status == "matched",
+        "requires_review": recommendation.human_review_required,
+        "issues": [
+            item.reason
+            for item in recommendation.checks
+            if item.outcome in {"mismatch", "not_possible"}
+        ],
+        "status": recommendation.matching_status,
+        "available_documents": [
+            item.model_dump(mode="json")
+            for item in recommendation.supporting_records
+        ],
+        "checks": checks,
+        "recommended_next_actions": [recommendation.next_recommended_action],
+        "human_decision_required": recommendation.matching_status
+        in {"review_required", "awaiting_human_decision"},
+        "invoice_approval_required": True,
+    }
+
+
+@router.get(
+    "/{invoice_id}/recommendation",
+    response_model=InvoiceRecommendation,
+    dependencies=[Depends(get_current_user)],
+)
+def get_invoice_recommendation(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> InvoiceRecommendation:
+    owner_id = _owner_id(current_user)
+    invoice = db.query(Invoice).outerjoin(
+        Document, Invoice.source_document_id == Document.id
+    ).filter(Invoice.id == invoice_id, _invoice_owner_filter(owner_id)).first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return recommend_invoice_review(db, invoice, owner_id=owner_id)
 
 
 _UNRESOLVED_MATCH_STATUSES = {
@@ -56,8 +122,9 @@ def _invoice_dashboard_filters(
     due_date_to: date | None,
     search: str | None,
     review_queue: bool,
+    owner_id: uuid.UUID,
 ) -> list:
-    filters = []
+    filters = [_invoice_owner_filter(owner_id)]
     if match_status:
         filters.append(Invoice.match_status == match_status)
     if final_status:
@@ -99,12 +166,14 @@ def _invoice_dashboard_response(
         db.query(func.count(Invoice.id))
         .select_from(Invoice)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
         .scalar()
     )
     rows = (
-        db.query(Invoice, Vendor.name.label("vendor_name"))
+        db.query(Invoice, Vendor.name.label("vendor_name"), Document.status)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
         .order_by(Invoice.invoice_date.desc(), Invoice.id)
         .offset((page - 1) * page_size)
@@ -116,6 +185,8 @@ def _invoice_dashboard_response(
         items=[
             InvoiceDashboardItem(
                 invoice_id=invoice.id,
+                source_document_id=invoice.source_document_id,
+                processing_status=document_status,
                 invoice_no=invoice.invoice_no,
                 vendor_name=vendor_name or invoice.vendor_name_raw,
                 invoice_date=invoice.invoice_date,
@@ -125,7 +196,7 @@ def _invoice_dashboard_response(
                 match_status=invoice.match_status,
                 final_status=invoice.final_status,
             )
-            for invoice, vendor_name in rows
+            for invoice, vendor_name, document_status in rows
         ],
         total=total or 0,
         page=page,
@@ -145,6 +216,7 @@ def _dashboard_query_parameters(
     due_date_to: date | None,
     search: str | None,
     review_queue: bool,
+    owner_id: uuid.UUID,
 ) -> list:
     if invoice_date_from and invoice_date_to and invoice_date_from > invoice_date_to:
         raise HTTPException(
@@ -178,6 +250,7 @@ def _dashboard_query_parameters(
         due_date_to=due_date_to,
         search=search,
         review_queue=review_queue,
+        owner_id=owner_id,
     )
 
 
@@ -199,6 +272,7 @@ def list_invoices(
     due_date_to: date | None = None,
     search: Annotated[str | None, Query(max_length=200)] = None,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> InvoiceDashboardResponse:
     filters = _dashboard_query_parameters(
         match_status=match_status,
@@ -211,6 +285,7 @@ def list_invoices(
         due_date_to=due_date_to,
         search=search,
         review_queue=False,
+        owner_id=_owner_id(current_user),
     )
     return _invoice_dashboard_response(
         db,
@@ -238,6 +313,7 @@ def list_invoice_review_queue(
     due_date_to: date | None = None,
     search: Annotated[str | None, Query(max_length=200)] = None,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> InvoiceDashboardResponse:
     filters = _dashboard_query_parameters(
         match_status=match_status,
@@ -250,6 +326,7 @@ def list_invoice_review_queue(
         due_date_to=due_date_to,
         search=search,
         review_queue=True,
+        owner_id=_owner_id(current_user),
     )
     return _invoice_dashboard_response(
         db,
@@ -269,16 +346,13 @@ def review_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> InvoiceReviewResponse:
-    try:
-        reviewer_id = uuid.UUID(str(current_user["sub"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Authenticated user ID is invalid",
-        ) from exc
-
+    reviewer_id = _owner_id(current_user)
     invoice = (
-        db.query(Invoice).filter(Invoice.id == invoice_id).with_for_update().first()
+        db.query(Invoice)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
+        .filter(Invoice.id == invoice_id, _invoice_owner_filter(reviewer_id))
+        .with_for_update(of=Invoice)
+        .first()
     )
 
     if invoice is None:

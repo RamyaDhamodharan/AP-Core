@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
+from src.api.rest.routers import invoice_routers
 from src.api.rest.routers.document_routers import (
     _save_goods_receipt_from_extraction,
 )
@@ -17,7 +18,6 @@ from src.api.rest.routers.goods_receipt_routers import (
     _handle_goods_receipt_integrity_error,
 )
 from src.db.session_db import get_db
-from src.models.invoice_models import Invoice
 from src.services.po_matching_services import match_invoice_three_way
 
 client = TestClient(app)
@@ -173,7 +173,9 @@ def test_create_goods_receipt_rejects_duplicate_number():
     assert response.status_code == 409
 
 
-def _extraction_case(*, duplicate=False, vendor_mismatch=False, po_lines=None):
+def _extraction_case(
+    *, duplicate=False, vendor_mismatch=False, po_lines=None, po_candidates=None
+):
     po_id = uuid.uuid4()
     vendor_id = uuid.uuid4()
     po = SimpleNamespace(
@@ -188,8 +190,9 @@ def _extraction_case(*, duplicate=False, vendor_mismatch=False, po_lines=None):
     )
     po_lines = po_lines if po_lines is not None else [default_line]
     queries = [
+        _query(first=None),
         _query(first=object() if duplicate else None),
-        _query(first=po),
+        _query(po_candidates if po_candidates is not None else [po]),
         _query(po_lines),
     ]
     db = MagicMock()
@@ -231,6 +234,20 @@ def test_goods_receipt_extraction_rejects_duplicate_number():
     db, document, data, vendor, _ = _extraction_case(duplicate=True)
     with pytest.raises(ValueError, match="Duplicate goods receipt number"):
         _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_not_called()
+
+
+def test_goods_receipt_extraction_does_not_choose_ambiguous_purchase_order():
+    po_id = uuid.uuid4()
+    candidates = [
+        SimpleNamespace(id=po_id, vendor_id=uuid.uuid4()),
+        SimpleNamespace(id=uuid.uuid4(), vendor_id=uuid.uuid4()),
+    ]
+    db, document, data, vendor, _ = _extraction_case(po_candidates=candidates)
+
+    with pytest.raises(ValueError, match="purchase order is ambiguous"):
+        _save_goods_receipt_from_extraction(db, document, data, vendor)
+
     db.add.assert_not_called()
 
 
@@ -346,12 +363,62 @@ def test_goods_receipt_extraction_rejects_po_line_outside_order():
     db.add.assert_not_called()
 
 
-def test_three_way_match_endpoint_does_not_change_invoice_approval():
+def test_goods_receipt_extraction_rejects_po_line_id_without_item_evidence():
+    db, document, data, vendor, _ = _extraction_case()
+    data["line_items"][0].pop("item_code")
+    data["line_items"][0].pop("description")
+    data["line_items"][0]["po_line_id"] = str(uuid.uuid4())
+
+    with pytest.raises(ValueError, match="needs an item code or description"):
+        _save_goods_receipt_from_extraction(db, document, data, vendor)
+
+    db.add.assert_not_called()
+
+
+def test_goods_receipt_extraction_rejects_incompatible_unit():
+    db, document, data, vendor, _ = _extraction_case()
+    data["line_items"][0]["uom"] = "CASE"
+
+    with pytest.raises(ValueError, match="unit does not match its PO line"):
+        _save_goods_receipt_from_extraction(db, document, data, vendor)
+
+    db.add.assert_not_called()
+
+
+def test_three_way_match_endpoint_does_not_change_invoice_approval(monkeypatch):
     db, invoice, _ = _case()
     invoice.final_status = "approved"
-    po = db.get.return_value
-    db.get.side_effect = lambda model, invoice_id: (
-        invoice if model is Invoice else po
+    (
+        db.query.return_value.outerjoin.return_value.filter.return_value.first.return_value
+    ) = invoice
+    recommendation = SimpleNamespace(
+        matching_status="matched",
+        human_review_required=False,
+        next_recommended_action="Submit for human approval",
+        checks=[],
+        supporting_records=[],
+        model_dump=lambda mode=None: {
+            "invoice_id": str(invoice.id),
+            "processing_status": "extracted",
+            "matching_status": "matched",
+            "review_status": "ready_for_human_review",
+            "approval_status": "approved",
+            "payment_status": "unknown",
+            "supporting_records": [],
+            "missing_document_types": [],
+            "candidates": [],
+            "checks": [],
+            "discrepancies": [],
+            "reason_codes": [],
+            "next_recommended_action": "Submit for human approval",
+            "human_review_required": False,
+            "invoice_approval_required": True,
+        },
+    )
+    monkeypatch.setattr(
+        invoice_routers,
+        "recommend_invoice_review",
+        lambda _db, _invoice, owner_id: recommendation,
     )
     db.add = MagicMock()
     user_id = uuid.uuid4()

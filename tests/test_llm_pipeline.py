@@ -168,6 +168,18 @@ def test_validate_extracted_data_accepts_valid_invoice():
     assert validate_extracted_data(data, "invoice") == []
 
 
+def test_validate_extracted_data_accepts_gst_bill_as_invoice():
+    data = {
+        "document_type": "GST BILL",
+        "vendor": "ABC Supplies",
+        "invoice_number": "INV-101",
+        "invoice_date": "2026-10-01",
+        "total": 1500,
+    }
+
+    assert validate_extracted_data(data, "invoice") == []
+
+
 def test_validate_extracted_data_detects_missing_invoice_number():
     data = {
         "vendor": "ABC Supplies",

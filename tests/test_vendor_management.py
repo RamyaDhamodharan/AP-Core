@@ -136,9 +136,7 @@ def test_create_vendor_rolls_back_database_conflict():
         teardown()
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "Vendor conflicts with existing data"
-    )
+    assert response.json()["detail"] == ("Vendor conflicts with existing data")
     db.rollback.assert_called_once()
 
 
@@ -291,9 +289,7 @@ def test_vendor_list_preserves_array_response_and_supports_search_pagination():
     db.scalars.return_value.all.return_value = vendors
 
     try:
-        response = client.get(
-            "/api/vendors?search=Acme&page=2&page_size=5"
-        )
+        response = client.get("/api/vendors?search=Acme&page=2&page_size=5")
     finally:
         teardown()
 
@@ -360,11 +356,7 @@ def test_vendor_routes_require_authentication(method, path, json_body):
 
     try:
         request = getattr(client, method)
-        response = (
-            request(path)
-            if json_body is None
-            else request(path, json=json_body)
-        )
+        response = request(path) if json_body is None else request(path, json=json_body)
     finally:
         teardown()
 
