@@ -16,10 +16,7 @@ ALIAS_REVISION = "20261019_0002"
 
 def _load_alias_revision():
     revision_path = (
-        ROOT
-        / "alembic"
-        / "versions"
-        / f"{ALIAS_REVISION}_vendor_alias_management.py"
+        ROOT / "alembic" / "versions" / f"{ALIAS_REVISION}_vendor_alias_management.py"
     )
     spec = importlib.util.spec_from_file_location(
         "vendor_alias_management_revision",
@@ -36,11 +33,12 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["0f7ca912d0e0"]
+    assert script.get_heads() == ["20261020_0003"]
     alias_revision = script.get_revision(ALIAS_REVISION)
     assert alias_revision is not None
     assert alias_revision.down_revision == BASELINE_REVISION
     assert script.get_revision("0f7ca912d0e0").down_revision == ALIAS_REVISION
+
 
 def test_sql_bootstrap_matches_pre_alias_migration_baseline():
     schema = (ROOT / "database" / "001_initial_schema.sql").read_text()
@@ -119,8 +117,7 @@ def test_downgrade_documents_irreversible_normalization_and_preserves_aliases(
 
     assert "original spelling and whitespace" in migration.downgrade.__doc__
     assert (
-        "Cannot downgrade vendor alias management while inactive aliases exist"
-        in sql
+        "Cannot downgrade vendor alias management while inactive aliases exist" in sql
     )
     assert "DELETE FROM" not in sql.upper()
     assert "DROP TABLE" not in sql.upper()
@@ -140,8 +137,7 @@ def test_alias_migration_downgrade_guards_data_and_restores_baseline_index(
     sql = "\n".join(statements)
 
     assert (
-        "Cannot downgrade vendor alias management while inactive aliases exist"
-        in sql
+        "Cannot downgrade vendor alias management while inactive aliases exist" in sql
     )
     assert "DROP INDEX IF EXISTS uq_vendor_alias_norm" in sql
     assert "DROP COLUMN IF EXISTS is_active" in sql

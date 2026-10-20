@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -11,14 +10,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # API endpoints
-OPENROUTER_DECISIONS_URL = (
-    "https://openrouter.ai/api/alpha/decisions"
-)
-GROQ_API_URL = (
-    "https://api.groq.com/openai/v1/chat/completions"
-)
+OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-DOCUMENT_TYPES = {"invoice", "po", "other"}
+DOCUMENT_TYPES = {"invoice", "po", "goods_receipt", "other"}
 
 
 def classify_document(raw_text: str) -> str:
@@ -39,14 +34,19 @@ def classify_document(raw_text: str) -> str:
             "doc_type": {
                 "type": "choice",
                 "instructions": (
-                    "Classify the document as invoice, po, or other. "
+                    "Classify the document as invoice, po, goods_receipt, or other. "
                     "Use invoice for a supplier invoice or bill, "
-                    "po for a purchase order, and other for all "
+                    "po for a purchase order, goods_receipt for a delivery receipt, "
+                    "goods received note, or proof of delivery, and other for "
+                    "all "
                     "remaining document types."
                 ),
                 "criteria": {
                     "invoice": "Supplier invoice or bill",
                     "po": "Purchase order",
+                    "goods_receipt": (
+                        "Goods receipt, delivery receipt, or goods received note"
+                    ),
                     "other": "Any other document",
                 },
             }
@@ -66,20 +66,15 @@ def classify_document(raw_text: str) -> str:
 
     data = response.json()
     answers = data.get("answers", {})
-    answer = answers.get("doc_type", {}) if isinstance(
-        answers, dict
-    ) else {}
+    answer = answers.get("doc_type", {}) if isinstance(answers, dict) else {}
 
-    doc_type = (
-        answer.get("choice")
-        if isinstance(answer, dict)
-        else None
-    )
+    doc_type = answer.get("choice") if isinstance(answer, dict) else None
+
+    if isinstance(doc_type, str) and doc_type.strip().lower() == "gr":
+        doc_type = "goods_receipt"
 
     if doc_type not in DOCUMENT_TYPES:
-        raise ValueError(
-            f"Luna returned an invalid document type: {doc_type!r}"
-        )
+        raise ValueError(f"Luna returned an invalid document type: {doc_type!r}")
 
     return doc_type
 
@@ -109,7 +104,8 @@ def _groq_extract(
                         "JSON object. Do not invent values; use null "
                         "for missing values. Include document_type, "
                         "vendor, invoice_number, order_number, "
-                        "po_number, invoice_date, po_date, due_date, "
+                "po_number, gr_number, receipt_date, received_qty, accepted_qty, "
+                "rejected_qty, invoice_date, po_date, due_date, "
                         "currency, subtotal, tax, total, and line_items "
                         "when applicable. "
                         "Preserve values as they appear in the source."
@@ -130,9 +126,7 @@ def _groq_extract(
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(
-            "Groq returned an unexpected response structure"
-        ) from exc
+        raise ValueError("Groq returned an unexpected response structure") from exc
 
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Groq returned empty extraction content")
@@ -146,9 +140,12 @@ def _groq_extract(
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
 
-        if lines and lines[0].strip().lower() in {
-            "```json", "json"
-        } or lines and lines[0].strip().startswith("```"):
+        if (
+            lines
+            and lines[0].strip().lower() in {"```json", "json"}
+            or lines
+            and lines[0].strip().startswith("```")
+        ):
             lines = lines[1:]
 
         content = "\n".join(lines).strip()
@@ -156,9 +153,7 @@ def _groq_extract(
     try:
         result: Any = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Groq returned invalid JSON extraction content"
-        ) from exc
+        raise ValueError("Groq returned invalid JSON extraction content") from exc
 
     if not isinstance(result, dict):
         raise ValueError("Extractor did not return a JSON object")
@@ -209,6 +204,8 @@ def extract_document(
         api_key,
         fallback_model,
     )
+
+
 def _to_decimal(value: Any) -> Decimal | None:
     """Convert monetary values with currency codes and symbols to Decimal."""
     if value is None or isinstance(value, bool):
@@ -241,6 +238,7 @@ def _to_decimal(value: Any) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
 
+
 def validate_extracted_data(
     data: dict[str, Any],
     doc_type: str,
@@ -263,12 +261,13 @@ def validate_extracted_data(
             "purchase order": "po",
             "payment advice": "other",
             "payment_advice": "other",
+            "gr": "goods_receipt",
+            "goods receipt": "goods_receipt",
+            "goods received note": "goods_receipt",
         }
 
         if aliases.get(normalized_type, normalized_type) != doc_type:
-            issues.append(
-                f"Document type mismatch: expected {doc_type}"
-            )
+            issues.append(f"Document type mismatch: expected {doc_type}")
 
     if doc_type == "invoice":
         required_fields = (
@@ -279,29 +278,34 @@ def validate_extracted_data(
         )
     elif doc_type == "po":
         required_fields = ("vendor", "total")
+    elif doc_type == "goods_receipt":
+        required_fields = ("vendor", "receipt_date")
     else:
         required_fields = ()
 
     for field in required_fields:
         value = data.get(field)
-        if value is None or (
-            isinstance(value, str) and not value.strip()
-        ):
+        if value is None or (isinstance(value, str) and not value.strip()):
             issues.append(f"Missing required field: {field}")
 
     if doc_type == "po" and not any(
         data.get(field) is not None
-        and not (
-            isinstance(data[field], str)
-            and not data[field].strip()
-        )
+        and not (isinstance(data[field], str) and not data[field].strip())
         for field in ("order_number", "po_number")
     ):
         issues.append("Missing required field: order_number")
 
+    if doc_type == "goods_receipt":
+        if not any(
+            data.get(field)
+            for field in ("gr_number", "receipt_number", "goods_receipt_number")
+        ):
+            issues.append("Missing required field: gr_number")
+        if not any(data.get(field) for field in ("order_number", "po_number")):
+            issues.append("Missing required field: order_number")
+
     amounts = {
-        field: _to_decimal(data.get(field))
-        for field in ("subtotal", "tax", "total")
+        field: _to_decimal(data.get(field)) for field in ("subtotal", "tax", "total")
     }
 
     for field, amount in amounts.items():
@@ -321,9 +325,7 @@ def validate_extracted_data(
         and total is not None
         and abs(subtotal + tax - total) > Decimal("0.01")
     ):
-        issues.append(
-            "Amount mismatch: subtotal plus tax does not equal total"
-        )
+        issues.append("Amount mismatch: subtotal plus tax does not equal total")
 
     line_items = data.get("line_items")
     if line_items is not None:
@@ -332,11 +334,10 @@ def validate_extracted_data(
         else:
             for index, item in enumerate(line_items):
                 if not isinstance(item, dict):
-                    issues.append(
-                        f"Line item {index + 1} must be an object"
-                    )
+                    issues.append(f"Line item {index + 1} must be an object")
 
     return issues
+
 
 def test_validate_extracted_data_accepts_valid_invoice():
     data = {

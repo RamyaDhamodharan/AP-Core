@@ -19,8 +19,20 @@ from src.schemas.invoice_schemas import (
     InvoiceReviewRequest,
     InvoiceReviewResponse,
 )
+from src.services.po_matching_services import match_invoice_three_way
 
 router = APIRouter(prefix="/api/invoices", tags=["Invoices"])
+
+
+@router.post("/{invoice_id}/three-way-match", dependencies=[Depends(get_current_user)])
+def three_way_match_invoice(
+    invoice_id: uuid.UUID, db: Session = Depends(get_db)
+) -> dict:
+    invoice = db.get(Invoice, invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return match_invoice_three_way(db, invoice)
+
 
 _UNRESOLVED_MATCH_STATUSES = {
     "pending",
@@ -134,20 +146,12 @@ def _dashboard_query_parameters(
     search: str | None,
     review_queue: bool,
 ) -> list:
-    if (
-        invoice_date_from
-        and invoice_date_to
-        and invoice_date_from > invoice_date_to
-    ):
+    if invoice_date_from and invoice_date_to and invoice_date_from > invoice_date_to:
         raise HTTPException(
             status_code=422,
             detail="invoice_date_from must not be after invoice_date_to",
         )
-    if (
-        due_date_from
-        and due_date_to
-        and due_date_from > due_date_to
-    ):
+    if due_date_from and due_date_to and due_date_from > due_date_to:
         raise HTTPException(
             status_code=422,
             detail="due_date_from must not be after due_date_to",
@@ -274,10 +278,7 @@ def review_invoice(
         ) from exc
 
     invoice = (
-        db.query(Invoice)
-        .filter(Invoice.id == invoice_id)
-        .with_for_update()
-        .first()
+        db.query(Invoice).filter(Invoice.id == invoice_id).with_for_update().first()
     )
 
     if invoice is None:
@@ -292,17 +293,13 @@ def review_invoice(
     ):
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Invoice cannot be approved while matching is unresolved"
-            ),
+            detail=("Invoice cannot be approved while matching is unresolved"),
         )
 
     old_value = {
         "final_status": invoice.final_status,
         "final_by": str(invoice.final_by) if invoice.final_by else None,
-        "final_at": (
-            invoice.final_at.isoformat() if invoice.final_at else None
-        ),
+        "final_at": (invoice.final_at.isoformat() if invoice.final_at else None),
     }
     decided_at = datetime.now(UTC)
     invoice.final_status = payload.decision

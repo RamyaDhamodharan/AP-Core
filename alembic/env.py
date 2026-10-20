@@ -1,5 +1,3 @@
-
-
 import os
 from logging.config import fileConfig
 
@@ -10,14 +8,28 @@ from alembic import context
 from src.models import (
     audit_models,
     document_models,
+    exchange_rate_models,
+    goods_receipt_models,
     invoice_models,
     match_run_models,
     notification_models,
     purchase_order_models,
     user_models,
-    exchange_rate_models,
 )
 from src.models.vendor_models import Base
+
+# Alembic discovers mapped tables from the model modules imported above.
+_MODEL_MODULES = (
+    audit_models,
+    document_models,
+    exchange_rate_models,
+    goods_receipt_models,
+    invoice_models,
+    match_run_models,
+    notification_models,
+    purchase_order_models,
+    user_models,
+)
 
 load_dotenv()
 config = context.config
@@ -35,11 +47,7 @@ target_metadata = Base.metadata
 
 
 def include_object(object, name, type_, reflected, compare_to):
-    return not (
-        reflected
-        and compare_to is None
-        and type_ in {"table", "column"}
-    )
+    return not (reflected and compare_to is None and type_ in {"table", "column"})
 
 
 def run_migrations_offline() -> None:
