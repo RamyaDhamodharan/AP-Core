@@ -140,7 +140,7 @@ def list_exception_alerts(
     )
     total = base_query.with_entities(func.count(Invoice.id)).scalar()
     invoices = (
-        base_query.order_by(Invoice.created_at.desc(), Invoice.id)
+        base_query.order_by(Invoice.invoice_date.desc().nullslast(), Invoice.id)
         .offset((page - 1) * page_size)
         .limit(page_size)
         .all()

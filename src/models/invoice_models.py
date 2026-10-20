@@ -1,7 +1,7 @@
 ﻿import uuid
 from datetime import date, datetime
 from decimal import Decimal
-
+from sqlalchemy import Index
 from sqlalchemy import (
     Boolean,
     Date,
@@ -10,10 +10,12 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Index,
+    UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.dialects.postgresql import CHAR, ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.vendor_models import Base
@@ -21,6 +23,30 @@ from src.models.vendor_models import Base
 
 class Invoice(Base):
     __tablename__ = "invoices"
+    __table_args__ = (
+        Index("ix_invoices_due_date", "due_date"),
+        Index("ix_invoices_owner", "owner_user_id"),
+        Index("ix_invoices_po_id", "po_id"),
+        Index(
+            "ix_invoices_status_date",
+            "match_status",
+            "final_status",
+            "invoice_date",
+        ),
+        UniqueConstraint(
+            "vendor_id", "invoice_no", "version_no",
+            name="uq_invoice_version",
+        ),
+        Index(
+            "uq_current_vendor_invoice",
+            "vendor_id",
+            "invoice_no",
+            unique=True,
+            postgresql_where=text(
+                "is_current AND vendor_id IS NOT NULL AND invoice_no IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True,
@@ -41,7 +67,7 @@ class Invoice(Base):
     vendor_tax_id_raw: Mapped[str | None] = mapped_column(String(30))
     invoice_date: Mapped[date | None] = mapped_column(Date)
     due_date: Mapped[date | None] = mapped_column(Date)
-    currency: Mapped[str | None] = mapped_column(String(3))
+    currency: Mapped[str | None] = mapped_column(CHAR(3))
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     total_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
@@ -64,24 +90,28 @@ class Invoice(Base):
             name="review_decision", create_type=False,
         ),
     )
-    final_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    final_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    final_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("match_runs.id")
     )
-    final_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    final_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    final_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )
-    created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-    )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(),
-        onupdate=func.now(),
-    )
-    updated_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now(),
     )
