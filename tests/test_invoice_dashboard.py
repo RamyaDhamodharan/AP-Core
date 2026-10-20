@@ -15,6 +15,7 @@ client = TestClient(app)
 
 
 def _setup_dashboard(rows=None, total=0):
+    owner_id = uuid.uuid4()
     count_query = MagicMock()
     count_query.select_from.return_value = count_query
     count_query.outerjoin.return_value = count_query
@@ -33,7 +34,7 @@ def _setup_dashboard(rows=None, total=0):
     db.query.side_effect = [count_query, invoices_query]
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {
-        "sub": str(uuid.uuid4()),
+        "sub": str(owner_id),
         "type": "access",
     }
 
@@ -47,6 +48,7 @@ def _setup_dashboard(rows=None, total=0):
 def _invoice(**overrides):
     values = {
         "id": uuid.uuid4(),
+        "source_document_id": uuid.uuid4(),
         "invoice_no": "INV-101",
         "vendor_name_raw": "ABC Supplies Ltd",
         "invoice_date": date(2026, 10, 1),
@@ -63,7 +65,7 @@ def _invoice(**overrides):
 def test_invoice_list_is_paginated_and_returns_dashboard_fields():
     invoice = _invoice()
     db, _, query, teardown = _setup_dashboard(
-        [(invoice, "ABC Supplies")],
+        [(invoice, "ABC Supplies", "extracted")],
         total=41,
     )
 
@@ -83,6 +85,8 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
     assert body["items"] == [
         {
             "invoice_id": str(invoice.id),
+            "source_document_id": str(invoice.source_document_id),
+            "processing_status": "extracted",
             "invoice_no": "INV-101",
             "vendor_name": "ABC Supplies",
             "invoice_date": "2026-10-01",
@@ -122,15 +126,10 @@ def test_invoice_list_applies_filters_and_search():
     assert response.status_code == 200
     expressions = query.filter.call_args.args
     compiled = [
-        expression.compile(dialect=postgresql.dialect())
-        for expression in expressions
+        expression.compile(dialect=postgresql.dialect()) for expression in expressions
     ]
     sql = " ".join(str(statement) for statement in compiled)
-    params = {
-        value
-        for statement in compiled
-        for value in statement.params.values()
-    }
+    params = {value for statement in compiled for value in statement.params.values()}
     assert "invoices.match_status" in sql
     assert "invoices.final_status" in sql
     assert "invoices.vendor_id" in sql
@@ -139,6 +138,8 @@ def test_invoice_list_applies_filters_and_search():
     assert "invoices.invoice_no" in sql
     assert "invoices.vendor_name_raw" in sql
     assert "vendors.name" in sql
+    assert "documents.created_by" in sql
+    assert "invoices.owner_user_id" in sql
     assert "%INV-10%" in params
 
 
@@ -157,8 +158,7 @@ def test_review_queue_includes_only_undecided_invoices():
         for expression in expressions
     ]
     assert any(
-        "invoices.final_status IS NULL" in statement
-        for statement in compiled_sql
+        "invoices.final_status IS NULL" in statement for statement in compiled_sql
     )
 
 
@@ -174,6 +174,56 @@ def test_invoice_list_returns_empty_page():
     assert response.json()["items"] == []
     assert response.json()["total"] == 0
     query.all.assert_called_once()
+
+
+def test_recommendation_hides_invoice_owned_by_another_user():
+    query = MagicMock()
+    query.outerjoin.return_value = query
+    query.filter.return_value.first.return_value = None
+    db = MagicMock()
+    db.query.return_value = query
+    owner_id = uuid.uuid4()
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": str(owner_id),
+        "type": "access",
+    }
+
+    try:
+        response = client.get(f"/api/invoices/{uuid.uuid4()}/recommendation")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 404
+    assert query.filter.call_count == 1
+    owner_scope = query.filter.call_args.args[1].compile(dialect=postgresql.dialect())
+    assert "documents.created_by" in str(owner_scope)
+    assert "invoices.owner_user_id" in str(owner_scope)
+
+
+def test_recommendation_api_returns_server_error_when_database_is_unavailable():
+    query = MagicMock()
+    query.outerjoin.return_value = query
+    query.filter.side_effect = RuntimeError("database unavailable")
+    db = MagicMock()
+    db.query.return_value = query
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": str(uuid.uuid4()),
+        "type": "access",
+    }
+    non_raising_client = TestClient(app, raise_server_exceptions=False)
+
+    try:
+        response = non_raising_client.get(
+            f"/api/invoices/{uuid.uuid4()}/recommendation"
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 500
 
 
 def test_invoice_list_rejects_invalid_pagination():

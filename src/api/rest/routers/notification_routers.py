@@ -77,11 +77,7 @@ def list_notifications(
     filters = [Notification.recipient_email == recipient_email]
     if status:
         filters.append(Notification.status == status)
-    total = (
-        db.query(func.count(Notification.id))
-        .filter(*filters)
-        .scalar()
-    )
+    total = db.query(func.count(Notification.id)).filter(*filters).scalar()
     rows = (
         db.query(Notification, Invoice)
         .outerjoin(

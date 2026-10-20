@@ -1,4 +1,3 @@
-
 import os
 
 import jwt
@@ -35,7 +34,6 @@ def get_current_user(
             )
 
         return payload
-
 
     except InvalidTokenError as e:
         print("JWT VALIDATION ERROR:", repr(e))

@@ -1,4 +1,4 @@
-Get-ChildItem C:\Users\User\Desktop\AP\AP-Core\src\api\rest\routers -Name-- GenWorx AP Assistant initial schema based on supplied LLD.
+-- GenWorx AP Assistant initial schema based on supplied LLD.
 -- Local/sample-data use only. UUID PK and standard audit columns on each business table.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -175,7 +175,7 @@ CREATE TABLE invoice_lines (
 
 CREATE TABLE goods_receipts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  gr_number varchar(60) NOT NULL UNIQUE,
+  gr_number varchar(60) NOT NULL,
   po_id uuid NOT NULL REFERENCES purchase_orders(id),
   vendor_id uuid NOT NULL REFERENCES vendors(id),
   source_document_id uuid REFERENCES documents(id),
@@ -183,7 +183,8 @@ CREATE TABLE goods_receipts (
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES users(id),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  updated_by uuid REFERENCES users(id)
+  updated_by uuid REFERENCES users(id),
+  CONSTRAINT uq_goods_receipts_gr_number UNIQUE (gr_number)
 );
 CREATE INDEX ix_goods_receipts_po_id ON goods_receipts(po_id);
 CREATE UNIQUE INDEX uq_goods_receipts_gr_number_norm ON goods_receipts(lower(trim(gr_number)));
@@ -253,6 +254,23 @@ CREATE TABLE audit_log (
   updated_by uuid
 );
 CREATE INDEX ix_audit_entity_timeline ON audit_log(entity_type, entity_id, created_at);
+
+CREATE TABLE document_workflows (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  status varchar(40) NOT NULL,
+  result jsonb NOT NULL DEFAULT '{}'::jsonb,
+  decision varchar(40),
+  decision_target_id uuid,
+  decision_target_type varchar(30),
+  decision_reason varchar(500),
+  decision_by uuid REFERENCES users(id),
+  decided_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT uq_document_workflows_document UNIQUE(document_id)
+);
+CREATE INDEX ix_document_workflows_status ON document_workflows(status);
 
 CREATE TABLE notifications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

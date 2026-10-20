@@ -1,4 +1,3 @@
-
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -6,6 +5,7 @@ from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
+from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
 from src.db.session_db import get_db
 
@@ -14,6 +14,7 @@ client = TestClient(app)
 
 def setup_db(monkeypatch, db):
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
     monkeypatch.setattr(
         document_routers,
         "upload_file",
@@ -33,6 +34,7 @@ def setup_db(monkeypatch, db):
 
 def teardown_db():
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_upload_valid_pdf(monkeypatch):
@@ -144,9 +146,7 @@ def test_upload_blocks_duplicate_file(monkeypatch):
     )
 
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = (
-        existing_document
-    )
+    db.query.return_value.filter_by.return_value.first.return_value = existing_document
 
     setup_db(monkeypatch, db)
 
@@ -172,6 +172,8 @@ def test_upload_blocks_duplicate_file(monkeypatch):
 
     db.add.assert_not_called()
     db.commit.assert_not_called()
+
+
 def test_upload_triggers_auto_processing(monkeypatch):
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = None
@@ -197,8 +199,8 @@ def test_upload_triggers_auto_processing(monkeypatch):
 
 def test_duplicate_upload_does_not_trigger_processing(monkeypatch):
     db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = (
-        SimpleNamespace(id=uuid.uuid4())
+    db.query.return_value.filter_by.return_value.first.return_value = SimpleNamespace(
+        id=uuid.uuid4()
     )
     setup_db(monkeypatch, db)
 

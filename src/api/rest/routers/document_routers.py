@@ -6,8 +6,9 @@ import re
 import tempfile
 import threading
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -15,23 +16,34 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
+    Query,
     UploadFile,
 )
 from minio.error import S3Error
-from sqlalchemy import func
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ....api.rest.dependencies import get_current_user
 from ....db.session_db import SessionLocal, get_db
+from ....models.audit_models import AuditLog
 from ....models.document_models import Document
 from ....models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from ....models.invoice_models import Invoice, InvoiceLine
 from ....models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from ....models.vendor_models import Vendor
+from ....schemas.document_schemas import (
+    DocumentAuditEntry,
+    DocumentListResponse,
+    DocumentReviewDetail,
+    DocumentSummary,
+)
+from ....services.document_workflow_services import refresh_related_workflows
 from ....services.llm_pipeline_services import (
     _to_decimal,
     classify_document,
     extract_document,
+    extract_e2e_test_document_text,
     validate_extracted_data,
 )
 from ....services.vendor_resolution_services import resolve_vendor
@@ -48,10 +60,102 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
+STALE_PARSE_TIMEOUT = timedelta(minutes=10)
 
 _PROCESS_SLOTS = threading.BoundedSemaphore(int(os.getenv("PROCESS_CONCURRENCY", "2")))
 
 _converters: dict = {}
+
+
+def _document_owner_id(current_user: dict) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+
+
+def _document_owner_filters(owner_id: uuid.UUID) -> list:
+    owned_invoices = select(Invoice.source_document_id).where(
+        or_(Invoice.owner_user_id == owner_id, Invoice.created_by == owner_id)
+    )
+    return [
+        or_(
+            Document.created_by == owner_id,
+            Document.id.in_(owned_invoices),
+        )
+    ]
+
+
+@router.get("", response_model=DocumentListResponse)
+def list_documents(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    status: Annotated[str | None, Query(max_length=40)] = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> DocumentListResponse:
+    """List documents uploaded by the authenticated user."""
+    owner_id = _document_owner_id(current_user)
+    filters = _document_owner_filters(owner_id)
+    if status:
+        filters.append(Document.status == status)
+
+    total = db.query(func.count(Document.id)).filter(*filters).scalar() or 0
+    rows = (
+        db.query(Document)
+        .filter(*filters)
+        .order_by(Document.created_at.desc(), Document.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return DocumentListResponse(
+        items=[DocumentSummary.model_validate(row) for row in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/{document_id}", response_model=DocumentReviewDetail)
+def get_document_detail(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> DocumentReviewDetail:
+    """Return source/extraction evidence and audit history for its uploader."""
+    owner_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    events = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.entity_type == "document",
+            AuditLog.entity_id == document_id,
+        )
+        .order_by(AuditLog.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return DocumentReviewDetail.model_validate(
+        {
+            **DocumentSummary.model_validate(document).model_dump(),
+            "raw_text": document.raw_text,
+            "extracted_json": document.extracted_json,
+            "audit_history": [
+                DocumentAuditEntry.model_validate(event).model_dump()
+                for event in events
+            ],
+        }
+    )
 
 
 def _get_converter(converter_cls):
@@ -99,19 +203,20 @@ def _purchase_order_number(data: dict) -> str:
 def _find_duplicate_purchase_order(
     db: Session,
     po_number: str,
+    *,
+    exclude_document_id: uuid.UUID | None = None,
 ) -> PurchaseOrder | None:
     normalized_number = _normalize_invoice_value(po_number)
     if not normalized_number:
         return None
 
-    return (
-        db.query(PurchaseOrder)
-        .filter(
+    query = db.query(PurchaseOrder).filter(
             func.lower(func.trim(PurchaseOrder.po_number)) == normalized_number,
             PurchaseOrder.is_current.is_(True),
         )
-        .first()
-    )
+    if exclude_document_id is not None:
+        query = query.filter(PurchaseOrder.source_document_id != exclude_document_id)
+    return query.first()
 
 
 def _purchase_order_persistence_issues(data: dict) -> list[str]:
@@ -138,6 +243,22 @@ def _purchase_order_persistence_issues(data: dict) -> list[str]:
 
     if data.get("total") is not None and total is None:
         issues.append("Invalid monetary value: total")
+
+    line_items = data.get("line_items")
+    if line_items is not None and isinstance(line_items, list):
+        for index, line in enumerate(line_items, start=1):
+            if not isinstance(line, dict):
+                continue  # validate_extracted_data reports the object error.
+            quantity = _to_decimal(_line_value(line, "qty", "quantity"))
+            if quantity is None or quantity <= 0:
+                issues.append(f"PO line item {index} has a missing or invalid quantity")
+            for field, aliases in (
+                ("unit price", ("unit_price", "price")),
+                ("line amount", ("line_amount", "amount", "total")),
+            ):
+                raw_amount = _line_value(line, *aliases)
+                if raw_amount is not None and _to_decimal(raw_amount) is None:
+                    issues.append(f"PO line item {index} has an invalid {field}")
 
     return issues
 
@@ -177,6 +298,7 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     filename = Path(file.filename or "upload").name
     extension = Path(filename).suffix.lower()
@@ -234,6 +356,8 @@ async def upload_document(
         file_hash=file_hash,
         storage_path=storage_path,
         status="received",
+        created_by=uuid.UUID(str(current_user["sub"])),
+        updated_by=uuid.UUID(str(current_user["sub"])),
     )
 
     try:
@@ -356,11 +480,27 @@ def _save_invoice_from_extraction(
     if source_invoice is not None:
         if not source_invoice.is_current:
             return source_invoice
-
-        for field, value in invoice_values.items():
-            setattr(source_invoice, field, value)
-        _replace_invoice_lines(db, source_invoice, data, po)
-        db.flush()
+        if not all(
+            getattr(source_invoice, field) == value
+            for field, value in invoice_values.items()
+        ):
+            raise ValueError(
+                "Invoice extraction differs from the previously saved record; "
+                "review required"
+            )
+        if "line_items" in data:
+            stored_lines = (
+                db.query(InvoiceLine)
+                .filter(InvoiceLine.invoice_id == source_invoice.id)
+                .all()
+            )
+            if _line_fingerprints(stored_lines) != _line_fingerprints(
+                data["line_items"] or [], extracted=True
+            ):
+                raise ValueError(
+                    "Invoice line extraction differs from the previously saved "
+                    "record; review required"
+                )
         return source_invoice
 
     version_no = 1
@@ -392,6 +532,9 @@ def _save_invoice_from_extraction(
 
     invoice = Invoice(
         source_document_id=document.id,
+        owner_user_id=getattr(document, "created_by", None),
+        created_by=getattr(document, "created_by", None),
+        updated_by=getattr(document, "updated_by", None),
         version_no=version_no,
         is_current=True,
         **invoice_values,
@@ -406,6 +549,35 @@ def _save_invoice_from_extraction(
 
 def _line_value(line: dict, *keys):
     return next((line.get(key) for key in keys if line.get(key) is not None), None)
+
+
+def _line_fingerprints(lines: list, *, extracted: bool = False) -> list[tuple]:
+    def value(line, *keys):
+        return _line_value(line, *keys) if extracted else getattr(line, keys[0], None)
+
+    def decimal_key(raw):
+        parsed = _to_decimal(raw)
+        return str(parsed.normalize()) if parsed is not None else None
+
+    fingerprints = []
+    for line in lines:
+        if extracted and not isinstance(line, dict):
+            raise ValueError("Extracted line item must be an object")
+        fingerprints.append(
+            (
+                _normalize_invoice_value(
+                    value(line, "item_code", "sku", "product_code")
+                ),
+                _normalize_invoice_value(
+                    value(line, "description", "item_description")
+                ),
+                _normalize_invoice_value(value(line, "uom", "unit_of_measure")),
+                decimal_key(value(line, "qty", "quantity")),
+                decimal_key(value(line, "unit_price", "price")),
+                decimal_key(value(line, "line_amount", "amount", "total")),
+            )
+        )
+    return sorted(fingerprints, key=repr)
 
 
 def _replace_invoice_lines(
@@ -459,8 +631,21 @@ def _replace_invoice_lines(
         )
 
 
+class AwaitingRelatedDocumentError(ValueError):
+    """The source document is valid, but a related record has not arrived."""
+
+
+class AwaitingHumanDecisionError(ValueError):
+    """Available identifiers resolve to more than one possible record."""
+
+
 def _save_goods_receipt_from_extraction(
-    db: Session, document: Document, data: dict, vendor: Vendor
+    db: Session,
+    document: Document,
+    data: dict,
+    vendor: Vendor,
+    *,
+    purchase_order_id: uuid.UUID | None = None,
 ) -> None:
     gr_number = str(
         data.get("gr_number")
@@ -470,23 +655,47 @@ def _save_goods_receipt_from_extraction(
     ).strip()
     if not gr_number:
         raise ValueError("Goods receipt number is required")
-    if (
+    existing_receipt = (
         db.query(GoodsReceipt)
-        .filter(func.lower(func.trim(GoodsReceipt.gr_number)) == gr_number.lower())
-        .first()
-    ):
-        raise ValueError(f"Duplicate goods receipt number: {gr_number}")
-    po_number = str(data.get("order_number") or data.get("po_number") or "").strip()
-    po = (
-        db.query(PurchaseOrder)
-        .filter(
-            func.lower(func.trim(PurchaseOrder.po_number)) == po_number.lower(),
-            PurchaseOrder.is_current.is_(True),
-        )
+        .filter(GoodsReceipt.source_document_id == document.id)
         .first()
     )
-    if po is None:
-        raise ValueError("Goods receipt purchase order was not found")
+    duplicate_query = db.query(GoodsReceipt).filter(
+        func.lower(func.trim(GoodsReceipt.gr_number)) == gr_number.lower()
+    )
+    if existing_receipt is not None:
+        duplicate_query = duplicate_query.filter(GoodsReceipt.id != existing_receipt.id)
+    if duplicate_query.first():
+        raise ValueError(f"Duplicate goods receipt number: {gr_number}")
+    po_number = str(data.get("order_number") or data.get("po_number") or "").strip()
+    if purchase_order_id is not None:
+        selected_po = db.query(PurchaseOrder).filter(
+            PurchaseOrder.id == purchase_order_id,
+            PurchaseOrder.is_current.is_(True),
+        ).first()
+        po_candidates = (
+            [selected_po]
+            if selected_po is not None
+            and _normalize_invoice_value(selected_po.po_number)
+            == _normalize_invoice_value(po_number)
+            else []
+        )
+    else:
+        po_candidates = (
+            db.query(PurchaseOrder)
+            .filter(
+                func.lower(func.trim(PurchaseOrder.po_number)) == po_number.lower(),
+                PurchaseOrder.is_current.is_(True),
+            )
+            .all()
+        )
+    if not po_candidates:
+        raise AwaitingRelatedDocumentError(
+            "Goods receipt purchase order has not arrived"
+        )
+    if len(po_candidates) > 1:
+        raise AwaitingHumanDecisionError("Goods receipt purchase order is ambiguous")
+    po = po_candidates[0]
     if po.vendor_id != vendor.id:
         raise ValueError("Goods receipt vendor does not match purchase order")
     po_lines = (
@@ -501,6 +710,11 @@ def _save_goods_receipt_from_extraction(
         description = _line_value(raw, "description", "item_description")
         extracted_po_line_id = raw.get("po_line_id")
         if extracted_po_line_id is not None:
+            if not code and not description:
+                raise ValueError(
+                    "Goods receipt line needs an item code or description "
+                    "for PO validation"
+                )
             candidates = [
                 line for line in po_lines if str(line.id) == str(extracted_po_line_id)
             ]
@@ -540,6 +754,11 @@ def _save_goods_receipt_from_extraction(
             )
         ):
             raise ValueError("Goods receipt line data conflicts with its PO line")
+        extracted_uom = _line_value(raw, "uom", "unit_of_measure")
+        if extracted_uom and po_line.uom and _normalize_invoice_value(
+            extracted_uom
+        ) != _normalize_invoice_value(po_line.uom):
+            raise ValueError("Goods receipt line unit does not match its PO line")
         if po_line.id in mapped_po_line_ids:
             raise ValueError("Goods receipt contains a duplicate PO line reference")
         mapped_po_line_ids.add(po_line.id)
@@ -561,7 +780,7 @@ def _save_goods_receipt_from_extraction(
                 po_line_id=po_line.id,
                 item_code=po_line.item_code,
                 description=po_line.description,
-                uom=po_line.uom,
+                uom=str(extracted_uom)[:10] if extracted_uom else None,
                 received_qty=received,
                 accepted_qty=accepted,
                 rejected_qty=rejected,
@@ -569,12 +788,44 @@ def _save_goods_receipt_from_extraction(
         )
     if not mapped:
         raise ValueError("Goods receipt line items are missing")
+    receipt_date = _parse_document_date(data.get("receipt_date"))
+    if existing_receipt is not None:
+        old_lines = sorted(
+            (
+                str(line.po_line_id),
+                line.received_qty,
+                line.accepted_qty,
+                line.rejected_qty,
+            )
+            for line in existing_receipt.lines
+        )
+        new_lines = sorted(
+            (
+                str(line.po_line_id),
+                line.received_qty,
+                line.accepted_qty,
+                line.rejected_qty,
+            )
+            for line in mapped
+        )
+        if (
+            existing_receipt.gr_number == gr_number
+            and existing_receipt.po_id == po.id
+            and existing_receipt.vendor_id == vendor.id
+            and existing_receipt.receipt_date == receipt_date
+            and old_lines == new_lines
+        ):
+            return
+        raise ValueError(
+            "Goods receipt extraction differs from the previously saved record; "
+            "review required"
+        )
     receipt = GoodsReceipt(
         gr_number=gr_number,
         po_id=po.id,
         vendor_id=vendor.id,
         source_document_id=document.id,
-        receipt_date=_parse_document_date(data.get("receipt_date")),
+        receipt_date=receipt_date,
         lines=mapped,
     )
     db.add(receipt)
@@ -652,6 +903,50 @@ def _rematch_waiting_invoices_for_po(
     return rematched
 
 
+def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
+    """Attach previously extracted GR documents when their PO arrives later."""
+    documents = (
+        db.query(Document)
+        .filter(
+            Document.doc_type == "goods_receipt",
+            Document.status == "extracted",
+            Document.extracted_json.isnot(None),
+        )
+        .all()
+    )
+    saved = 0
+    for document in documents:
+        data = document.extracted_json
+        if not isinstance(data, dict):
+            continue
+        referenced_po = str(
+            data.get("order_number") or data.get("po_number") or ""
+        ).strip()
+        if _normalize_invoice_value(referenced_po) != _normalize_invoice_value(
+            po.po_number
+        ):
+            continue
+        vendor_name = str(data.get("vendor") or "").strip()
+        vendor = resolve_vendor(db, vendor_name)
+        if vendor is None or vendor.id != po.vendor_id:
+            continue
+        try:
+            _save_goods_receipt_from_extraction(db, document, data, vendor)
+        except (
+            AwaitingRelatedDocumentError,
+            AwaitingHumanDecisionError,
+            ValueError,
+        ):
+            logger.info(
+                "Deferred goods receipt %s remains unresolved for PO %s",
+                document.id,
+                po.id,
+            )
+            continue
+        saved += 1
+    return saved
+
+
 def _save_purchase_order_from_extraction(
     db: Session,
     document: Document,
@@ -660,18 +955,43 @@ def _save_purchase_order_from_extraction(
 ) -> PurchaseOrder:
     """Persist a validated purchase order against its source document."""
     po_date = data.get("po_date") or data.get("order_date")
+    currency = str(data["currency"]).strip().upper()
+    total_amount = _to_decimal(data.get("total"))
+    existing = (
+        db.query(PurchaseOrder)
+        .filter(PurchaseOrder.source_document_id == document.id)
+        .first()
+    )
+    if existing is not None:
+        existing_lines = list(getattr(existing, "lines", []))
+        extracted_lines = data.get("line_items") or []
+        same_header = (
+            existing.po_number == _purchase_order_number(data)
+            and existing.vendor_id == vendor.id
+            and existing.po_date == _parse_document_date(po_date)
+            and str(existing.currency).strip().upper() == currency
+            and existing.total_amount == total_amount
+            and _line_fingerprints(existing_lines)
+            == _line_fingerprints(extracted_lines, extracted=True)
+        )
+        if same_header:
+            return existing
+        raise ValueError(
+            "Purchase order extraction differs from the previously saved record; "
+            "review required"
+        )
 
     purchase_order = PurchaseOrder(
         po_number=_purchase_order_number(data),
         vendor_id=vendor.id,
         source_document_id=document.id,
         po_date=_parse_document_date(po_date),
-        currency=str(data["currency"]).strip().upper(),
+        currency=currency,
         subtotal=_to_decimal(data.get("subtotal")),
         tax_amount=_to_decimal(
             data.get("tax") if data.get("tax") is not None else data.get("tax_amount")
         ),
-        total_amount=_to_decimal(data.get("total")),
+        total_amount=total_amount,
     )
 
     db.add(purchase_order)
@@ -679,7 +999,7 @@ def _save_purchase_order_from_extraction(
 
     for raw in data.get("line_items") or []:
         if not isinstance(raw, dict):
-            continue
+            raise ValueError("Purchase order line item must be an object")
         item_code = _line_value(raw, "item_code", "sku", "product_code")
         description = _line_value(raw, "description", "item_description")
         db.add(
@@ -699,16 +1019,24 @@ def _save_purchase_order_from_extraction(
         )
 
     _rematch_waiting_invoices_for_po(db, purchase_order)
+    _save_pending_goods_receipts_for_po(db, purchase_order)
 
     return purchase_order
 
 
-@router.post("/{document_id}/parse")
+@router.post("/{document_id}/parse", dependencies=[Depends(get_current_user)])
 def parse_document(
     document_id: uuid.UUID,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
-    document = db.query(Document).filter_by(id=document_id).first()
+    owner_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .with_for_update()
+        .first()
+    )
 
     if not document:
         raise HTTPException(
@@ -721,6 +1049,23 @@ def parse_document(
             status_code=404,
             detail="Stored file not found",
         )
+
+    if document.status == "extracted":
+        return {
+            "id": str(document.id),
+            "status": document.status,
+            "doc_type": document.doc_type,
+            "extracted_json": document.extracted_json,
+            "validation_issues": [],
+            "duplicate_of": None,
+        }
+    if document.status == "parsing":
+        raise HTTPException(
+            status_code=409, detail="Document processing is already in progress"
+        )
+
+    document.status = "parsing"
+    db.commit()
 
     try:
         content = download_file(document.storage_path)
@@ -762,19 +1107,19 @@ def parse_document(
             temp_file.write(content)
             temp_path = temp_file.name
 
-        document.status = "parsing"
         document.failure_message = None
-        db.commit()
 
         # Step 2: Parse using Docling.
-        document_converter = importlib.import_module(
-            "docling.document_converter"
-        ).DocumentConverter
+        if os.getenv("AP_E2E_MOCK_EXTRACTION"):
+            raw_text = extract_e2e_test_document_text(content)
+        else:
+            document_converter = importlib.import_module(
+                "docling.document_converter"
+            ).DocumentConverter
 
-        converter = _get_converter(document_converter)
-        result = converter.convert(temp_path)
-
-        raw_text = result.document.export_to_markdown()
+            converter = _get_converter(document_converter)
+            result = converter.convert(temp_path)
+            raw_text = result.document.export_to_markdown()
 
         if not raw_text or not raw_text.strip():
             raise ValueError("No text could be extracted from the document")
@@ -890,6 +1235,7 @@ def parse_document(
             duplicate_purchase_order = _find_duplicate_purchase_order(
                 db,
                 _purchase_order_number(extracted_data),
+                exclude_document_id=document.id,
             )
 
         # Preserve extracted data for review.
@@ -922,6 +1268,8 @@ def parse_document(
                 validation_issues.append(
                     "Invoice version conflict; document requires review"
                 )
+            except ValueError as exc:
+                validation_issues.append(str(exc))
         if doc_type == "po" and not validation_issues:
             if duplicate_purchase_order is not None:
                 validation_issues.append(
@@ -937,13 +1285,15 @@ def parse_document(
                         extracted_data,
                         po_vendor,
                     )
-
+                except ValueError as exc:
+                    validation_issues.append(str(exc))
                 except IntegrityError as exc:
                     db.rollback()
 
                     duplicate_purchase_order = _find_duplicate_purchase_order(
                         db,
                         _purchase_order_number(extracted_data),
+                        exclude_document_id=document.id,
                     )
 
                     if duplicate_purchase_order is None:
@@ -971,6 +1321,9 @@ def parse_document(
                 _save_goods_receipt_from_extraction(
                     db, document, extracted_data, goods_receipt_vendor
                 )
+            except (AwaitingRelatedDocumentError, AwaitingHumanDecisionError):
+                # Keep the validated source document available for later linking.
+                pass
             except ValueError as exc:
                 validation_issues.append(str(exc))
 
@@ -991,6 +1344,16 @@ def parse_document(
 
         db.commit()
         db.refresh(document)
+        if isinstance(db, Session):
+            try:
+                refresh_related_workflows(db, document.id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Workflow refresh failed after document %s was extracted",
+                    document_id,
+                )
 
         # Step 8: Return extraction and duplicate-check results.
         return {
@@ -1034,3 +1397,61 @@ def parse_document(
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
+
+
+@router.post("/{document_id}/retry", status_code=202)
+def retry_document_processing(
+    document_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    owner_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .with_for_update()
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    stale_parse = (
+        document.status == "parsing"
+        and isinstance(document.updated_at, datetime)
+        and document.updated_at.tzinfo is not None
+        and document.updated_at <= datetime.now(UTC) - STALE_PARSE_TIMEOUT
+    )
+    if (
+        document.status not in {"failed", "needs_vendor_review", "incomplete"}
+        and not stale_parse
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only failed, review-required, or stale processing documents "
+                "can be retried"
+            ),
+        )
+    old_status = document.status
+    document.status = "received"
+    document.failure_message = None
+    actor_id = owner_id
+    document.updated_by = actor_id
+    db.add(
+        AuditLog(
+            action="document_processing_retry_requested",
+            entity_type="document",
+            entity_id=document.id,
+            old_value={"status": old_status},
+            new_value={"status": "received"},
+            message="Document processing retry requested",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    dispatch_document_processing(
+        background_tasks,
+        document.id,
+        _process_in_background,
+    )
+    return {"id": str(document.id), "status": document.status}

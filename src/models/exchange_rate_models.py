@@ -1,4 +1,3 @@
-
 import uuid
 
 from sqlalchemy import (
@@ -21,14 +20,17 @@ class ExchangeRate(Base):
     __tablename__ = "exchange_rates"
     __table_args__ = (
         UniqueConstraint(
-            "from_currency", "to_currency", "rate_date",
+            "from_currency",
+            "to_currency",
+            "rate_date",
             name="uq_exchange_rate",
         ),
         CheckConstraint("rate > 0", name="exchange_rates_rate_check"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True,
+        UUID(as_uuid=True),
+        primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     from_currency = mapped_column(CHAR(3), nullable=False)
@@ -37,12 +39,16 @@ class ExchangeRate(Base):
     rate_date = mapped_column(Date, nullable=False)
 
     created_at = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )
     created_by = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     updated_at = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        server_default=func.now(), onupdate=func.now(),
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
     updated_by = mapped_column(
         UUID(as_uuid=True),

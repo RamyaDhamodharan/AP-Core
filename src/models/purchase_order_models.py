@@ -16,9 +16,9 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import CHAR, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.models.vendor_models import Base
+from src.models.vendor_models import Base, Vendor
 
 
 class PurchaseOrder(Base):
@@ -78,6 +78,16 @@ class PurchaseOrder(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    lines: Mapped[list["PurchaseOrderLine"]] = relationship(
+        back_populates="purchase_order",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    vendor: Mapped[Vendor | None] = relationship(lazy="selectin")
+
+    @property
+    def vendor_name(self) -> str | None:
+        return self.vendor.name if self.vendor is not None else None
 
 
 class PurchaseOrderLine(Base):
@@ -112,3 +122,4 @@ class PurchaseOrderLine(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    purchase_order: Mapped[PurchaseOrder] = relationship(back_populates="lines")

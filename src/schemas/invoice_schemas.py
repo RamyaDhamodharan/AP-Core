@@ -30,6 +30,8 @@ class InvoiceReviewResponse(BaseModel):
 
 class InvoiceDashboardItem(BaseModel):
     invoice_id: UUID
+    source_document_id: UUID | None = None
+    processing_status: str | None = None
     invoice_no: str | None
     vendor_name: str | None
     invoice_date: date | None
