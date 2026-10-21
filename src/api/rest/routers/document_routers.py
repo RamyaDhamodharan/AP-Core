@@ -61,9 +61,7 @@ from ....services.vendor_resolution_services import (
     resolve_vendor,
 )
 from ....storage.minio_storage import (
-    delete_file,
     download_file,
-    upload_file,
 )
 from ....worker.dispatch import (
     dispatch_document_processing,
@@ -341,7 +339,7 @@ def _process_in_background(document_id: uuid.UUID) -> None:
 @router.post("/upload", status_code=202)
 async def upload_document(
     background_tasks: BackgroundTasks,
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(..., alias="file"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -362,7 +360,14 @@ async def upload_document(
         })
     response = {"results": results}
     if len(results) == 1:
-        response.update({"id": results[0]["document_id"], "original_filename": results[0]["filename"], "status": results[0]["status"], "message": results[0]["message"]})
+        response.update(
+            {
+                "id": results[0]["document_id"],
+                "original_filename": results[0]["filename"],
+                "status": results[0]["status"],
+                "message": results[0]["message"],
+            }
+        )
     return response
 
 

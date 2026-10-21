@@ -79,12 +79,17 @@ CREATE TABLE documents (
   email_sender varchar(200),
   email_subject varchar(500),
   email_received_at timestamptz,
+  email_message_id varchar(300),
+  source varchar(40),
   failure_message varchar(500),
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES users(id),
   updated_at timestamptz NOT NULL DEFAULT now(),
   updated_by uuid REFERENCES users(id)
 );
+CREATE UNIQUE INDEX uq_documents_email_message_id_root
+  ON documents(email_message_id)
+  WHERE parent_document_id IS NULL AND email_message_id IS NOT NULL;
 
 CREATE TABLE purchase_orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

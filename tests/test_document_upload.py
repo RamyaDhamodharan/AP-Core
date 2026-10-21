@@ -10,6 +10,7 @@ from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
 from src.db.session_db import get_db
+from src.services import document_ingest_services
 
 client = TestClient(app)
 
@@ -18,14 +19,10 @@ def setup_db(monkeypatch, db):
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
     monkeypatch.setattr(
-        document_routers,
-        "upload_file",
-        lambda *args, **kwargs: None,
+        document_ingest_services, "upload_file", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
-        document_routers,
-        "delete_file",
-        lambda *args, **kwargs: None,
+        document_ingest_services, "delete_file", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         document_routers,
@@ -58,7 +55,7 @@ def test_upload_valid_pdf(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
     assert body["original_filename"] == "invoice.pdf"
     assert body["status"] == "received"
@@ -148,7 +145,9 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
     db.flush.side_effect = flush
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
-    monkeypatch.setattr(document_routers, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        document_ingest_services, "upload_file", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(document_routers, "download_file", lambda *_: b"PDF")
     monkeypatch.setenv("USE_CELERY", "false")
 
@@ -215,7 +214,7 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert document.status == "extracted"
     assert invoice.final_status == "approved"
     assert any(
@@ -242,8 +241,8 @@ def test_upload_rejects_unsupported_extension(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Unsupported file type"
+    assert response.status_code == 202
+    assert response.json()["results"][0]["message"] == "Unsupported file type"
     db.add.assert_not_called()
 
 
@@ -265,8 +264,8 @@ def test_upload_rejects_empty_file(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Uploaded file is empty"
+    assert response.status_code == 202
+    assert response.json()["results"][0]["message"] == "Uploaded file is empty"
     db.add.assert_not_called()
 
 
@@ -290,8 +289,8 @@ def test_upload_rejects_file_over_20_mb(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 413
-    assert response.json()["detail"] == "File exceeds 20 MB limit"
+    assert response.status_code == 202
+    assert response.json()["results"][0]["message"] == "File exceeds 20 MB limit"
     db.add.assert_not_called()
 
 
@@ -322,7 +321,7 @@ def test_upload_blocks_duplicate_file(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
     assert body["id"] == str(existing_id)
     assert body["status"] == "duplicate_blocked"
@@ -351,7 +350,7 @@ def test_upload_triggers_auto_processing(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert started == [uuid.UUID(response.json()["id"])]
 
 
@@ -369,7 +368,7 @@ def test_uuid_subject_upload_enqueues_document(monkeypatch):
     )
     queued = []
     monkeypatch.setattr(
-        document_routers,
+        document_ingest_services,
         "dispatch_document_processing",
         lambda _tasks, document_id, _fallback: queued.append(document_id),
     )
@@ -383,7 +382,7 @@ def test_uuid_subject_upload_enqueues_document(monkeypatch):
     finally:
         teardown_db()
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert queued == [uuid.UUID(response.json()["id"])]
     assert db.add.call_args.args[0].created_by == owner_id
 
@@ -437,3 +436,46 @@ def test_duplicate_upload_does_not_trigger_processing(monkeypatch):
 
     assert response.json()["status"] == "duplicate_blocked"
     assert started == []
+
+
+def test_multi_upload_returns_success_duplicate_and_corrupt_results(monkeypatch):
+
+    stored = []
+    db = MagicMock()
+    query = MagicMock()
+    query.filter_by.side_effect = lambda **kwargs: SimpleNamespace(
+        first=lambda: next(
+            (d for d in stored if all(getattr(d, k) == v for k, v in kwargs.items())),
+            None,
+        )
+    )
+    db.query.return_value = query
+    db.add.side_effect = lambda row: stored.append(row)
+    setup_db(monkeypatch, db)
+
+    def fail_corrupt(_key, content, _content_type):
+        if content == b"corrupt":
+            raise ValueError("corrupt file")
+
+    monkeypatch.setattr(document_ingest_services, "upload_file", fail_corrupt)
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files=[
+                ("file", ("ok.pdf", b"valid", "application/pdf")),
+                ("file", ("duplicate.pdf", b"valid", "application/pdf")),
+                ("file", ("bad.pdf", b"corrupt", "application/pdf")),
+            ],
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 202
+    results = response.json()["results"]
+    assert len(results) == 3
+    assert [row["status"] for row in results] == [
+        "received",
+        "duplicate_blocked",
+        "failed",
+    ]
+    assert results[0]["document_id"] == results[1]["document_id"]

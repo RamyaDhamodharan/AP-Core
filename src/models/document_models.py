@@ -11,7 +11,17 @@ from src.models.vendor_models import Base
 
 class Document(Base):
     __tablename__ = "documents"
-    __table_args__ = (Index("ix_documents_status", "status"),)
+    __table_args__ = (
+        Index("ix_documents_status", "status"),
+        Index(
+            "uq_documents_email_message_id_root",
+            "email_message_id",
+            unique=True,
+            postgresql_where=text(
+                "parent_document_id IS NULL AND email_message_id IS NOT NULL"
+            ),
+        ),
+    )
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,

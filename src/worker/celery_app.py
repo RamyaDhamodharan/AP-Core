@@ -3,6 +3,7 @@
 import os
 
 from celery import Celery
+from celery.schedules import schedule
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -20,3 +21,13 @@ celery_app.conf.update(
     task_default_retry_delay=10,
     broker_connection_retry_on_startup=True,
 )
+
+if os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true":
+    celery_app.conf.beat_schedule = {
+        "poll-ap-email": {
+            "task": "ap.poll_email",
+            "schedule": schedule(
+                float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "120"))
+            ),
+        }
+    }

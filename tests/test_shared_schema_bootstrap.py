@@ -38,6 +38,20 @@ def test_shared_audit_columns_are_present_without_invented_foreign_keys():
         )
 
 
+def test_document_email_message_id_has_root_partial_unique_index():
+    documents = _table_definition("documents")
+    schema = re.sub(
+        r"\s+", " ", (ROOT / "database" / "001_initial_schema.sql").read_text()
+    )
+
+    assert "email_message_id varchar(300)" in documents
+    assert (
+        "CREATE UNIQUE INDEX uq_documents_email_message_id_root "
+        "ON documents(email_message_id) "
+        "WHERE parent_document_id IS NULL AND email_message_id IS NOT NULL"
+    ) in schema
+
+
 def test_reconciliation_preserves_existing_table_constraints():
     exchange_rates = _table_definition("exchange_rates")
     match_runs = _table_definition("match_runs")

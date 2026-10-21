@@ -57,7 +57,9 @@ def ingest_file(
     document_id = uuid.uuid4()
     storage_path = f"documents/{document_id}{extension}"
     try:
-        upload_file(storage_path, content_bytes, content_type or "application/octet-stream")
+        upload_file(
+            storage_path, content_bytes, content_type or "application/octet-stream"
+        )
         document = Document(
             id=document_id,
             original_filename=filename,
@@ -94,20 +96,17 @@ def ingest_file(
         logger.exception("File ingestion failed for %s", filename)
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 
-    if not parent_document_id:
+    if extension != ".eml":
         from src.api.rest.routers.document_routers import _process_in_background
 
         if background_tasks is not None:
-            dispatch_document_processing(background_tasks, document.id, _process_in_background)
+            dispatch_document_processing(
+                background_tasks, document.id, _process_in_background
+            )
         elif os.getenv("USE_CELERY", "false").lower() == "true":
-            dispatch_document_processing(BackgroundTasks(), document.id, _process_in_background)
+            dispatch_document_processing(
+                BackgroundTasks(), document.id, _process_in_background
+            )
         else:
-            # Email callers use a standalone DB session in the worker task.
-            from src.db.session_db import SessionLocal
-
-            process_db = SessionLocal()
-            try:
-                _process_in_background(document.id)
-            finally:
-                process_db.close()
+            _process_in_background(document.id)
     return IngestResult("received", document.id, "File received")

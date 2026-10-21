@@ -90,3 +90,16 @@ The ORM metadata is not yet a complete representation of every bootstrap
 column. Alembic autogenerate is configured not to propose drops for database
 tables or columns absent from that metadata; review all generated revisions
 before applying them.
+
+## Email polling
+
+Set `EMAIL_POLL_ENABLED=true` and configure `IMAP_HOST`, `IMAP_USER`, and
+`IMAP_PASSWORD` for a dedicated TEST mailbox. Polling checks only unseen mail;
+PDF, PNG, and JPEG attachments enter the normal document pipeline. Keep
+`TEST_MAILBOX_ALLOWLIST` limited to test addresses. Gmail requires 2-Step
+Verification and an app password from Google Account → Security → App
+passwords. Outlook consumer accounts can use an app password when two-step
+verification is enabled; Microsoft 365 work accounts may require an admin to
+enable authenticated IMAP or app passwords. Never use a production mailbox for
+testing. Configure the interval with `EMAIL_POLL_INTERVAL_SECONDS` (default
+120) and the folder with `IMAP_FOLDER` (default `INBOX`).

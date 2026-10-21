@@ -47,3 +47,16 @@ def send_notification(self, notification_id: str) -> None:
             exc=locals().get("error", RuntimeError("SMTP send failed")),
             countdown=2**self.request.retries,
         )
+
+
+@celery_app.task(name="ap.poll_email", bind=True, max_retries=0)
+def poll_email(self) -> dict:
+    """Run one guarded email poll without allowing overlap across workers."""
+    from src.db.session_db import SessionLocal
+    from src.services.email_polling_services import poll_email_with_lock
+
+    db = SessionLocal()
+    try:
+        return poll_email_with_lock(db)
+    finally:
+        db.close()
