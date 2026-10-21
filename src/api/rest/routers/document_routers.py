@@ -1,5 +1,7 @@
 import importlib
+import inspect
 import logging
+import math
 import os
 import re
 import tempfile
@@ -13,6 +15,7 @@ from typing import Annotated
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Body,
     Depends,
     File,
     HTTPException,
@@ -62,6 +65,7 @@ from ....services.vendor_resolution_services import (
 )
 from ....storage.minio_storage import (
     download_file,
+    move_file,
 )
 from ....worker.dispatch import (
     dispatch_document_processing,
@@ -78,6 +82,57 @@ STALE_PARSE_TIMEOUT = timedelta(minutes=10)
 _PROCESS_SLOTS = threading.BoundedSemaphore(int(os.getenv("PROCESS_CONCURRENCY", "2")))
 
 _converters: dict = {}
+
+
+@router.post("/{document_id}/reclassify", status_code=202)
+def reclassify_other_document(
+    document_id: uuid.UUID,
+    doc_type: Annotated[str, Body(embed=True)],
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Move an Other document back into the shared classification pipeline."""
+    if doc_type not in {"invoice", "po", "goods_receipt"}:
+        raise HTTPException(status_code=422, detail="Unsupported document type")
+    user_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id)
+        .with_for_update()
+        .first()
+    )
+    if document is None or document.status != "other":
+        raise HTTPException(status_code=404, detail="Other document not found")
+    old_key = document.storage_path
+    filename = Path(document.original_filename).name
+    now = (
+        getattr(document, "email_received_at", None)
+        or getattr(document, "created_at", None)
+        or datetime.now(UTC)
+    )
+    new_key = f"{doc_type}/{now:%Y}/{now:%m}/{document.id}/{filename}"
+    if old_key and old_key != new_key:
+        move_file(old_key, new_key)
+    document.storage_path = new_key
+    document.status = "received"
+    document.classify_override = doc_type
+    document.updated_by = user_id
+    db.add(
+        AuditLog(
+            action="document_reclassified",
+            entity_type="document",
+            entity_id=document.id,
+            result="success",
+            message="Other document reclassified",
+            old_value={"doc_type": document.doc_type, "status": "other"},
+            new_value={"doc_type": doc_type, "status": "received"},
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    dispatch_document_processing(background_tasks, document.id, _process_in_background)
+    return {"id": str(document.id), "status": "received", "doc_type": doc_type}
 
 
 def _document_owner_id(current_user: dict) -> uuid.UUID:
@@ -101,19 +156,35 @@ def _document_owner_filters(owner_id: uuid.UUID) -> list:
     ]
 
 
+def _document_scope_filters(owner_id: uuid.UUID, current_user: dict) -> list:
+    """Admins can review mailbox documents; other users see their own uploads."""
+    if current_user.get("role") == "admin":
+        return []
+    return _document_owner_filters(owner_id)
+
+
 @router.get("", response_model=DocumentListResponse)
 def list_documents(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     status: Annotated[str | None, Query(max_length=40)] = None,
+    doc_type: Annotated[str | None, Query(max_length=40)] = None,
+    source: Annotated[str | None, Query(max_length=40)] = None,
+    parent_document_id: uuid.UUID | None = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentListResponse:
     """List documents uploaded by the authenticated user."""
     owner_id = _document_owner_id(current_user)
-    filters = _document_owner_filters(owner_id)
+    filters = _document_scope_filters(owner_id, current_user)
     if status:
         filters.append(Document.status == status)
+    if doc_type:
+        filters.append(Document.doc_type == doc_type)
+    if source:
+        filters.append(Document.source == source)
+    if parent_document_id:
+        filters.append(Document.parent_document_id == parent_document_id)
 
     total = db.query(func.count(Document.id)).filter(*filters).scalar() or 0
     rows = (
@@ -142,7 +213,10 @@ def get_document_detail(
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)
-        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .filter(
+            Document.id == document_id,
+            *_document_scope_filters(owner_id, current_user),
+        )
         .first()
     )
     if document is None:
@@ -175,6 +249,60 @@ def _get_converter(converter_cls):
     if converter_cls not in _converters:
         _converters[converter_cls] = converter_cls()
     return _converters[converter_cls]
+
+
+def _route_document_to_other(
+    db: Session, document: Document, doc_type: str, confidence: float
+) -> None:
+    """Move a low-confidence classification out before extraction or matching."""
+    old_key = document.storage_path
+    now = (
+        getattr(document, "email_received_at", None)
+        or getattr(document, "created_at", None)
+        or datetime.now(UTC)
+    )
+    filename = Path(document.original_filename).name
+    new_key = f"other/{now:%Y}/{now:%m}/{document.id}/{filename}"
+    if old_key and old_key != new_key:
+        move_file(old_key, new_key)
+    document.storage_path = new_key
+    document.status = "other"
+    db.add(
+        AuditLog(
+            action="document_routed_other",
+            entity_type="document",
+            entity_id=document.id,
+            result="success",
+            message="Document routed to other",
+            new_value={"doc_type": doc_type, "confidence": confidence},
+            created_by=getattr(document, "created_by", None),
+        )
+    )
+    db.commit()
+
+
+def _classify_document_cheaply(
+    filename: str, raw_text: str
+) -> tuple[str, float] | None:
+    """Use clear filename/first-page labels before the existing paid classifier."""
+    first_page = raw_text.split("\f", 1)[0][:6000].casefold()
+    filename = Path(filename).stem.casefold().replace("_", " ").replace("-", " ")
+    signals = (
+        ("invoice", r"\binvoice\b|\btax invoice\b|\bbill to\b", "invoice"),
+        ("po", r"\bpurchase order\b|\bpo number\b|\bpo no\b", "po"),
+        (
+            "goods_receipt",
+            r"\bgoods received note\b|\bdelivery receipt\b|"
+            r"\bproof of delivery\b|\bGRN\b",
+            "goods_receipt",
+        ),
+    )
+    for doc_type, pattern, filename_pattern in signals:
+        if re.search(filename_pattern.replace("\\b", " "), filename) or re.search(
+            pattern, first_page, re.IGNORECASE
+        ):
+            return doc_type, 0.95
+    return None
 
 
 def _normalize_invoice_value(value: object) -> str:
@@ -305,18 +433,21 @@ def _process_in_background(document_id: uuid.UUID) -> None:
 
             if document is None or document.status != "received":
                 return
-            if document.created_by is None:
+            if document.created_by is None and document.source != "email_poll":
                 logger.error(
                     "Skipping processing for document %s without an uploader",
                     document_id,
                 )
                 return
 
+            worker_user = {"sub": str(document.created_by)}
+            if document.created_by is None:
+                worker_user = {"sub": "system-worker", "worker": True}
             parse_document(
                 document_id=document_id,
                 background_tasks=None,
                 db=db,
-                current_user={"sub": str(document.created_by)},
+                current_user=worker_user,
             )
 
         except HTTPException as exc:
@@ -345,19 +476,27 @@ async def upload_document(
 ):
     results = []
     user_id = uuid.UUID(str(current_user["sub"]))
+    max_upload_size = int(os.getenv("EMAIL_ATTACHMENT_MAX_BYTES", str(MAX_FILE_SIZE)))
     for file in files:
         filename = Path(file.filename or "upload").name
-        content = await file.read(MAX_FILE_SIZE + 1)
+        content = await file.read(max_upload_size + 1)
         result = ingest_file(
-            db, filename, content, file.content_type, user_id, "upload",
+            db,
+            filename,
+            content,
+            file.content_type,
+            user_id,
+            "upload",
             background_tasks=background_tasks,
         )
-        results.append({
-            "filename": filename,
-            "document_id": str(result.document_id) if result.document_id else None,
-            "status": result.status,
-            "message": result.message,
-        })
+        results.append(
+            {
+                "filename": filename,
+                "document_id": str(result.document_id) if result.document_id else None,
+                "status": result.status,
+                "message": result.message,
+            }
+        )
     response = {"results": results}
     if len(results) == 1:
         response.update(
@@ -1300,13 +1439,15 @@ def parse_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    owner_id = _document_owner_id(current_user)
-    document = (
-        db.query(Document)
-        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
-        .with_for_update()
-        .first()
-    )
+    worker_call = current_user.get("worker") is True
+    owner_id = None if worker_call else _document_owner_id(current_user)
+    if worker_call:
+        query = db.query(Document).filter(Document.id == document_id)
+    else:
+        query = db.query(Document).filter(
+            Document.id == document_id, *_document_owner_filters(owner_id)
+        )
+    document = query.with_for_update().first()
 
     if not document:
         raise HTTPException(
@@ -1326,7 +1467,10 @@ def parse_document(
         document.failure_message = (
             "This file type is unsupported; ask the vendor to send a PDF or image."
         )
-        if getattr(document, "email_sender", None):
+        if (
+            getattr(document, "doc_type", None) != "other"
+            and getattr(document, "email_sender", None)
+        ):
             db.add(
                 Notification(
                     document_id=document.id,
@@ -1423,14 +1567,114 @@ def parse_document(
         db.commit()
 
         # Step 3: Classify using OpenRouter.
-        doc_type = classify_document(raw_text)
+        classify_override = getattr(document, "classify_override", None)
+        if classify_override:
+            doc_type, classify_confidence = classify_override, 1.0
+            document.classify_override = None
+        else:
+            cheap_result = _classify_document_cheaply(
+                document.original_filename, raw_text
+            )
+            if cheap_result is not None:
+                doc_type, classify_confidence = cheap_result
+            else:
+                try:
+                    supports_confidence = (
+                        "with_confidence"
+                        in inspect.signature(classify_document).parameters
+                    )
+                    if supports_confidence:
+                        classified = classify_document(raw_text, with_confidence=True)
+                    else:
+                        classified = classify_document(raw_text)
+                    if isinstance(classified, tuple):
+                        doc_type, classify_confidence = classified
+                    else:
+                        doc_type, classify_confidence = classified, 1.0
+                except Exception as exc:
+                    logger.warning(
+                        "Document classification failed for %s (%s)",
+                        document.id,
+                        type(exc).__name__,
+                    )
+                    doc_type, classify_confidence = "other", 0.0
 
         if doc_type == "gr":
             doc_type = "goods_receipt"
-        if doc_type not in {"invoice", "po", "goods_receipt", "other"}:
-            raise ValueError(f"Unsupported document type returned: {doc_type}")
+        try:
+            classify_confidence = float(classify_confidence)
+        except (TypeError, ValueError):
+            classify_confidence = 0.0
+        if not math.isfinite(classify_confidence):
+            classify_confidence = 0.0
+        try:
+            min_confidence = float(os.getenv("DOC_CLASSIFY_MIN_CONFIDENCE", "0.70"))
+        except (TypeError, ValueError):
+            min_confidence = 0.70
+        allowed_types = {"invoice", "po", "goods_receipt", "other"}
+        if (
+            not isinstance(doc_type, str)
+            or doc_type not in allowed_types
+            or classify_confidence < min_confidence
+        ):
+            doc_type = "other"
 
         document.doc_type = doc_type
+        document.classify_confidence = classify_confidence
+        if doc_type == "other":
+            try:
+                _route_document_to_other(db, document, doc_type, classify_confidence)
+            except Exception as exc:
+                db.rollback()
+                document.doc_type = "other"
+                document.classify_confidence = classify_confidence
+                document.failure_message = (
+                    f"Could not move file to other storage: {type(exc).__name__}"
+                )[:500]
+                db.commit()
+                return {
+                    "id": str(document.id),
+                    "status": document.status,
+                    "doc_type": document.doc_type,
+                    "failure_message": document.failure_message,
+                }
+            return {
+                "id": str(document.id),
+                "status": "other",
+                "doc_type": doc_type,
+                "classify_confidence": classify_confidence,
+                "extracted_json": None,
+                "validation_issues": [],
+                "duplicate_of": None,
+            }
+
+        route_date = (
+            getattr(document, "email_received_at", None)
+            or getattr(document, "created_at", None)
+            or datetime.now(UTC)
+        )
+        routed_key = (
+            f"{doc_type}/{route_date:%Y}/{route_date:%m}/{document.id}/"
+            f"{Path(document.original_filename).name}"
+        )
+        try:
+            if document.storage_path and document.storage_path != routed_key:
+                move_file(document.storage_path, routed_key)
+        except Exception as exc:
+            db.rollback()
+            document.doc_type = doc_type
+            document.classify_confidence = classify_confidence
+            document.failure_message = (
+                f"Could not move file to {doc_type} storage: {type(exc).__name__}"
+            )[:500]
+            db.commit()
+            return {
+                "id": str(document.id),
+                "status": document.status,
+                "doc_type": document.doc_type,
+                "failure_message": document.failure_message,
+            }
+        document.storage_path = routed_key
         document.status = "classified"
         db.commit()
 
@@ -1647,7 +1891,10 @@ def parse_document(
                 document_id,
                 validation_issues,
             )
-            if getattr(document, "email_sender", None):
+            if (
+                getattr(document, "doc_type", None) != "other"
+                and getattr(document, "email_sender", None)
+            ):
                 db.add(
                     Notification(
                         document_id=document.id,
@@ -1704,7 +1951,10 @@ def parse_document(
             if document:
                 document.status = "failed"
                 document.failure_message = _document_failure_message(exc)
-                if getattr(document, "email_sender", None):
+                if (
+                    getattr(document, "doc_type", None) != "other"
+                    and getattr(document, "email_sender", None)
+                ):
                     db.add(
                         Notification(
                             document_id=document.id,

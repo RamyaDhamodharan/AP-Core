@@ -93,6 +93,7 @@ class Invoice(Base):
             "match_issues",
             "no_match",
             name="match_status",
+            schema="core",
             create_type=False,
         ),
         nullable=False,
@@ -104,6 +105,7 @@ class Invoice(Base):
             "rejected",
             "on_hold",
             name="review_decision",
+            schema="core",
             create_type=False,
         ),
     )
@@ -111,16 +113,16 @@ class Invoice(Base):
         UUID(as_uuid=True), ForeignKey("match_runs.id")
     )
     final_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     final_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -159,10 +161,10 @@ class InvoiceLine(Base):
         UUID(as_uuid=True), ForeignKey("po_lines.id")
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

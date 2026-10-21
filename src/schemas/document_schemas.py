@@ -13,6 +13,11 @@ class DocumentSummary(BaseModel):
     status: str
     doc_type: str | None
     failure_message: str | None
+    source: str | None = None
+    parent_document_id: uuid.UUID | None = None
+    email_sender: str | None = None
+    email_subject: str | None = None
+    email_received_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -258,7 +258,7 @@ class E2E:
         if not match.get("invoice_approval_required"):
             raise AssertionError("match response did not retain invoice approval")
         final = self.db(
-            "SELECT final_status::text FROM invoices WHERE invoice_no = %s",
+            "SELECT final_status::text FROM core.invoices WHERE invoice_no = %s",
             (inv_no,),
         )
         if final != [(None,)]:
@@ -304,7 +304,7 @@ class E2E:
     def _matched_case(self, order, label):
         parsed, _, _, workflow, match = self.triple(order, label)
         docs_in_db = self.db(
-            "SELECT count(*) FROM documents WHERE id = ANY(%s::uuid[])",
+            "SELECT count(*) FROM core.documents WHERE id = ANY(%s::uuid[])",
             (list(parsed.values()),),
         )[0][0]
         if docs_in_db != 3:
@@ -540,12 +540,12 @@ class E2E:
         again = self.request("POST", f"/api/documents/{po_doc_id}/parse")
         self._expect(again, 200, "repeat parse request")
         row = self.db(
-            "SELECT count(*) FROM purchase_orders WHERE source_document_id = %s",
+            "SELECT count(*) FROM core.purchase_orders WHERE source_document_id = %s",
             (po_doc_id,),
         )
         source_count = self.db(
-            "SELECT count(*) FROM documents WHERE file_hash = "
-            "(SELECT file_hash FROM documents WHERE id = %s)",
+            "SELECT count(*) FROM core.documents WHERE file_hash = "
+            "(SELECT file_hash FROM core.documents WHERE id = %s)",
             (po_doc_id,),
         )[0][0]
         if row[0][0] != 1 or source_count != 1 or parsed.get("status") != "extracted":
@@ -568,7 +568,8 @@ class E2E:
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline:
             rows = self.db(
-                "SELECT status::text, failure_message FROM documents WHERE id = %s",
+                "SELECT status::text, failure_message "
+                "FROM core.documents WHERE id = %s",
                 (document_id,),
             )
             if rows and rows[0][0] in {
@@ -595,11 +596,12 @@ class E2E:
         result = self.workflow(po_doc)
         state = self.db(
             "SELECT decision, decision_by, decided_at IS NOT NULL "
-            "FROM document_workflows WHERE document_id = %s",
+            "FROM core.document_workflows WHERE document_id = %s",
             (po_doc,),
         )
         audits = self.db(
-            "SELECT count(*) FROM audit_log WHERE entity_type = 'document_workflow' "
+            "SELECT count(*) FROM core.audit_log "
+            "WHERE entity_type = 'document_workflow' "
             "AND entity_id = %s AND action = 'document_workflow_hold'",
             (po_doc,),
         )[0][0]

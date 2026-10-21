@@ -17,6 +17,11 @@ from src.models.invoice_models import Invoice
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def fake_minio_moves(monkeypatch):
+    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
+
+
 def _save_invoice_for_matching(
     *,
     vendor,
@@ -58,7 +63,8 @@ def _save_invoice_for_matching(
     )
     versions_query = MagicMock()
     versions_query_result = (
-        versions_query.filter.return_value.order_by.return_value.with_for_update.return_value
+        versions_query.filter.return_value.order_by.return_value
+        .with_for_update.return_value
     )
     versions_query_result.all.return_value = prior_versions or []
     db_version_query = versions_query
@@ -213,7 +219,7 @@ def test_parse_document_success(monkeypatch):
 
     document = SimpleNamespace(
         id=document_id,
-        original_filename="invoice.pdf",
+        original_filename="miscellaneous.pdf",
         storage_path=f"documents/{document_id}.pdf",
         status="received",
         doc_type=None,
@@ -1044,14 +1050,22 @@ def test_parse_document_download_failure(monkeypatch):
     assert response.status_code >= 400
 
 
-def test_parse_document_classification_failure(monkeypatch):
+@pytest.mark.parametrize(
+    "classification_result",
+    [
+        ("invoice", 0.2),
+        ("unrecognized", 0.99),
+        RuntimeError("Classification failed"),
+    ],
+)
+def test_parse_document_classification_failure(monkeypatch, classification_result):
     from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
 
     document = SimpleNamespace(
         id=document_id,
-        original_filename="invoice.pdf",
+        original_filename="miscellaneous.pdf",
         storage_path=f"documents/{document_id}.pdf",
         status="received",
         doc_type=None,
@@ -1076,7 +1090,7 @@ def test_parse_document_classification_failure(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_markdown=lambda: "Invoice INV-101. Total 1500"
+                    export_to_markdown=lambda: "Reference materials and terms"
                 )
             )
 
@@ -1091,13 +1105,15 @@ def test_parse_document_classification_failure(monkeypatch):
         fake_converter_module,
     )
 
-    def fail_classification(text):
-        raise RuntimeError("Classification failed")
+    def classify(text):
+        if isinstance(classification_result, Exception):
+            raise classification_result
+        return classification_result
 
     monkeypatch.setattr(
         document_routers,
         "classify_document",
-        fail_classification,
+        classify,
     )
 
     app.dependency_overrides[get_db] = lambda: db
@@ -1109,7 +1125,9 @@ def test_parse_document_classification_failure(monkeypatch):
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
 
-    assert response.status_code >= 400
+    assert response.status_code == 200
+    assert response.json()["status"] == "other"
+    assert document.doc_type == "other"
 
 
 @pytest.mark.parametrize(

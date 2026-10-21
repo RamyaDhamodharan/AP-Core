@@ -24,6 +24,7 @@ def setup_db(monkeypatch, db):
     monkeypatch.setattr(
         document_ingest_services, "delete_file", lambda *args, **kwargs: None
     )
+    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
     monkeypatch.setattr(
         document_routers,
         "_process_in_background",
@@ -149,6 +150,12 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
         document_ingest_services, "upload_file", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(document_routers, "download_file", lambda *_: b"PDF")
+    routed_files = []
+    monkeypatch.setattr(
+        document_routers,
+        "move_file",
+        lambda source, destination: routed_files.append((source, destination)),
+    )
     monkeypatch.setenv("USE_CELERY", "false")
 
     class FakeConverter:
@@ -216,6 +223,8 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
 
     assert response.status_code == 202
     assert document.status == "extracted"
+    assert len(routed_files) == 1
+    assert routed_files[0][1].startswith("invoice/")
     assert invoice.final_status == "approved"
     assert any(
         isinstance(call.args[0], MatchRun) and call.args[0].result == "match_ok"

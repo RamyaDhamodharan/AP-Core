@@ -62,7 +62,9 @@ def extract_e2e_test_document_text(content: bytes) -> str:
     return raw_text
 
 
-def classify_document(raw_text: str) -> str:
+def classify_document(
+    raw_text: str, *, with_confidence: bool = False
+) -> str | tuple[str, float]:
     """Classify document text using OpenRouter Luna Decisions."""
     if _e2e_mock_enabled():
         doc_type = str(_e2e_payload(raw_text).get("document_type", "")).lower()
@@ -70,7 +72,7 @@ def classify_document(raw_text: str) -> str:
             doc_type = "goods_receipt"
         if doc_type not in DOCUMENT_TYPES:
             raise ValueError(f"Invalid E2E document type: {doc_type!r}")
-        return doc_type
+        return (doc_type, 1.0) if with_confidence else doc_type
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     model = os.getenv("OPENROUTER_MODEL", "")
@@ -122,15 +124,25 @@ def classify_document(raw_text: str) -> str:
     answers = data.get("answers", {})
     answer = answers.get("doc_type", {}) if isinstance(answers, dict) else {}
 
-    doc_type = answer.get("choice") if isinstance(answer, dict) else None
+    choice: object = answer.get("choice") if isinstance(answer, dict) else None
 
-    if isinstance(doc_type, str) and doc_type.strip().lower() == "gr":
-        doc_type = "goods_receipt"
+    if isinstance(choice, str) and choice.strip().lower() == "gr":
+        choice = "goods_receipt"
 
-    if doc_type not in DOCUMENT_TYPES:
-        raise ValueError(f"Luna returned an invalid document type: {doc_type!r}")
+    if choice not in DOCUMENT_TYPES:
+        raise ValueError(f"Luna returned an invalid document type: {choice!r}")
+    doc_type = str(choice)
 
-    return doc_type
+    confidence = (
+        answer.get("confidence", data.get("confidence", 0.0))
+        if isinstance(answer, dict)
+        else 0.0
+    )
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return (doc_type, confidence) if with_confidence else doc_type
 
 
 def _groq_extract(

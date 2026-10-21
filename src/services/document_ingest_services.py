@@ -5,6 +5,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import BackgroundTasks
@@ -36,6 +37,8 @@ def ingest_file(
     parent_document_id: uuid.UUID | None = None,
     email_meta: dict | None = None,
     background_tasks: BackgroundTasks | None = None,
+    object_key: str | None = None,
+    document_id: uuid.UUID | None = None,
 ) -> IngestResult:
     """Persist one file and enqueue document processing after its row commits."""
     filename = Path(filename or "upload").name
@@ -44,8 +47,17 @@ def ingest_file(
         return IngestResult("failed", None, "Unsupported file type")
     if not content_bytes:
         return IngestResult("failed", None, "Uploaded file is empty")
-    if len(content_bytes) > MAX_FILE_SIZE:
-        return IngestResult("failed", None, "File exceeds 20 MB limit")
+    max_size = (
+        int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20")) * 1024 * 1024
+        if source == "email_poll" and extension != ".eml"
+        else MAX_FILE_SIZE
+    )
+    if len(content_bytes) > max_size:
+        if max_size % (1024 * 1024) == 0:
+            limit_label = f"{max_size // (1024 * 1024)} MB"
+        else:
+            limit_label = f"{max_size} byte"
+        return IngestResult("failed", None, f"File exceeds {limit_label} limit")
 
     file_hash = hashlib.sha256(content_bytes).hexdigest()
     existing = db.query(Document).filter_by(file_hash=file_hash).first()
@@ -54,8 +66,11 @@ def ingest_file(
             "duplicate_blocked", existing.id, "This file has already been uploaded"
         )
 
-    document_id = uuid.uuid4()
-    storage_path = f"documents/{document_id}{extension}"
+    document_id = document_id or uuid.uuid4()
+    received_at = datetime.now(UTC)
+    storage_path = object_key or (
+        f"incoming/{received_at:%Y}/{received_at:%m}/{document_id}/{filename}"
+    )
     try:
         upload_file(
             storage_path, content_bytes, content_type or "application/octet-stream"
@@ -64,6 +79,9 @@ def ingest_file(
             id=document_id,
             original_filename=filename,
             file_hash=file_hash,
+            sha256=file_hash,
+            mime=content_type,
+            size=len(content_bytes),
             storage_path=storage_path,
             status="received",
             created_by=user_id,
@@ -92,7 +110,13 @@ def ingest_file(
         try:
             delete_file(storage_path)
         except Exception:
-            logger.exception("MinIO cleanup failed after ingestion error")
+            if source == "email_poll":
+                logger.warning("Email MinIO cleanup failed (%s)", type(exc).__name__)
+            else:
+                logger.exception("MinIO cleanup failed after ingestion error")
+        if source == "email_poll":
+            logger.warning("Email file ingestion failed (%s)", type(exc).__name__)
+            return IngestResult("failed", None, "Email file ingestion failed")
         logger.exception("File ingestion failed for %s", filename)
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 

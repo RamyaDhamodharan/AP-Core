@@ -43,7 +43,7 @@ class ExchangeRate(Base):
         nullable=False,
         server_default=func.now(),
     )
-    created_by = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_by = mapped_column(UUID(as_uuid=True), ForeignKey("auth.users.id"))
     updated_at = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -52,5 +52,5 @@ class ExchangeRate(Base):
     )
     updated_by = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("users.id"),
+        ForeignKey("auth.users.id"),
     )

@@ -33,7 +33,7 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261021_0006"]
+    assert script.get_heads() == ["20261022_0009"]
     alias_revision = script.get_revision(ALIAS_REVISION)
     assert alias_revision is not None
     assert alias_revision.down_revision == BASELINE_REVISION
@@ -42,7 +42,7 @@ def test_alembic_revision_chain_has_one_expected_head():
 
 def test_sql_bootstrap_matches_pre_alias_migration_baseline():
     schema = (ROOT / "database" / "001_initial_schema.sql").read_text()
-    alias_table = schema.split("CREATE TABLE vendor_aliases (", 1)[1].split(
+    alias_table = schema.split("CREATE TABLE core.vendor_aliases (", 1)[1].split(
         ");",
         1,
     )[0]
@@ -50,7 +50,9 @@ def test_sql_bootstrap_matches_pre_alias_migration_baseline():
     assert "alias_norm varchar(200) NOT NULL" in alias_table
     assert "is_active" not in alias_table
     assert "CREATE UNIQUE INDEX uq_vendor_alias_norm" not in schema
-    assert "CREATE INDEX ix_vendor_alias_norm ON vendor_aliases(alias_norm)" in schema
+    assert (
+        "CREATE INDEX ix_vendor_alias_norm ON core.vendor_aliases(alias_norm)"
+    ) in schema
 
 
 def test_alias_migration_upgrade_checks_and_normalizes_existing_data(

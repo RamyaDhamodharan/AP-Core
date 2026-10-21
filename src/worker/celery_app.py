@@ -30,7 +30,7 @@ if (
         "poll-ap-email": {
             "task": "ap.poll_email",
             "schedule": schedule(
-                float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "120"))
+                float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "300"))
             ),
         }
     }
