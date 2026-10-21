@@ -19,6 +19,17 @@ from src.worker.dispatch import dispatch_queued_notifications
 
 logger = logging.getLogger(__name__)
 ATTACHMENT_TYPES = {".pdf", ".png", ".jpg", ".jpeg"}
+IMAP_AUTH_ERROR = "Gmail rejected the login: use an App Password and enable IMAP"
+IMAP_REACHABILITY_ERROR = "Cannot reach IMAP host"
+IMAP_CONFIG_ERROR = "IMAP_USER / IMAP_PASSWORD not set"
+
+
+def _friendly_imap_error(exc: Exception) -> str:
+    if "AUTHENTICATIONFAILED" in str(exc).upper():
+        return IMAP_AUTH_ERROR
+    if isinstance(exc, (TimeoutError, OSError)):
+        return IMAP_REACHABILITY_ERROR
+    return IMAP_REACHABILITY_ERROR
 
 
 def poll_email_with_lock(db) -> dict:
@@ -27,9 +38,9 @@ def poll_email_with_lock(db) -> dict:
 
     lock = None
     try:
-        lock = Redis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        ).lock("ap:email-poll-lock", timeout=300, blocking_timeout=0)
+        lock = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0")).lock(
+            "ap:email-poll-lock", timeout=300, blocking_timeout=0
+        )
         if not lock.acquire(blocking=False):
             return {
                 "emails": 0,
@@ -39,17 +50,31 @@ def poll_email_with_lock(db) -> dict:
                 "skipped": "lock",
             }
         return poll_email_messages(db)
-    except Exception as exc:
-        logger.exception("Email poll lock or run failed")
+    except Exception:
+        logger.warning("Email polling Redis lock is unavailable")
         _audit(
             db,
             "email_failed",
             "Email polling could not start",
             result="error",
-            detail=repr(exc),
+            detail="Redis lock unavailable",
+        )
+        result = {
+            "emails": 0,
+            "attachments": 0,
+            "duplicates": 0,
+            "failed": 1,
+            "message": "Email polling lock unavailable",
+        }
+        _audit(
+            db,
+            "email_poll_run",
+            "Email polling could not start",
+            result="error",
+            detail=str(result),
         )
         db.commit()
-        return {"emails": 0, "attachments": 0, "duplicates": 0, "failed": 1}
+        return result
     finally:
         if lock is not None:
             with contextlib.suppress(Exception):
@@ -85,14 +110,33 @@ def _metadata(raw: bytes) -> tuple[Message, str | None, str, str, datetime | Non
 
 def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
     """Poll unseen messages. Individual failures are audited and isolated."""
-    host = os.getenv("IMAP_HOST", "")
+    host = os.getenv("IMAP_HOST", "").strip()
+    username = os.getenv("IMAP_USER", "").strip()
+    password = os.getenv("IMAP_PASSWORD", "")
+    if not username or not password:
+        result = {
+            "emails": 0,
+            "attachments": 0,
+            "duplicates": 0,
+            "failed": 1,
+            "message": IMAP_CONFIG_ERROR,
+        }
+        _audit(
+            db,
+            "email_poll_run",
+            "Email polling configuration is incomplete",
+            result="error",
+            detail=str(result),
+        )
+        db.commit()
+        return result
     if not host:
         result = {
             "emails": 0,
             "attachments": 0,
             "duplicates": 0,
-            "failed": 0,
-            "error": "IMAP_HOST is not configured",
+            "failed": 1,
+            "message": IMAP_REACHABILITY_ERROR,
         }
         _audit(
             db,
@@ -110,7 +154,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
     for attempt in range(3):
         try:
             client = factory(host, int(os.getenv("IMAP_PORT", "993")))
-            client.login(os.getenv("IMAP_USER", ""), os.getenv("IMAP_PASSWORD", ""))
+            client.login(username, password)
             break
         except (OSError, imaplib.IMAP4.error, TimeoutError) as exc:
             last_exc = exc
@@ -121,14 +165,16 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
             if attempt < 2:
                 sleep(2**attempt)
     if client is None:
-        detail = repr(last_exc)
-        logger.error("IMAP connection failed: %s", detail)
+        friendly_message = _friendly_imap_error(last_exc or RuntimeError())
+        logger.warning("IMAP connection failed: %s", friendly_message)
+        counts["failed"] += 1
+        counts["message"] = friendly_message
         _audit(
             db,
             "email_failed",
             "Email polling could not connect",
             result="error",
-            detail=detail,
+            detail=friendly_message,
         )
         _audit(
             db,
@@ -138,7 +184,6 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
             detail=str(counts),
         )
         db.commit()
-        counts["failed"] += 1
         return counts
 
     try:
@@ -157,14 +202,16 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
         _audit(db, "email_poll_run", "Email polling completed", detail=str(counts))
         db.commit()
     except Exception as exc:
-        logger.exception("IMAP polling batch failed")
+        friendly_message = _friendly_imap_error(exc)
+        logger.warning("IMAP polling batch failed: %s", friendly_message)
         _audit(
             db,
             "email_failed",
             "Email polling batch failed",
             result="error",
-            detail=repr(exc),
+            detail=friendly_message,
         )
+        counts["message"] = friendly_message
         db.commit()
         counts["failed"] += 1
     finally:
@@ -321,7 +368,7 @@ def _process_message(db, client, number, counts):
         client.store(number, "+FLAGS", "\\Seen")
     except Exception as exc:
         db.rollback()
-        logger.exception("Failed to process IMAP message %s", number)
+        logger.warning("Failed to process IMAP message %s", number)
         counts["failed"] += 1
         _audit(
             db,
@@ -329,6 +376,6 @@ def _process_message(db, client, number, counts):
             "Email could not be processed and will be retried",
             result="error",
             entity_id=getattr(parent, "id", None),
-            detail=f"{message_id or number}: {exc!r}",
+            detail=f"{message_id or number}: {type(exc).__name__}",
         )
         db.commit()

@@ -42,7 +42,10 @@ def email_poll_status(
     except (ValueError, SyntaxError):
         result = last.technical_detail if last else None
     return {
-        "enabled": os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true",
+        "enabled": (
+            os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true"
+            and os.getenv("EMAIL_PROVIDER", "imap").lower() == "imap"
+        ),
         "last_run_at": last.created_at.isoformat() if last else None,
         "last_result": result,
     }

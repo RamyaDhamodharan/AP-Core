@@ -22,7 +22,10 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
 )
 
-if os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true":
+if (
+    os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true"
+    and os.getenv("EMAIL_PROVIDER", "imap").lower() == "imap"
+):
     celery_app.conf.beat_schedule = {
         "poll-ap-email": {
             "task": "ap.poll_email",

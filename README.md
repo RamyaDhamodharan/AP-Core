@@ -9,6 +9,27 @@ FastAPI starter for document ingestion, parsing/extraction, vendors, purchase or
 4. Run: `uv run uvicorn src.main:app --reload --port 8002`
 5. Open `http://127.0.0.1:8002/docs` or `http://127.0.0.1:8002/health`.
 
+## Local email polling test
+
+1. Use a dedicated Gmail test mailbox. Enable 2-Step Verification and create
+   an App Password in Google Account → Security → App passwords. Use that value
+   as `IMAP_PASSWORD`; regular account passwords are rejected.
+2. Copy the root `.env.example` to `.env` and set the required local
+   `POSTGRES_PASSWORD` and `JWT_SECRET_KEY`, plus `IMAP_HOST=imap.gmail.com`,
+   `IMAP_USER`, `IMAP_PASSWORD`, `EMAIL_PROVIDER=imap`,
+   `EMAIL_POLL_ENABLED=true`, and the test mailbox in
+   `TEST_MAILBOX_ALLOWLIST`.
+3. From the repository root run `docker compose up -d --build`.
+4. Create an administrator with
+   `docker compose exec auth python scripts/create_admin.py --email you@example.com`.
+5. Log in at `http://localhost:8001/docs` using `POST /api/auth/login` and copy
+   the access token. In `http://localhost:8000/docs`, authorize with that token
+   and call `POST /api/email-polling/run`.
+6. Check `GET /api/documents` for the ingested email and attachment documents.
+
+The scheduled poll uses Celery beat when email polling is enabled. The manual
+admin endpoint works without waiting for the scheduled interval.
+
 ## Database initialization and migrations
 
 AP-Auth and AP-Core share the `genworx_ap` database but maintain separate

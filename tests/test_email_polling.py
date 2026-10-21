@@ -224,23 +224,108 @@ def test_bad_attachment_does_not_block_good_attachment(polling_setup, monkeypatc
     )
 
 
-def test_imap_login_failure_is_audited_without_raising(polling_setup, monkeypatch):
+def test_imap_auth_failure_has_safe_plain_language_result(
+    polling_setup, monkeypatch, caplog
+):
     db = polling_setup
+    secret = "never-log-this-password"
+    monkeypatch.setenv("IMAP_PASSWORD", secret)
 
     class BrokenIMAP:
         def __init__(self, *_):
             pass
 
         def login(self, *_):
-            raise imaplib.IMAP4.error("bad credentials")
+            raise imaplib.IMAP4.error("[AUTHENTICATIONFAILED] login rejected")
 
-    counts = email_polling_services.poll_email_messages(
+    result = email_polling_services.poll_email_messages(
         db, BrokenIMAP, sleep=lambda _: None
     )
-    assert counts["failed"] == 1
+    assert result["failed"] == 1
+    assert (
+        result["message"]
+        == "Gmail rejected the login: use an App Password and enable IMAP"
+    )
+    assert secret not in caplog.text
+    assert all(
+        secret not in (row.technical_detail or "")
+        for row in db.rows
+        if isinstance(row, AuditLog)
+    )
     assert any(
         isinstance(row, AuditLog) and row.action == "email_failed" for row in db.rows
     )
+
+
+def test_imap_timeout_has_plain_language_result(polling_setup, monkeypatch):
+    db = polling_setup
+
+    class TimeoutIMAP:
+        def __init__(self, *_):
+            pass
+
+        def login(self, *_):
+            raise TimeoutError("network timed out")
+
+    result = email_polling_services.poll_email_messages(
+        db, TimeoutIMAP, sleep=lambda _: None
+    )
+    assert result["message"] == "Cannot reach IMAP host"
+
+
+def test_missing_imap_login_configuration_has_plain_language_result(
+    polling_setup, monkeypatch
+):
+    monkeypatch.delenv("IMAP_USER")
+    result = email_polling_services.poll_email_messages(polling_setup)
+    assert result["message"] == "IMAP_USER / IMAP_PASSWORD not set"
+
+
+def test_admin_status_exposes_plain_language_poll_result(monkeypatch):
+    from datetime import UTC, datetime
+
+    secret = "email-poll-status-test-secret-with-32-bytes"
+    monkeypatch.setenv("JWT_SECRET_KEY", secret)
+    db = MagicMock()
+    last_run_query = db.query.return_value.filter.return_value.order_by.return_value
+    last_run_query.first.return_value = type(
+        "Audit",
+        (),
+        {
+            "created_at": datetime.now(UTC),
+            "technical_detail": "{'failed': 1, 'message': 'Cannot reach IMAP host'}",
+        },
+    )()
+    app.dependency_overrides[get_db] = lambda: db
+    token = jwt.encode(
+        {"sub": str(uuid.uuid4()), "type": "access", "role": "admin"},
+        secret,
+        algorithm="HS256",
+    )
+    try:
+        response = TestClient(app).get(
+            "/api/email-polling/status",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+    assert response.status_code == 200
+    assert response.json()["last_result"]["message"] == "Cannot reach IMAP host"
+
+
+def test_beat_schedule_requires_enabled_imap_provider(monkeypatch):
+    import importlib
+
+    from src.worker import celery_app as celery_module
+
+    monkeypatch.setenv("EMAIL_POLL_ENABLED", "true")
+    monkeypatch.setenv("EMAIL_PROVIDER", "imap")
+    enabled_module = importlib.reload(celery_module)
+    assert "poll-ap-email" in enabled_module.celery_app.conf.beat_schedule
+
+    monkeypatch.setenv("EMAIL_PROVIDER", "other")
+    disabled_module = importlib.reload(celery_module)
+    assert "poll-ap-email" not in disabled_module.celery_app.conf.beat_schedule
 
 
 def test_manual_poll_endpoint_requires_admin(monkeypatch):
