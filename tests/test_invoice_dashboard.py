@@ -102,6 +102,53 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
     assert db.query.call_count == 2
 
 
+def test_overdue_filter_excludes_approved_and_rejected_invoices():
+
+    invoice = _invoice()
+    _, count_query, _, teardown = _setup_dashboard(
+        [(invoice, "ABC Supplies", "extracted")], total=1
+    )
+    try:
+        response = client.get("/api/invoices?overdue=true")
+    finally:
+        teardown()
+    assert response.status_code == 200
+    expressions = [
+        item.compile(dialect=postgresql.dialect())
+        for item in count_query.filter.call_args.args
+    ]
+    sql = " ".join(str(expression) for expression in expressions)
+    assert "invoices.due_date <" in sql
+    assert "invoices.final_status NOT IN" in sql
+    assert "invoices.final_status IS NULL" in sql
+
+
+def test_invoice_detail_flags_low_confidence_extraction_fields():
+
+    invoice = _invoice(
+        vendor_id=None, subtotal=None, tax_amount=None, po_id=None, po_number_raw=None
+    )
+    document = SimpleNamespace(
+        extracted_json={"field_confidence": {"invoice_no": 84.9, "total_amount": 95}}
+    )
+    query = MagicMock()
+    query.outerjoin.return_value = query
+    query.filter.return_value = query
+    query.first.return_value = (invoice, document)
+    db = MagicMock()
+    db.query.return_value = query
+    owner_id = uuid.uuid4()
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
+    try:
+        response = client.get(f"/api/invoices/{invoice.id}")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == 200
+    assert response.json()["low_confidence_fields"] == ["invoice_no"]
+
+
 def test_invoice_list_applies_filters_and_search():
     vendor_id = uuid.uuid4()
     _, _, query, teardown = _setup_dashboard()

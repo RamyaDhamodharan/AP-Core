@@ -1,5 +1,6 @@
+import sys
 import uuid
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import jwt
@@ -65,6 +66,162 @@ def test_upload_valid_pdf(monkeypatch):
 
     db.add.assert_called_once()
     db.commit.assert_called_once()
+
+
+def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monkeypatch):
+    from src.models.document_models import Document
+    from src.models.invoice_models import InvoiceLine
+    from src.models.match_run_models import MatchRun
+    from src.models.notification_models import Notification
+    from src.models.purchase_order_models import PurchaseOrderLine
+    from src.services import invoice_matching_services
+
+    owner_id = uuid.uuid4()
+    po = SimpleNamespace(id=uuid.uuid4())
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        po_id=po.id,
+        source_document_id=None,
+        final_status=None,
+        final_run_id=None,
+        final_by=None,
+        final_at=None,
+        match_status="pending",
+        invoice_no="INV-1",
+    )
+    db = MagicMock()
+    document = None
+    document_query = MagicMock()
+    document_query.filter_by.return_value.first.return_value = None
+    locked_document_query = (
+        document_query.filter.return_value.with_for_update.return_value
+    )
+    locked_document_query.first.side_effect = lambda: document
+    empty_query = MagicMock()
+    empty_query.filter.return_value.all.return_value = []
+    empty_query.all.return_value = []
+    previous_query = MagicMock()
+    previous_query.filter.return_value.order_by.return_value.first.return_value = None
+    max_query = MagicMock()
+    max_query.filter.return_value.scalar.return_value = 0
+    notification_query = MagicMock()
+    notification_query.filter.return_value.all.return_value = []
+    match_query_number = 0
+
+    def query(model, *args):
+        nonlocal match_query_number
+        if model is Document:
+            return document_query
+        if model in {InvoiceLine, PurchaseOrderLine}:
+            return empty_query
+        if model is MatchRun:
+            match_query_number += 1
+            return previous_query
+        if str(model).startswith("max("):
+            return max_query
+        if model is Notification:
+            return notification_query
+        raise AssertionError(f"Unexpected query model: {model}")
+
+    db.query.side_effect = query
+    db.get.side_effect = lambda model, _id: (
+        invoice
+        if model.__name__ == "Invoice"
+        else po
+        if model.__name__ == "PurchaseOrder"
+        else document
+    )
+
+    def add(row):
+        nonlocal document
+        if isinstance(row, Document):
+            document = row
+
+    db.add.side_effect = add
+
+    def flush():
+        for call in db.add.call_args_list:
+            row = call.args[0]
+            if isinstance(row, MatchRun) and row.id is None:
+                row.id = uuid.uuid4()
+
+    db.flush.side_effect = flush
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
+    monkeypatch.setattr(document_routers, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(document_routers, "download_file", lambda *_: b"PDF")
+    monkeypatch.setenv("USE_CELERY", "false")
+
+    class FakeConverter:
+        def convert(self, _path):
+            return SimpleNamespace(
+                document=SimpleNamespace(export_to_markdown=lambda: "Invoice INV-1")
+            )
+
+    fake_docling = ModuleType("docling")
+    fake_converter = ModuleType("docling.document_converter")
+    fake_converter.DocumentConverter = FakeConverter
+    monkeypatch.setitem(sys.modules, "docling", fake_docling)
+    monkeypatch.setitem(sys.modules, "docling.document_converter", fake_converter)
+    monkeypatch.setattr(document_routers, "classify_document", lambda _: "invoice")
+    monkeypatch.setattr(
+        document_routers,
+        "extract_document",
+        lambda *_: {
+            "document_type": "invoice",
+            "vendor": "Acme",
+            "invoice_number": "INV-1",
+            "invoice_date": "2026-10-01",
+            "currency": "USD",
+            "total": "10",
+            "subtotal": "10",
+            "tax": "0",
+            "line_items": [],
+        },
+    )
+
+    def save_invoice(_db, saved_doc, _data):
+        nonlocal document
+        document = saved_doc
+        return invoice
+
+    monkeypatch.setattr(document_routers, "_save_invoice_from_extraction", save_invoice)
+    monkeypatch.setattr(
+        invoice_matching_services,
+        "_invoice_state_fingerprint",
+        lambda *_: "pipeline-state",
+    )
+    monkeypatch.setattr(
+        invoice_matching_services,
+        "recommend_invoice_review",
+        lambda *_args, **_kwargs: SimpleNamespace(checks=[]),
+    )
+
+    def process_document(document_id):
+        document_routers.parse_document(
+            document_id=document_id,
+            background_tasks=None,
+            db=db,
+            current_user={"sub": str(owner_id)},
+        )
+
+    monkeypatch.setattr(document_routers, "_process_in_background", process_document)
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.pdf", b"PDF", "application/pdf")},
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 201
+    assert document.status == "extracted"
+    assert invoice.final_status == "approved"
+    assert any(
+        isinstance(call.args[0], MatchRun) and call.args[0].result == "match_ok"
+        for call in db.add.call_args_list
+    )
 
 
 def test_upload_rejects_unsupported_extension(monkeypatch):
@@ -249,6 +406,7 @@ def test_background_processing_uses_stored_uploader_identity(monkeypatch):
     assert processed == [
         {
             "document_id": document.id,
+            "background_tasks": None,
             "db": db,
             "current_user": {"sub": str(owner_id)},
         }

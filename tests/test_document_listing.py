@@ -38,8 +38,7 @@ def test_list_documents_returns_only_authenticated_owner_page():
     count_query.filter.return_value.scalar.return_value = 1
     page_query = MagicMock()
     page_results = (
-        page_query.filter.return_value.order_by.return_value.offset.return_value
-        .limit.return_value.all
+        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all
     )
     page_results.return_value = [document]
     db = MagicMock()
@@ -47,9 +46,7 @@ def test_list_documents_returns_only_authenticated_owner_page():
     _override(owner_id, db)
 
     try:
-        response = client.get(
-            "/api/documents?page=1&page_size=10&status=extracted"
-        )
+        response = client.get("/api/documents?page=1&page_size=10&status=extracted")
     finally:
         _clear_overrides()
 
@@ -71,8 +68,7 @@ def test_empty_document_workspace_returns_zero_from_owner_scoped_api():
     count_query.filter.return_value.scalar.return_value = 0
     page_query = MagicMock()
     (
-        page_query.filter.return_value.order_by.return_value.offset.return_value
-        .limit.return_value.all.return_value
+        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
     ) = []
     db = MagicMock()
     db.query.side_effect = [count_query, page_query]
@@ -146,6 +142,4 @@ def test_document_detail_includes_evidence_and_audit_history():
     body = response.json()
     assert body["raw_text"] == "Invoice source text"
     assert body["extracted_json"] == {"invoice_number": "INV-1"}
-    assert body["audit_history"][0]["action"] == (
-        "document_processing_retry_requested"
-    )
+    assert body["audit_history"][0]["action"] == ("document_processing_retry_requested")

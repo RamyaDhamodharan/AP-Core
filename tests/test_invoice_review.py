@@ -91,7 +91,7 @@ def test_review_invoice_rejects_invoice():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "rejected"},
+            json={"decision": "rejected", "reason": "Duplicate invoice"},
         )
     finally:
         teardown()
@@ -108,7 +108,7 @@ def test_review_invoice_places_invoice_on_hold():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "on_hold"},
+            json={"decision": "on_hold", "reason": "Awaiting clarification"},
         )
     finally:
         teardown()

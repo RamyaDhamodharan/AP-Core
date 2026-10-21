@@ -59,6 +59,8 @@ class Document(Base):
     email_sender: Mapped[str | None] = mapped_column(String(200))
     email_subject: Mapped[str | None] = mapped_column(String(500))
     email_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    email_message_id: Mapped[str | None] = mapped_column(String(300))
+    source: Mapped[str | None] = mapped_column(String(40))
     failure_message: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

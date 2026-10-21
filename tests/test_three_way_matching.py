@@ -1,3 +1,4 @@
+import os
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
@@ -144,6 +145,11 @@ def test_three_way_match_detects_duplicate_invoice():
     assert any("Duplicate invoice" in issue for issue in result["issues"])
 
 
+@pytest.mark.skipif(
+    os.getenv("ENABLE_GOODS_RECEIPT", "false").casefold()
+    not in {"1", "true", "yes", "on"},
+    reason="goods receipt API is disabled by default",
+)
 def test_create_goods_receipt_rejects_duplicate_number():
     user_id = uuid.uuid4()
     db = MagicMock()
@@ -287,6 +293,11 @@ def test_unrelated_goods_receipt_integrity_error_is_reraised():
     db.rollback.assert_called_once()
 
 
+@pytest.mark.skipif(
+    os.getenv("ENABLE_GOODS_RECEIPT", "false").casefold()
+    not in {"1", "true", "yes", "on"},
+    reason="goods receipt API is disabled by default",
+)
 def test_goods_receipt_update_rejects_empty_lines_without_mutating_receipt():
     existing_line = SimpleNamespace(id=uuid.uuid4())
     receipt = SimpleNamespace(lines=[existing_line])

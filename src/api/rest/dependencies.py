@@ -53,3 +53,12 @@ def get_current_user(
             detail="Invalid or expired access token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from e
+
+
+def require_role(role: str):
+    def role_dependency(current_user: dict[str, object] = Depends(get_current_user)):
+        if current_user.get("role") != role:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return current_user
+
+    return role_dependency

@@ -1,6 +1,7 @@
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from src.models.document_models import Document
 from src.models.goods_receipt_models import GoodsReceipt
@@ -301,6 +302,59 @@ def test_workflow_comparison_flags_unit_price_mismatch():
     )
 
 
+def test_workflow_unit_price_at_exactly_two_percent_passes():
+    checks = _checks(invoice_price="10.2")
+    assert (
+        next(check for check in checks if check.name == "unit_price").outcome
+        == "passed"
+    )
+
+
+def test_workflow_unit_price_above_two_percent_is_issue():
+    checks = _checks(invoice_price="10.201")
+    assert (
+        next(check for check in checks if check.name == "unit_price").outcome
+        == "mismatch"
+    )
+
+
+def test_workflow_tax_difference_is_issue():
+    invoice, po, receipt, po_line, invoice_line = _records()
+    invoice.tax_amount = Decimal("2")
+    po.tax_amount = Decimal("1")
+    checks = compare_available_records(
+        invoice=invoice,
+        purchase_order=po,
+        receipts=[receipt],
+        po_lines=[po_line],
+        invoice_lines=[invoice_line],
+    )
+    assert next(check for check in checks if check.name == "tax").outcome == "mismatch"
+
+
+def test_workflow_currency_conversion_uses_exchange_rate():
+    from datetime import date
+
+    invoice, po, receipt, po_line, invoice_line = _records()
+    invoice.currency = "EUR"
+    rate = SimpleNamespace(rate=Decimal("1.1"), rate_date=date(2026, 10, 20))
+    query = MagicMock()
+    query.filter.return_value.order_by.return_value.first.return_value = rate
+    db = MagicMock()
+    db.query.return_value = query
+    checks = compare_available_records(
+        db=db,
+        invoice=invoice,
+        purchase_order=po,
+        receipts=[receipt],
+        po_lines=[po_line],
+        invoice_lines=[invoice_line],
+    )
+    assert (
+        next(check for check in checks if check.name == "currency").outcome == "passed"
+    )
+
+
 def test_invoice_item_code_mismatch_is_not_linked_by_matching_description():
     invoice, purchase_order, receipt, po_line, invoice_line = _records()
     invoice_line.po_line_id = None
@@ -348,10 +402,8 @@ def test_workflow_evaluates_the_same_complete_match_from_any_upload_anchor():
 
 
 def test_invoice_and_po_without_receipt_are_a_partial_comparison():
-    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = (
-        _workflow_session(
+    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = _workflow_session(
         with_receipt=False
-        )
     )
 
     result = evaluate_document_workflow(session, invoice_doc.id)
@@ -363,10 +415,8 @@ def test_invoice_and_po_without_receipt_are_a_partial_comparison():
 
 
 def test_invoice_and_extracted_receipt_without_po_are_partial():
-    session, _rows, _sources, _invoice_doc, _po_doc, gr_doc, *_ = (
-        _workflow_session(
+    session, _rows, _sources, _invoice_doc, _po_doc, gr_doc, *_ = _workflow_session(
         with_po=False
-        )
     )
 
     result = evaluate_document_workflow(session, gr_doc.id)
@@ -380,8 +430,8 @@ def test_invoice_and_extracted_receipt_without_po_are_partial():
 
 
 def test_only_invoice_awaits_related_documents():
-    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = (
-        _workflow_session(with_po=False, with_receipt=False)
+    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = _workflow_session(
+        with_po=False, with_receipt=False
     )
 
     result = evaluate_document_workflow(session, invoice_doc.id)
@@ -621,8 +671,7 @@ def test_invoice_recommendation_reports_duplicate_gr_and_invoice_candidates():
     assert any(candidate.id == duplicate_invoice.id for candidate in result.candidates)
     assert any(candidate.id == duplicate_receipt.id for candidate in result.candidates)
     assert any(
-        candidate.id == duplicate_receipt.id
-        for candidate in result.supporting_records
+        candidate.id == duplicate_receipt.id for candidate in result.supporting_records
     )
 
 

@@ -168,6 +168,80 @@ def test_exception_alerts_returns_empty_results():
     assert response.json()["total"] == 0
 
 
+def test_queued_notification_is_sent_to_allowlisted_mailbox(monkeypatch):
+    from src.services.notification_services import send_notification
+
+    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "test@example.com")
+    notification = SimpleNamespace(
+        recipient_email="test@example.com",
+        subject="Review",
+        body="Please review",
+        status="queued",
+        attempts=0,
+        sent_at=None,
+        last_error=None,
+    )
+    smtp = MagicMock()
+    smtp_context = MagicMock()
+    smtp_context.__enter__.return_value = smtp
+    monkeypatch.setattr(
+        "src.services.notification_services.smtplib.SMTP", lambda *a, **k: smtp_context
+    )
+
+    assert send_notification(notification) is True
+    assert notification.status == "sent"
+    assert notification.attempts == 1
+    smtp.send_message.assert_called_once()
+
+
+def test_failed_notification_can_be_retried(monkeypatch):
+    from src.services.notification_services import send_notification
+
+    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "test@example.com")
+    notification = SimpleNamespace(
+        recipient_email="test@example.com",
+        subject="Review",
+        body="Please review",
+        status="queued",
+        attempts=0,
+        sent_at=None,
+        last_error=None,
+    )
+    failing_context = MagicMock()
+    failing_context.__enter__.side_effect = ConnectionError("SMTP unavailable")
+    monkeypatch.setattr(
+        "src.services.notification_services.smtplib.SMTP",
+        lambda *a, **k: failing_context,
+    )
+
+    assert send_notification(notification) is False
+    assert notification.status == "failed"
+    assert notification.attempts == 1
+
+    good_context = MagicMock()
+    good_context.__enter__.return_value = MagicMock()
+    monkeypatch.setattr(
+        "src.services.notification_services.smtplib.SMTP", lambda *a, **k: good_context
+    )
+    assert send_notification(notification) is True
+    assert notification.status == "sent"
+    assert notification.attempts == 2
+
+
+def test_notification_fallback_uses_background_tasks(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from src.worker.dispatch import dispatch_notification
+
+    monkeypatch.setenv("USE_CELERY", "false")
+    background_tasks = BackgroundTasks()
+    notification_id = uuid.uuid4()
+    mode = dispatch_notification(background_tasks, notification_id)
+    assert mode == "background"
+    assert len(background_tasks.tasks) == 1
+    assert background_tasks.tasks[0].args == (notification_id,)
+
+
 def test_exception_alerts_require_authentication():
     db, _, teardown = _setup_alerts()
     app.dependency_overrides.pop(get_current_user, None)

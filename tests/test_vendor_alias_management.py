@@ -25,6 +25,7 @@ def _setup(db=None):
     app.dependency_overrides[get_current_user] = lambda: {
         "sub": str(uuid.uuid4()),
         "type": "access",
+        "role": "admin",
     }
 
     def teardown():

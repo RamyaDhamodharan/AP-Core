@@ -1,4 +1,3 @@
-import hashlib
 import importlib
 import logging
 import os
@@ -18,6 +17,7 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Response,
     UploadFile,
 )
 from minio.error import S3Error
@@ -31,6 +31,7 @@ from ....models.audit_models import AuditLog
 from ....models.document_models import Document
 from ....models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from ....models.invoice_models import Invoice, InvoiceLine
+from ....models.notification_models import Notification
 from ....models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from ....models.vendor_models import Vendor
 from ....schemas.document_schemas import (
@@ -43,7 +44,9 @@ from ....schemas.purchase_order_schemas import (
     PurchaseOrderResponse,
     PurchaseOrderVendorResolutionRequest,
 )
+from ....services.document_ingest_services import MAX_FILE_SIZE, ingest_file
 from ....services.document_workflow_services import refresh_related_workflows
+from ....services.invoice_matching_services import run_match_for_invoice
 from ....services.llm_pipeline_services import (
     _to_decimal,
     classify_document,
@@ -62,14 +65,16 @@ from ....storage.minio_storage import (
     download_file,
     upload_file,
 )
-from ....worker.dispatch import dispatch_document_processing
+from ....worker.dispatch import (
+    dispatch_document_processing,
+    dispatch_queued_notifications,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
-MAX_FILE_SIZE = 20 * 1024 * 1024
 STALE_PARSE_TIMEOUT = timedelta(minutes=10)
 
 _PROCESS_SLOTS = threading.BoundedSemaphore(int(os.getenv("PROCESS_CONCURRENCY", "2")))
@@ -311,6 +316,7 @@ def _process_in_background(document_id: uuid.UUID) -> None:
 
             parse_document(
                 document_id=document_id,
+                background_tasks=None,
                 db=db,
                 current_user={"sub": str(document.created_by)},
             )
@@ -332,109 +338,32 @@ def _process_in_background(document_id: uuid.UUID) -> None:
             db.close()
 
 
-@router.post("/upload", status_code=201)
+@router.post("/upload", status_code=202)
 async def upload_document(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    filename = Path(file.filename or "upload").name
-    extension = Path(filename).suffix.lower()
-
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported file type",
+    results = []
+    user_id = uuid.UUID(str(current_user["sub"]))
+    for file in files:
+        filename = Path(file.filename or "upload").name
+        content = await file.read(MAX_FILE_SIZE + 1)
+        result = ingest_file(
+            db, filename, content, file.content_type, user_id, "upload",
+            background_tasks=background_tasks,
         )
-
-    content = await file.read(MAX_FILE_SIZE + 1)
-
-    if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty",
-        )
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="File exceeds 20 MB limit",
-        )
-
-    file_hash = hashlib.sha256(content).hexdigest()
-
-    existing = db.query(Document).filter_by(file_hash=file_hash).first()
-
-    if existing:
-        return {
-            "id": str(existing.id),
-            "status": "duplicate_blocked",
-            "message": "This file has already been uploaded",
-        }
-
-    document_id = uuid.uuid4()
-    storage_path = f"documents/{document_id}{extension}"
-
-    try:
-        upload_file(
-            storage_path,
-            content,
-            file.content_type or "application/octet-stream",
-        )
-    except Exception:
-        logger.exception("MinIO upload failed")
-        raise HTTPException(
-            status_code=503,
-            detail="File storage is unavailable. Check MinIO logs.",
-        ) from None
-
-    document = Document(
-        id=document_id,
-        original_filename=filename,
-        file_hash=file_hash,
-        storage_path=storage_path,
-        status="received",
-        created_by=uuid.UUID(str(current_user["sub"])),
-        updated_by=uuid.UUID(str(current_user["sub"])),
-    )
-
-    try:
-        db.add(document)
-        db.commit()
-        db.refresh(document)
-
-    except IntegrityError:
-        db.rollback()
-        try:
-            delete_file(storage_path)
-        except Exception:
-            logger.exception("MinIO cleanup failed after duplicate upload")
-
-        raise HTTPException(
-            status_code=409,
-            detail="Duplicate file upload",
-        ) from None
-
-    except Exception:
-        db.rollback()
-        try:
-            delete_file(storage_path)
-        except Exception:
-            logger.exception("MinIO cleanup failed after database error")
-        raise
-
-    dispatch_document_processing(
-        background_tasks,
-        document.id,
-        _process_in_background,
-    )
-
-    return {
-        "id": str(document.id),
-        "original_filename": document.original_filename,
-        "status": document.status,
-    }
+        results.append({
+            "filename": filename,
+            "document_id": str(result.document_id) if result.document_id else None,
+            "status": result.status,
+            "message": result.message,
+        })
+    response = {"results": results}
+    if len(results) == 1:
+        response.update({"id": results[0]["document_id"], "original_filename": results[0]["filename"], "status": results[0]["status"], "message": results[0]["message"]})
+    return response
 
 
 def _save_invoice_from_extraction(
@@ -558,6 +487,30 @@ def _save_invoice_from_extraction(
         )
 
         if prior_versions:
+            current_version = next(
+                (item for item in prior_versions if getattr(item, "is_current", False)),
+                None,
+            )
+            if current_version is not None and all(
+                getattr(current_version, field, None) == value
+                for field, value in invoice_values.items()
+                if field != "match_status"
+            ):
+                if "line_items" not in data:
+                    raise DuplicateInvoiceError(
+                        "Duplicate current invoice: same vendor, number, and content"
+                    )
+                existing_lines = (
+                    db.query(InvoiceLine)
+                    .filter(InvoiceLine.invoice_id == current_version.id)
+                    .all()
+                )
+                if _line_fingerprints(existing_lines) == _line_fingerprints(
+                    data.get("line_items") or [], extracted=True
+                ):
+                    raise DuplicateInvoiceError(
+                        "Duplicate current invoice: same vendor, number, and content"
+                    )
             version_no = max(invoice.version_no for invoice in prior_versions) + 1
             demoted_current = False
 
@@ -588,6 +541,29 @@ def _save_invoice_from_extraction(
 
 def _line_value(line: dict, *keys):
     return next((line.get(key) for key in keys if line.get(key) is not None), None)
+
+
+def _document_failure_message(error: Exception) -> str:
+    failure_text = str(error).casefold()
+    if "password" in failure_text or "encrypted" in failure_text:
+        return "This file is password-protected; ask the vendor for an unlocked copy."
+    if any(
+        word in failure_text
+        for word in (
+            "corrupt",
+            "invalid",
+            "truncated",
+            "unexpected eof",
+            "format error",
+        )
+    ):
+        return "This file appears damaged; ask the vendor to resend it."
+    if any(
+        word in failure_text
+        for word in ("unsupported", "not supported", "unknown format")
+    ):
+        return "This file type is unsupported; ask the vendor to send a PDF or image."
+    return f"File could not be processed: {str(error)[:400]}"
 
 
 def _line_fingerprints(lines: list, *, extracted: bool = False) -> list[tuple]:
@@ -676,6 +652,10 @@ class AwaitingRelatedDocumentError(ValueError):
 
 class AwaitingHumanDecisionError(ValueError):
     """Available identifiers resolve to more than one possible record."""
+
+
+class DuplicateInvoiceError(ValueError):
+    """The same current invoice content has already been processed."""
 
 
 def _save_goods_receipt_from_extraction(
@@ -943,6 +923,13 @@ def _rematch_waiting_invoices_for_po(
             issues.append("Invoice total does not match purchase order")
 
         invoice.match_status = "match_issues" if issues else "ready_for_review"
+        if getattr(invoice, "id", None):
+            run_match_for_invoice(
+                db,
+                invoice.id,
+                getattr(invoice, "updated_by", None)
+                or getattr(invoice, "created_by", None),
+            )
         rematched += 1
 
     db.flush()
@@ -1304,6 +1291,7 @@ def resolve_purchase_order_vendor(
 @router.post("/{document_id}/parse", dependencies=[Depends(get_current_user)])
 def parse_document(
     document_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1326,6 +1314,30 @@ def parse_document(
             status_code=404,
             detail="Stored file not found",
         )
+
+    extension = Path(document.original_filename).suffix.casefold()
+    if extension not in ALLOWED_EXTENSIONS:
+        document.status = "failed"
+        document.failure_message = (
+            "This file type is unsupported; ask the vendor to send a PDF or image."
+        )
+        if getattr(document, "email_sender", None):
+            db.add(
+                Notification(
+                    document_id=document.id,
+                    recipient_email=document.email_sender,
+                    subject="Document could not be processed",
+                    body=document.failure_message,
+                    status="queued",
+                )
+            )
+        db.commit()
+        dispatch_queued_notifications(db, document.id, background_tasks)
+        return {
+            "id": str(document.id),
+            "status": document.status,
+            "failure_message": document.failure_message,
+        }
 
     if document.status == "extracted":
         return {
@@ -1526,11 +1538,15 @@ def parse_document(
         # identify an existing invoice.
         if doc_type == "invoice" and not validation_issues:
             try:
-                _save_invoice_from_extraction(
+                saved_invoice = _save_invoice_from_extraction(
                     db,
                     document,
                     extracted_data,
                 )
+                if saved_invoice is not None and saved_invoice.po_id:
+                    run_match_for_invoice(
+                        db, saved_invoice.id, getattr(document, "created_by", None)
+                    )
 
             except IntegrityError as exc:
                 if not _is_invoice_version_conflict(exc):
@@ -1549,6 +1565,8 @@ def parse_document(
                 validation_issues.append(
                     "Invoice version conflict; document requires review"
                 )
+            except DuplicateInvoiceError as exc:
+                validation_issues.append(str(exc))
             except ValueError as exc:
                 validation_issues.append(str(exc))
         if doc_type == "po" and not validation_issues:
@@ -1610,7 +1628,13 @@ def parse_document(
 
         # Step 7: Set final document status.
         if validation_issues:
-            document.status = "needs_vendor_review"
+            duplicate_invoice = any(
+                issue.startswith("Duplicate current invoice:")
+                for issue in validation_issues
+            )
+            document.status = (
+                "duplicate_blocked" if duplicate_invoice else "needs_vendor_review"
+            )
             document.failure_message = "; ".join(validation_issues)[:500]
 
             logger.warning(
@@ -1618,6 +1642,16 @@ def parse_document(
                 document_id,
                 validation_issues,
             )
+            if getattr(document, "email_sender", None):
+                db.add(
+                    Notification(
+                        document_id=document.id,
+                        recipient_email=document.email_sender,
+                        subject="Document needs attention",
+                        body=document.failure_message,
+                        status="queued",
+                    )
+                )
 
         else:
             document.status = "extracted"
@@ -1635,6 +1669,7 @@ def parse_document(
                     "Workflow refresh failed after document %s was extracted",
                     document_id,
                 )
+        dispatch_queued_notifications(db, document.id, background_tasks)
 
         # Step 8: Return extraction and duplicate-check results.
         return {
@@ -1663,8 +1698,19 @@ def parse_document(
 
             if document:
                 document.status = "failed"
-                document.failure_message = str(exc)[:500]
+                document.failure_message = _document_failure_message(exc)
+                if getattr(document, "email_sender", None):
+                    db.add(
+                        Notification(
+                            document_id=document.id,
+                            recipient_email=document.email_sender,
+                            subject="Document could not be processed",
+                            body=document.failure_message,
+                            status="queued",
+                        )
+                    )
                 db.commit()
+                dispatch_queued_notifications(db, document.id)
 
         except Exception:
             db.rollback()
@@ -1680,6 +1726,43 @@ def parse_document(
             Path(temp_path).unlink(missing_ok=True)
 
 
+@router.get("/{document_id}/file")
+def get_document_file(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == document_id,
+            *_document_owner_filters(_document_owner_id(current_user)),
+        )
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not document.storage_path:
+        raise HTTPException(status_code=404, detail="Original file is unavailable")
+    try:
+        content = download_file(document.storage_path)
+    except Exception as exc:
+        logger.exception("MinIO file download failed")
+        raise HTTPException(
+            status_code=502, detail="Original file could not be retrieved"
+        ) from exc
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{document.original_filename}"'
+            ),
+        },
+    )
+
+
+@router.post("/{document_id}/rerun", status_code=202)
 @router.post("/{document_id}/retry", status_code=202)
 def retry_document_processing(
     document_id: uuid.UUID,

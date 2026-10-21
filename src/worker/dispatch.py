@@ -29,3 +29,62 @@ def dispatch_document_processing(
 
     background_tasks.add_task(fallback, document_id)
     return "background"
+
+
+def dispatch_notification(
+    background_tasks: BackgroundTasks | None, notification_id: uuid.UUID
+) -> str:
+    """Dispatch queued email, falling back to the request background task."""
+    if os.getenv("USE_CELERY", "false").lower() == "true":
+        try:
+            from src.worker.tasks import send_notification
+
+            send_notification.delay(str(notification_id))
+            return "celery"
+        except Exception:
+            logger.exception(
+                "Celery notification dispatch failed for %s", notification_id
+            )
+    if background_tasks is not None:
+        background_tasks.add_task(_send_notification_in_process, notification_id)
+        return "background"
+    _send_notification_in_process(notification_id)
+    return "inline"
+
+
+def _send_notification_in_process(notification_id: uuid.UUID) -> None:
+    from src.db.session_db import SessionLocal
+    from src.models.notification_models import Notification
+    from src.services.notification_services import send_notification
+
+    db = SessionLocal()
+    try:
+        notification = db.get(Notification, notification_id)
+        if notification is not None and notification.status == "queued":
+            send_notification(notification)
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Notification dispatch failed for %s", notification_id)
+    finally:
+        db.close()
+
+
+def dispatch_queued_notifications(db, document_id, background_tasks=None) -> int:
+    from src.models.notification_models import Notification
+
+    try:
+        rows = (
+            db.query(Notification)
+            .filter(
+                Notification.document_id == document_id,
+                Notification.status == "queued",
+            )
+            .all()
+        )
+    except Exception:
+        logger.exception("Could not load queued notifications for %s", document_id)
+        return 0
+    for row in rows:
+        dispatch_notification(background_tasks, row.id)
+    return len(rows)

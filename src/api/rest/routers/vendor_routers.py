@@ -6,7 +6,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.api.rest.dependencies import get_current_user
+from src.api.rest.dependencies import get_current_user, require_role
 from src.db.session_db import get_db
 from src.models.vendor_models import Vendor, VendorAlias
 from src.schemas.vendor_schemas import (
@@ -168,7 +168,7 @@ def get_vendor(
     "",
     response_model=VendorResponse,
     status_code=201,
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_role("admin"))],
 )
 def create_vendor(
     payload: VendorCreate,
@@ -203,7 +203,7 @@ def create_vendor(
 @router.patch(
     "/{vendor_id}",
     response_model=VendorResponse,
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_role("admin"))],
 )
 def update_vendor(
     vendor_id: uuid.UUID,
@@ -275,7 +275,7 @@ def list_vendor_aliases(
     "/{vendor_id}/aliases",
     response_model=VendorAliasResponse,
     status_code=201,
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_role("admin"))],
 )
 def create_vendor_alias(
     vendor_id: uuid.UUID,
@@ -303,7 +303,7 @@ def create_vendor_alias(
 @router.patch(
     "/{vendor_id}/aliases/{alias_id}",
     response_model=VendorAliasResponse,
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_role("admin"))],
 )
 def update_vendor_alias(
     vendor_id: uuid.UUID,
@@ -349,7 +349,7 @@ def update_vendor_alias(
 @router.delete(
     "/{vendor_id}/aliases/{alias_id}",
     response_model=VendorAliasResponse,
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_role("admin"))],
 )
 def deactivate_vendor_alias(
     vendor_id: uuid.UUID,
