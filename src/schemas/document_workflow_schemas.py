@@ -30,6 +30,10 @@ class WorkflowCandidate(BaseModel):
 
 
 class WorkflowCheck(BaseModel):
+    finding_id: str | None = None
+    category: str | None = None
+    finding_status: Literal["supported", "open", "not_verifiable"] | None = None
+    evidence_record_ids: list[uuid.UUID] = Field(default_factory=list)
     name: str
     reason_code: str | None = None
     outcome: Literal["passed", "mismatch", "not_possible"]

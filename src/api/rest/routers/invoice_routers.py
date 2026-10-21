@@ -370,6 +370,17 @@ def review_invoice(
             detail=("Invoice cannot be approved while matching is unresolved"),
         )
 
+    if payload.decision == "approved":
+        recommendation = recommend_invoice_review(db, invoice, owner_id=reviewer_id)
+        if any(
+            check.outcome != "passed" and check.severity == "error"
+            for check in recommendation.checks
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Invoice cannot be approved while critical findings remain open",
+            )
+
     old_value = {
         "final_status": invoice.final_status,
         "final_by": str(invoice.final_by) if invoice.final_by else None,

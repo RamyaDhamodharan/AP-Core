@@ -526,6 +526,9 @@ def test_invoice_recommendation_reports_actual_full_match_and_unknown_payment():
     assert result.processing_status == "extracted"
     assert result.approval_status == "awaiting_decision"
     assert result.payment_status == "unknown"
+    assert all(check.finding_id for check in result.checks)
+    assert all(check.category for check in result.checks)
+    assert all(check.evidence_record_ids for check in result.checks)
     assert {record.type for record in result.supporting_records} >= {
         "invoice",
         "po",
@@ -533,6 +536,23 @@ def test_invoice_recommendation_reports_actual_full_match_and_unknown_payment():
     }
     assert result.next_recommended_action == (
         "Submit the invoice through the existing human approval workflow"
+    )
+
+
+def test_invoice_recommendation_finding_ids_are_stable_and_status_is_explicit():
+    session, _rows, _sources, _doc, _po, _gr, invoice, owner = _workflow_session()
+
+    first = recommend_invoice_review(session, invoice, owner_id=owner)
+    second = recommend_invoice_review(session, invoice, owner_id=owner)
+
+    assert [check.finding_id for check in first.checks] == [
+        check.finding_id for check in second.checks
+    ]
+    assert {check.finding_status for check in first.checks} == {"supported"}
+    assert all(
+        set(check.evidence_record_ids)
+        == {record.id for record in first.supporting_records}
+        for check in first.checks
     )
 
 
@@ -563,6 +583,11 @@ def test_invoice_recommendation_includes_extraction_validation_issue():
     assert result.matching_status == "review_required"
     assert "extraction_validation_issue" in result.reason_codes
     assert any(item.name == "extraction_validation" for item in result.discrepancies)
+    finding = next(
+        item for item in result.checks if item.name == "extraction_validation"
+    )
+    assert finding.finding_status == "open"
+    assert finding.category == "extraction_validation"
 
 
 def test_invoice_recommendation_reports_multiple_po_candidates():
@@ -613,6 +638,8 @@ def test_invoice_recommendation_reports_total_discrepancy_values():
 
     assert result.matching_status == "review_required"
     assert line_total_check.reason_code == "line_total_discrepancy"
+    assert line_total_check.finding_status == "open"
+    assert line_total_check.category == "financial"
     assert line_total_check.expected == Decimal("95.00")
     assert line_total_check.actual == Decimal("100.00")
     assert line_total_check.difference == Decimal("5.00")

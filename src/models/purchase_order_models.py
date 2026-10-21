@@ -1,6 +1,7 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -15,7 +16,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import CHAR, UUID
+from sqlalchemy.dialects.postgresql import CHAR, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.vendor_models import Base, Vendor
@@ -61,6 +62,8 @@ class PurchaseOrder(Base):
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     total_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    payment_terms: Mapped[Any | None] = mapped_column(JSONB)
+    delivery_details: Mapped[Any | None] = mapped_column(JSONB)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id")
     )

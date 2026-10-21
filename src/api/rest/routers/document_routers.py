@@ -7,6 +7,7 @@ import tempfile
 import threading
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -38,6 +39,10 @@ from ....schemas.document_schemas import (
     DocumentReviewDetail,
     DocumentSummary,
 )
+from ....schemas.purchase_order_schemas import (
+    PurchaseOrderResponse,
+    PurchaseOrderVendorResolutionRequest,
+)
 from ....services.document_workflow_services import refresh_related_workflows
 from ....services.llm_pipeline_services import (
     _to_decimal,
@@ -46,7 +51,12 @@ from ....services.llm_pipeline_services import (
     extract_e2e_test_document_text,
     validate_extracted_data,
 )
-from ....services.vendor_resolution_services import resolve_vendor
+from ....services.vendor_resolution_services import (
+    find_active_alias_conflict,
+    find_canonical_name_conflict,
+    normalize_vendor_name,
+    resolve_vendor,
+)
 from ....storage.minio_storage import (
     delete_file,
     download_file,
@@ -211,9 +221,12 @@ def _find_duplicate_purchase_order(
         return None
 
     query = db.query(PurchaseOrder).filter(
-            func.lower(func.trim(PurchaseOrder.po_number)) == normalized_number,
-            PurchaseOrder.is_current.is_(True),
+        func.lower(
+            func.regexp_replace(func.trim(PurchaseOrder.po_number), r"\s+", " ", "g")
         )
+        == normalized_number,
+        PurchaseOrder.is_current.is_(True),
+    )
     if exclude_document_id is not None:
         query = query.filter(PurchaseOrder.source_document_id != exclude_document_id)
     return query.first()
@@ -246,6 +259,8 @@ def _purchase_order_persistence_issues(data: dict) -> list[str]:
 
     line_items = data.get("line_items")
     if line_items is not None and isinstance(line_items, list):
+        line_amounts = []
+        all_line_amounts_present = bool(line_items)
         for index, line in enumerate(line_items, start=1):
             if not isinstance(line, dict):
                 continue  # validate_extracted_data reports the object error.
@@ -259,6 +274,20 @@ def _purchase_order_persistence_issues(data: dict) -> list[str]:
                 raw_amount = _line_value(line, *aliases)
                 if raw_amount is not None and _to_decimal(raw_amount) is None:
                     issues.append(f"PO line item {index} has an invalid {field}")
+            raw_line_amount = _line_value(line, "line_amount", "amount", "total")
+            parsed_line_amount = _to_decimal(raw_line_amount)
+            if parsed_line_amount is None:
+                all_line_amounts_present = False
+            else:
+                line_amounts.append(parsed_line_amount)
+
+        subtotal = _to_decimal(data.get("subtotal"))
+        if (
+            subtotal is not None
+            and all_line_amounts_present
+            and abs(sum(line_amounts, Decimal(0)) - subtotal) > Decimal("0.01")
+        ):
+            issues.append("PO line amounts do not reconcile to subtotal")
 
     return issues
 
@@ -273,8 +302,18 @@ def _process_in_background(document_id: uuid.UUID) -> None:
 
             if document is None or document.status != "received":
                 return
+            if document.created_by is None:
+                logger.error(
+                    "Skipping processing for document %s without an uploader",
+                    document_id,
+                )
+                return
 
-            parse_document(document_id=document_id, db=db)
+            parse_document(
+                document_id=document_id,
+                db=db,
+                current_user={"sub": str(document.created_by)},
+            )
 
         except HTTPException as exc:
             logger.error(
@@ -413,7 +452,7 @@ def _save_invoice_from_extraction(
     )
 
     vendor_name = str(data.get("vendor") or "").strip() or None
-    vendor = resolve_vendor(db, vendor_name)
+    vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
 
     invoice_no = str(data.get("invoice_number") or "").strip() or None
 
@@ -669,10 +708,14 @@ def _save_goods_receipt_from_extraction(
         raise ValueError(f"Duplicate goods receipt number: {gr_number}")
     po_number = str(data.get("order_number") or data.get("po_number") or "").strip()
     if purchase_order_id is not None:
-        selected_po = db.query(PurchaseOrder).filter(
-            PurchaseOrder.id == purchase_order_id,
-            PurchaseOrder.is_current.is_(True),
-        ).first()
+        selected_po = (
+            db.query(PurchaseOrder)
+            .filter(
+                PurchaseOrder.id == purchase_order_id,
+                PurchaseOrder.is_current.is_(True),
+            )
+            .first()
+        )
         po_candidates = (
             [selected_po]
             if selected_po is not None
@@ -755,9 +798,12 @@ def _save_goods_receipt_from_extraction(
         ):
             raise ValueError("Goods receipt line data conflicts with its PO line")
         extracted_uom = _line_value(raw, "uom", "unit_of_measure")
-        if extracted_uom and po_line.uom and _normalize_invoice_value(
+        if (
             extracted_uom
-        ) != _normalize_invoice_value(po_line.uom):
+            and po_line.uom
+            and _normalize_invoice_value(extracted_uom)
+            != _normalize_invoice_value(po_line.uom)
+        ):
             raise ValueError("Goods receipt line unit does not match its PO line")
         if po_line.id in mapped_po_line_ids:
             raise ValueError("Goods receipt contains a duplicate PO line reference")
@@ -927,7 +973,7 @@ def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
         ):
             continue
         vendor_name = str(data.get("vendor") or "").strip()
-        vendor = resolve_vendor(db, vendor_name)
+        vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
         if vendor is None or vendor.id != po.vendor_id:
             continue
         try:
@@ -957,6 +1003,21 @@ def _save_purchase_order_from_extraction(
     po_date = data.get("po_date") or data.get("order_date")
     currency = str(data["currency"]).strip().upper()
     total_amount = _to_decimal(data.get("total"))
+    delivery_details = data.get("delivery_details")
+    if delivery_details is None:
+        delivery_details = {
+            key: data[key]
+            for key in (
+                "delivery_address",
+                "ship_to",
+                "ship_to_address",
+                "delivery_date",
+                "expected_delivery_date",
+                "delivery_method",
+                "shipping_terms",
+            )
+            if data.get(key) is not None
+        } or None
     existing = (
         db.query(PurchaseOrder)
         .filter(PurchaseOrder.source_document_id == document.id)
@@ -971,6 +1032,8 @@ def _save_purchase_order_from_extraction(
             and existing.po_date == _parse_document_date(po_date)
             and str(existing.currency).strip().upper() == currency
             and existing.total_amount == total_amount
+            and existing.payment_terms == data.get("payment_terms")
+            and existing.delivery_details == delivery_details
             and _line_fingerprints(existing_lines)
             == _line_fingerprints(extracted_lines, extracted=True)
         )
@@ -992,6 +1055,10 @@ def _save_purchase_order_from_extraction(
             data.get("tax") if data.get("tax") is not None else data.get("tax_amount")
         ),
         total_amount=total_amount,
+        payment_terms=data.get("payment_terms"),
+        delivery_details=delivery_details,
+        created_by=document.created_by,
+        updated_by=document.created_by,
     )
 
     db.add(purchase_order)
@@ -1015,6 +1082,8 @@ def _save_purchase_order_from_extraction(
                 line_amount=_to_decimal(
                     _line_value(raw, "line_amount", "amount", "total")
                 ),
+                created_by=document.created_by,
+                updated_by=document.created_by,
             )
         )
 
@@ -1022,6 +1091,214 @@ def _save_purchase_order_from_extraction(
     _save_pending_goods_receipts_for_po(db, purchase_order)
 
     return purchase_order
+
+
+@router.post("/{document_id}/resolve-po-vendor")
+def resolve_purchase_order_vendor(
+    document_id: uuid.UUID,
+    payload: PurchaseOrderVendorResolutionRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    owner_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .with_for_update()
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if document.doc_type != "po" or not isinstance(document.extracted_json, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="A purchase order extraction is required before vendor review",
+        )
+
+    data = dict(document.extracted_json)
+    existing = (
+        db.query(PurchaseOrder)
+        .filter(PurchaseOrder.source_document_id == document.id)
+        .first()
+    )
+    if existing is not None:
+        is_same_vendor = payload.vendor_id == existing.vendor_id
+        if payload.new_vendor is not None:
+            existing_vendor = db.get(Vendor, existing.vendor_id)
+            is_same_vendor = existing_vendor is not None and normalize_vendor_name(
+                existing_vendor.name
+            ) == normalize_vendor_name(payload.new_vendor.name)
+        if not is_same_vendor:
+            raise HTTPException(
+                status_code=409,
+                detail="This document already has a purchase order with another vendor",
+            )
+        return {
+            "purchase_order": PurchaseOrderResponse.model_validate(existing).model_dump(
+                mode="json"
+            ),
+            "document": DocumentSummary.model_validate(document).model_dump(
+                mode="json"
+            ),
+        }
+
+    if document.status not in {"needs_vendor_review", "extracted"}:
+        raise HTTPException(
+            status_code=409,
+            detail="The document is not ready for purchase order vendor review",
+        )
+
+    if payload.vendor_id is not None:
+        vendor = db.get(Vendor, payload.vendor_id)
+        if vendor is None:
+            raise HTTPException(status_code=404, detail="Vendor not found")
+        if not vendor.is_active:
+            raise HTTPException(status_code=409, detail="Vendor is inactive")
+        new_vendor = None
+    else:
+        vendor = None
+        new_vendor = payload.new_vendor
+        if new_vendor is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Select an existing vendor or provide a new vendor",
+            )
+    selected_vendor_name = vendor.name if vendor is not None else new_vendor.name
+    validation_data = dict(data)
+    validation_data["vendor"] = selected_vendor_name
+    if not validation_data.get("order_number"):
+        validation_data["order_number"] = validation_data.get("po_number")
+    if validation_data.get("tax") is None:
+        validation_data["tax"] = validation_data.get("tax_amount")
+    validation_issues = validate_extracted_data(validation_data, "po")
+    validation_issues.extend(_purchase_order_persistence_issues(validation_data))
+    if validation_issues:
+        raise HTTPException(
+            status_code=422,
+            detail={"validation_issues": validation_issues},
+        )
+
+    duplicate = _find_duplicate_purchase_order(
+        db,
+        _purchase_order_number(validation_data),
+    )
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Duplicate current purchase order number: "
+                f"{_purchase_order_number(validation_data)}"
+            ),
+        )
+
+    if new_vendor is not None:
+        if find_canonical_name_conflict(db, new_vendor.name) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="A vendor with this name already exists; select that vendor",
+            )
+        if find_active_alias_conflict(db, new_vendor.name) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Vendor name conflicts with an existing vendor alias",
+            )
+        if new_vendor.tax_id:
+            tax_id = re.sub(r"[^a-z0-9]", "", new_vendor.tax_id.casefold())
+            existing_tax_id = (
+                db.query(Vendor)
+                .filter(
+                    func.lower(
+                        func.regexp_replace(Vendor.tax_id, r"[^[:alnum:]]", "", "g")
+                    )
+                    == tax_id
+                )
+                .first()
+            )
+            if existing_tax_id is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A vendor with this tax ID already exists; select that vendor"
+                    ),
+                )
+        vendor = Vendor(
+            name=new_vendor.name,
+            tax_id=new_vendor.tax_id,
+            contact_name=new_vendor.contact_name,
+            contact_email=(
+                str(new_vendor.contact_email) if new_vendor.contact_email else None
+            ),
+            contact_phone=new_vendor.contact_phone,
+            created_by=owner_id,
+            updated_by=owner_id,
+        )
+        db.add(vendor)
+        db.flush()
+
+    if vendor is None:
+        raise HTTPException(status_code=422, detail="Vendor could not be resolved")
+
+    extracted_vendor = data.get("vendor")
+    resolved_data = dict(data)
+    resolved_data["vendor"] = vendor.name
+    resolved_data["vendor_resolution"] = {
+        "method": "user_confirmed",
+        "vendor_id": str(vendor.id),
+        "extracted_value": extracted_vendor,
+    }
+
+    try:
+        purchase_order = _save_purchase_order_from_extraction(
+            db,
+            document,
+            resolved_data,
+            vendor,
+        )
+        document.extracted_json = resolved_data
+        document.status = "extracted"
+        document.failure_message = None
+        document.updated_by = owner_id
+        db.add(
+            AuditLog(
+                action="purchase_order_vendor_resolved",
+                entity_type="document",
+                entity_id=document.id,
+                old_value={"vendor": extracted_vendor},
+                new_value={
+                    "vendor_id": str(vendor.id),
+                    "vendor_name": vendor.name,
+                    "purchase_order_id": str(purchase_order.id),
+                },
+                message="PO vendor explicitly resolved and purchase order persisted",
+                created_by=owner_id,
+                updated_by=owner_id,
+            )
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Purchase order or vendor conflicts with existing data",
+        ) from exc
+
+    db.refresh(purchase_order)
+    db.refresh(document)
+    try:
+        refresh_related_workflows(db, document.id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Workflow refresh failed after vendor resolution for %s", document.id
+        )
+
+    return {
+        "purchase_order": PurchaseOrderResponse.model_validate(
+            purchase_order
+        ).model_dump(mode="json"),
+        "document": DocumentSummary.model_validate(document).model_dump(mode="json"),
+    }
 
 
 @router.post("/{document_id}/parse", dependencies=[Depends(get_current_user)])
@@ -1210,7 +1487,9 @@ def parse_document(
             vendor_name = str(extracted_data.get("vendor") or "").strip()
 
             if vendor_name:
-                po_vendor = resolve_vendor(db, vendor_name)
+                po_vendor = resolve_vendor(
+                    db, vendor_name, tax_id=extracted_data.get("vendor_tax_id")
+                )
 
                 if po_vendor is None:
                     validation_issues.append(
@@ -1222,7 +1501,9 @@ def parse_document(
                 validation_issues.extend(validation_data["line_errors"])
             vendor_name = str(extracted_data.get("vendor") or "").strip()
             if vendor_name:
-                goods_receipt_vendor = resolve_vendor(db, vendor_name)
+                goods_receipt_vendor = resolve_vendor(
+                    db, vendor_name, tax_id=extracted_data.get("vendor_tax_id")
+                )
                 if goods_receipt_vendor is None:
                     validation_issues.append(
                         f"Vendor not found or inactive: {vendor_name}"

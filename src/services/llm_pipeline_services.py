@@ -26,9 +26,7 @@ def _e2e_mock_enabled() -> bool:
     if not enabled:
         return False
     if enabled != "1" or os.getenv("APP_ENV") != "test":
-        raise RuntimeError(
-            "AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1"
-        )
+        raise RuntimeError("AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1")
     return True
 
 
@@ -56,9 +54,7 @@ def extract_e2e_test_document_text(content: bytes) -> str:
 
     document = pdfium.PdfDocument(content)
     try:
-        raw_text = "\n".join(
-            page.get_textpage().get_text_range() for page in document
-        )
+        raw_text = "\n".join(page.get_textpage().get_text_range() for page in document)
     finally:
         document.close()
     if _E2E_PAYLOAD_PATTERN.search(raw_text) is None:
@@ -161,10 +157,14 @@ def _groq_extract(
                         f"{doc_type} document. Return only a valid "
                         "JSON object. Do not invent values; use null "
                         "for missing values. Include document_type, "
-                        "vendor, invoice_number, order_number, "
-                "po_number, gr_number, receipt_date, received_qty, accepted_qty, "
-                "rejected_qty, invoice_date, po_date, due_date, "
-                        "currency, subtotal, tax, total, and line_items "
+                        "vendor, vendor_tax_id, invoice_number, order_number, "
+                        "po_number, gr_number, receipt_date, received_qty, "
+                        "accepted_qty, "
+                        "rejected_qty, invoice_date, po_date, due_date, "
+                        "currency, subtotal, tax, total, payment_terms, "
+                        "delivery_details, delivery_address, ship_to, "
+                        "expected_delivery_date, and line_items with item_code, "
+                        "description, qty, unit_price, line_amount "
                         "when applicable. "
                         "Preserve values as they appear in the source."
                     ),
@@ -231,9 +231,7 @@ def extract_document(
             payload_type = "goods_receipt"
         if payload_type != doc_type:
             raise ValueError("E2E mock type does not match classified document")
-        return {
-            key: value for key, value in payload.items() if key != "document_type"
-        }
+        return {key: value for key, value in payload.items() if key != "document_type"}
 
     api_key = os.getenv("GROQ_API_KEY", "")
     primary_model = os.getenv("GROQ_MODEL", "")

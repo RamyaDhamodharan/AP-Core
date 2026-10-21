@@ -2,6 +2,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import jwt
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
@@ -195,6 +196,64 @@ def test_upload_triggers_auto_processing(monkeypatch):
 
     assert response.status_code == 201
     assert started == [uuid.UUID(response.json()["id"])]
+
+
+def test_uuid_subject_upload_enqueues_document(monkeypatch):
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = None
+    setup_db(monkeypatch, db)
+    app.dependency_overrides.pop(get_current_user, None)
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-for-authentication-tests")
+    owner_id = uuid.uuid4()
+    token = jwt.encode(
+        {"sub": str(owner_id), "type": "access"},
+        "test-secret-for-authentication-tests",
+        algorithm="HS256",
+    )
+    queued = []
+    monkeypatch.setattr(
+        document_routers,
+        "dispatch_document_processing",
+        lambda _tasks, document_id, _fallback: queued.append(document_id),
+    )
+
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.pdf", b"pdf bytes", "application/pdf")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 201
+    assert queued == [uuid.UUID(response.json()["id"])]
+    assert db.add.call_args.args[0].created_by == owner_id
+
+
+def test_background_processing_uses_stored_uploader_identity(monkeypatch):
+    owner_id = uuid.uuid4()
+    document = SimpleNamespace(id=uuid.uuid4(), status="received", created_by=owner_id)
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = document
+    monkeypatch.setattr(document_routers, "SessionLocal", lambda: db)
+    processed = []
+    monkeypatch.setattr(
+        document_routers,
+        "parse_document",
+        lambda **kwargs: processed.append(kwargs),
+    )
+
+    document_routers._process_in_background(document.id)
+
+    assert processed == [
+        {
+            "document_id": document.id,
+            "db": db,
+            "current_user": {"sub": str(owner_id)},
+        }
+    ]
+    db.close.assert_called_once()
 
 
 def test_duplicate_upload_does_not_trigger_processing(monkeypatch):

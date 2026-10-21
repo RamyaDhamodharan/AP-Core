@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 
 from sqlalchemy import func, or_, select
@@ -1231,6 +1232,60 @@ def _reason_code(check: WorkflowCheck) -> str:
     )
 
 
+def _finding_category(check: WorkflowCheck) -> str:
+    name = check.name
+    if name.startswith("duplicate"):
+        return "duplicate_integrity"
+    if "vendor" in name:
+        return "vendor_identity"
+    if any(part in name for part in ("quantity", "receipt", "lines")):
+        return "quantity_receipt"
+    if any(part in name for part in ("total", "price", "currency", "tax")):
+        return "financial"
+    if "extraction" in name:
+        return "extraction_validation"
+    if "candidate" in name or "purchase_order" in name or "po_" in name:
+        return "document_matching"
+    return "evidence_availability"
+
+
+def _annotate_findings(
+    invoice_id: uuid.UUID,
+    checks: list[WorkflowCheck],
+    records: list[WorkflowDocument],
+) -> list[WorkflowCheck]:
+    evidence_ids = [record.id for record in records]
+    annotated = []
+    for check in checks:
+        payload = "|".join(
+            (
+                str(invoice_id),
+                check.name,
+                str(check.expected),
+                str(check.actual),
+                str(check.difference),
+                check.reason,
+            )
+        )
+        finding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, payload))
+        finding_status = {
+            "passed": "supported",
+            "mismatch": "open",
+            "not_possible": "not_verifiable",
+        }[check.outcome]
+        annotated.append(
+            check.model_copy(
+                update={
+                    "finding_id": finding_id,
+                    "category": _finding_category(check),
+                    "finding_status": finding_status,
+                    "evidence_record_ids": evidence_ids,
+                }
+            )
+        )
+    return annotated
+
+
 def recommend_invoice_review(
     db: Session, invoice: Invoice, *, owner_id
 ) -> InvoiceRecommendation:
@@ -1422,6 +1477,7 @@ def recommend_invoice_review(
         )
         for check in checks
     ]
+    checks = _annotate_findings(invoice.id, checks, supporting)
     codes = list(
         dict.fromkeys(check.reason_code for check in checks if check.reason_code)
     )

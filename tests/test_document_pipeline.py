@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -123,6 +124,7 @@ def _run_purchase_order_parse(
         raw_text=None,
         extracted_json=None,
         failure_message=None,
+        created_by=uuid.uuid4(),
     )
 
     document_query = MagicMock()
@@ -286,13 +288,21 @@ def test_parse_document_success(monkeypatch):
     from src.db.session_db import get_db
 
     app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
+    owner_id = uuid.uuid4()
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-for-authentication-tests")
+    token = jwt.encode(
+        {"sub": str(owner_id), "type": "access"},
+        "test-secret-for-authentication-tests",
+        algorithm="HS256",
+    )
 
     try:
-        response = client.post(f"/api/documents/{document_id}/parse")
+        response = client.post(
+            f"/api/documents/{document_id}/parse",
+            headers={"Authorization": f"Bearer {token}"},
+        )
     finally:
         app.dependency_overrides.pop(get_db, None)
-        app.dependency_overrides.pop(get_current_user, None)
 
     # Verify API response
     assert response.status_code == 200
@@ -693,7 +703,7 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     from datetime import date
     from decimal import Decimal
 
-    from src.models.purchase_order_models import PurchaseOrder
+    from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 
     vendor = SimpleNamespace(id=uuid.uuid4())
     data = {
@@ -705,6 +715,18 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
         "subtotal": "100.00",
         "tax": "10.00",
         "total": "110.00",
+        "payment_terms": "Net 30",
+        "delivery_details": {"address": "Receiving dock"},
+        "line_items": [
+            {
+                "item_code": "ITEM-1",
+                "description": "Office supplies",
+                "qty": "2",
+                "uom": "EA",
+                "unit_price": "50.00",
+                "line_amount": "100.00",
+            }
+        ],
     }
 
     response, document, db = _run_purchase_order_parse(
@@ -717,8 +739,12 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert response.json()["status"] == "extracted"
     assert document.doc_type == "po"
     assert document.extracted_json == data
-    db.add.assert_called_once()
-    purchase_order = db.add.call_args.args[0]
+    assert db.add.call_count == 2
+    purchase_order = next(
+        record
+        for record in (call.args[0] for call in db.add.call_args_list)
+        if isinstance(record, PurchaseOrder)
+    )
     assert isinstance(purchase_order, PurchaseOrder)
     assert purchase_order.po_number == "PO-101"
     assert purchase_order.vendor_id == vendor.id
@@ -728,6 +754,16 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert purchase_order.tax_amount == Decimal("10.00")
     assert purchase_order.total_amount == Decimal("110.00")
     assert purchase_order.source_document_id == document.id
+    assert purchase_order.payment_terms == "Net 30"
+    assert purchase_order.delivery_details == {"address": "Receiving dock"}
+    purchase_order_line = next(
+        record
+        for record in (call.args[0] for call in db.add.call_args_list)
+        if isinstance(record, PurchaseOrderLine)
+    )
+    assert purchase_order_line.item_code == "ITEM-1"
+    assert purchase_order_line.qty == Decimal("2")
+    assert purchase_order_line.created_by == document.created_by
 
 
 def test_parse_document_resolves_purchase_order_vendor_alias(monkeypatch):
@@ -835,6 +871,36 @@ def test_parse_document_requires_known_vendor_for_purchase_order(
         in response.json()["validation_issues"]
     )
     assert document.extracted_json == data
+    db.add.assert_not_called()
+
+
+def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
+    data = {
+        "vendor": "ABC Supplies",
+        "po_number": "PO-102",
+        "po_date": "2026-10-01",
+        "currency": "USD",
+        "subtotal": "100.00",
+        "tax": "10.00",
+        "total": "110.00",
+        "line_items": [
+            {"qty": "1", "line_amount": "90.00"},
+        ],
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=SimpleNamespace(id=uuid.uuid4()),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_vendor_review"
+    assert (
+        "PO line amounts do not reconcile to subtotal"
+        in response.json()["validation_issues"]
+    )
+    assert document.status == "needs_vendor_review"
     db.add.assert_not_called()
 
 

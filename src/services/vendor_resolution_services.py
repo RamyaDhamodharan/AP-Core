@@ -51,7 +51,29 @@ def find_active_alias_conflict(
     return db.query(VendorAlias).filter(*filters).first()
 
 
-def resolve_vendor(db: Session, name: object) -> Vendor | None:
+def resolve_vendor(
+    db: Session,
+    name: object,
+    *,
+    tax_id: object = None,
+) -> Vendor | None:
+    normalized_tax_id = re.sub(r"[^a-z0-9]", "", str(tax_id or "").casefold())
+    if normalized_tax_id:
+        matches = (
+            db.query(Vendor)
+            .filter(
+                Vendor.is_active.is_(True),
+                func.lower(func.regexp_replace(Vendor.tax_id, r"[^[:alnum:]]", "", "g"))
+                == normalized_tax_id,
+            )
+            .all()
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None
+        return None
+
     normalized_name = normalize_vendor_name(name)
     if not normalized_name:
         return None

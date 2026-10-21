@@ -1,8 +1,11 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from src.schemas.vendor_schemas import VendorCreate
 
 
 class PurchaseOrderLineResponse(BaseModel):
@@ -33,6 +36,8 @@ class PurchaseOrderResponse(BaseModel):
     subtotal: Decimal | None
     tax_amount: Decimal | None
     total_amount: Decimal | None
+    payment_terms: Any | None = None
+    delivery_details: Any | None = None
     created_at: datetime
     updated_at: datetime
     lines: list[PurchaseOrderLineResponse]
@@ -43,3 +48,24 @@ class PurchaseOrderListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class PurchaseOrderVendorResolutionRequest(BaseModel):
+    vendor_id: uuid.UUID | None = None
+    new_vendor: VendorCreate | None = None
+
+    @model_validator(mode="after")
+    def validate_vendor_choice(self):
+        if (self.vendor_id is None) == (self.new_vendor is None):
+            raise ValueError("Select an existing vendor or provide a new vendor")
+        if self.new_vendor and not any(
+            (
+                self.new_vendor.tax_id,
+                self.new_vendor.contact_email,
+                self.new_vendor.contact_phone,
+            )
+        ):
+            raise ValueError(
+                "A new vendor requires a tax ID, contact email, or contact phone"
+            )
+        return self

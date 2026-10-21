@@ -98,6 +98,8 @@ CREATE TABLE purchase_orders (
   subtotal numeric(14,2),
   tax_amount numeric(14,2),
   total_amount numeric(14,2),
+  payment_terms jsonb,
+  delivery_details jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES users(id),
   updated_at timestamptz NOT NULL DEFAULT now(),
