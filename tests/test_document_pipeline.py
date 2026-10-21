@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,11 @@ from src.api.rest.routers import document_routers
 from src.models.invoice_models import Invoice
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def fake_minio_moves(monkeypatch):
+    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
 
 
 def _save_invoice_for_matching(
@@ -57,7 +63,8 @@ def _save_invoice_for_matching(
     )
     versions_query = MagicMock()
     versions_query_result = (
-        versions_query.filter.return_value.order_by.return_value.with_for_update.return_value
+        versions_query.filter.return_value.order_by.return_value
+        .with_for_update.return_value
     )
     versions_query_result.all.return_value = prior_versions or []
     db_version_query = versions_query
@@ -123,6 +130,7 @@ def _run_purchase_order_parse(
         raw_text=None,
         extracted_json=None,
         failure_message=None,
+        created_by=uuid.uuid4(),
     )
 
     document_query = MagicMock()
@@ -211,7 +219,7 @@ def test_parse_document_success(monkeypatch):
 
     document = SimpleNamespace(
         id=document_id,
-        original_filename="invoice.pdf",
+        original_filename="miscellaneous.pdf",
         storage_path=f"documents/{document_id}.pdf",
         status="received",
         doc_type=None,
@@ -226,11 +234,20 @@ def test_parse_document_success(monkeypatch):
     query.filter.return_value.first.return_value = document
     locked_query = query.filter.return_value.with_for_update.return_value
     locked_query.first.return_value = document
+    saved_invoice = SimpleNamespace(
+        id=uuid.uuid4(), po_id=uuid.uuid4(), final_status=None
+    )
     monkeypatch.setattr(
         document_routers,
         "_save_invoice_from_extraction",
-        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: saved_invoice,
     )
+
+    def auto_match(_db, invoice_id, user_id):
+        assert invoice_id == saved_invoice.id
+        saved_invoice.final_status = "approved"
+
+    monkeypatch.setattr(document_routers, "run_match_for_invoice", auto_match)
 
     # Mock file download from MinIO
     monkeypatch.setattr(
@@ -286,13 +303,21 @@ def test_parse_document_success(monkeypatch):
     from src.db.session_db import get_db
 
     app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
+    owner_id = uuid.uuid4()
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-for-authentication-tests")
+    token = jwt.encode(
+        {"sub": str(owner_id), "type": "access"},
+        "test-secret-for-authentication-tests",
+        algorithm="HS256",
+    )
 
     try:
-        response = client.post(f"/api/documents/{document_id}/parse")
+        response = client.post(
+            f"/api/documents/{document_id}/parse",
+            headers={"Authorization": f"Bearer {token}"},
+        )
     finally:
         app.dependency_overrides.pop(get_db, None)
-        app.dependency_overrides.pop(get_current_user, None)
 
     # Verify API response
     assert response.status_code == 200
@@ -314,6 +339,7 @@ def test_parse_document_success(monkeypatch):
         "total": 1500,
         "line_items": [],
     }
+    assert saved_invoice.final_status == "approved"
 
 
 def test_invoice_matching_sets_po_and_ready_status():
@@ -460,7 +486,7 @@ def test_invoice_matching_keeps_existing_one_cent_tolerance():
     assert invoice.match_status == "ready_for_review"
 
 
-def test_rematch_waiting_invoice_when_po_arrives():
+def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
 
     po_id = uuid.uuid4()
     vendor_id = uuid.uuid4()
@@ -473,6 +499,7 @@ def test_rematch_waiting_invoice_when_po_arrives():
         total_amount=1500,
     )
     invoice = SimpleNamespace(
+        id=uuid.uuid4(),
         po_number_raw="PO-101",
         is_current=True,
         match_status="waiting_for_po",
@@ -483,6 +510,14 @@ def test_rematch_waiting_invoice_when_po_arrives():
     )
 
     db = MagicMock()
+
+    def auto_match(_db, invoice_id, user_id):
+        assert invoice_id == invoice.id
+        invoice.match_status = "ready_for_review"
+        invoice.final_status = "approved"
+        return SimpleNamespace(result="match_ok")
+
+    monkeypatch.setattr(document_routers, "run_match_for_invoice", auto_match)
     (
         db.query.return_value.filter.return_value.with_for_update.return_value.all
     ).return_value = [invoice]
@@ -492,6 +527,7 @@ def test_rematch_waiting_invoice_when_po_arrives():
     assert count == 1
     assert invoice.po_id == po_id
     assert invoice.match_status == "ready_for_review"
+    assert invoice.final_status == "approved"
     db.flush.assert_called_once()
 
 
@@ -624,6 +660,62 @@ def test_invoice_persistence_creates_next_version_and_demotes_current():
     db.flush.assert_called()
 
 
+def test_identical_current_invoice_is_blocked_as_duplicate():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    duplicate = SimpleNamespace(
+        id=uuid.uuid4(),
+        is_current=True,
+        version_no=1,
+        invoice_no="INV-101",
+        vendor_id=vendor.id,
+        vendor_name_raw="ABC Supplies",
+        vendor_tax_id_raw=None,
+        invoice_date=date(2026, 10, 1),
+        due_date=None,
+        currency="USD",
+        subtotal=Decimal("1500.00"),
+        tax_amount=Decimal("0"),
+        total_amount=Decimal("1500.00"),
+        po_number_raw="PO-101",
+        po_id=None,
+        match_status="waiting_for_po",
+    )
+    with pytest.raises(document_routers.DuplicateInvoiceError):
+        _save_invoice_for_matching(
+            vendor=vendor, purchase_order=None, prior_versions=[duplicate]
+        )
+
+
+def test_corrected_invoice_is_saved_as_next_version():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    current = SimpleNamespace(
+        id=uuid.uuid4(),
+        is_current=True,
+        version_no=1,
+        invoice_no="INV-101",
+        vendor_id=vendor.id,
+        vendor_name_raw="ABC Supplies",
+        vendor_tax_id_raw=None,
+        invoice_date=date(2026, 10, 1),
+        due_date=None,
+        currency="USD",
+        subtotal=Decimal("1500.00"),
+        tax_amount=Decimal("0"),
+        total_amount=Decimal("1500.00"),
+        po_number_raw="PO-101",
+        po_id=None,
+        match_status="waiting_for_po",
+    )
+    invoice, _, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=None,
+        prior_versions=[current],
+        extracted_data={"total": "1501.00", "subtotal": "1501.00"},
+    )
+    assert invoice.version_no == 2
+    assert current.is_current is False
+
+
 def test_invoice_persistence_skips_version_matching_without_invoice_number():
     vendor = SimpleNamespace(id=uuid.uuid4())
 
@@ -693,7 +785,7 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     from datetime import date
     from decimal import Decimal
 
-    from src.models.purchase_order_models import PurchaseOrder
+    from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 
     vendor = SimpleNamespace(id=uuid.uuid4())
     data = {
@@ -705,6 +797,18 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
         "subtotal": "100.00",
         "tax": "10.00",
         "total": "110.00",
+        "payment_terms": "Net 30",
+        "delivery_details": {"address": "Receiving dock"},
+        "line_items": [
+            {
+                "item_code": "ITEM-1",
+                "description": "Office supplies",
+                "qty": "2",
+                "uom": "EA",
+                "unit_price": "50.00",
+                "line_amount": "100.00",
+            }
+        ],
     }
 
     response, document, db = _run_purchase_order_parse(
@@ -717,8 +821,12 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert response.json()["status"] == "extracted"
     assert document.doc_type == "po"
     assert document.extracted_json == data
-    db.add.assert_called_once()
-    purchase_order = db.add.call_args.args[0]
+    assert db.add.call_count == 2
+    purchase_order = next(
+        record
+        for record in (call.args[0] for call in db.add.call_args_list)
+        if isinstance(record, PurchaseOrder)
+    )
     assert isinstance(purchase_order, PurchaseOrder)
     assert purchase_order.po_number == "PO-101"
     assert purchase_order.vendor_id == vendor.id
@@ -728,6 +836,16 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert purchase_order.tax_amount == Decimal("10.00")
     assert purchase_order.total_amount == Decimal("110.00")
     assert purchase_order.source_document_id == document.id
+    assert purchase_order.payment_terms == "Net 30"
+    assert purchase_order.delivery_details == {"address": "Receiving dock"}
+    purchase_order_line = next(
+        record
+        for record in (call.args[0] for call in db.add.call_args_list)
+        if isinstance(record, PurchaseOrderLine)
+    )
+    assert purchase_order_line.item_code == "ITEM-1"
+    assert purchase_order_line.qty == Decimal("2")
+    assert purchase_order_line.created_by == document.created_by
 
 
 def test_parse_document_resolves_purchase_order_vendor_alias(monkeypatch):
@@ -838,6 +956,36 @@ def test_parse_document_requires_known_vendor_for_purchase_order(
     db.add.assert_not_called()
 
 
+def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
+    data = {
+        "vendor": "ABC Supplies",
+        "po_number": "PO-102",
+        "po_date": "2026-10-01",
+        "currency": "USD",
+        "subtotal": "100.00",
+        "tax": "10.00",
+        "total": "110.00",
+        "line_items": [
+            {"qty": "1", "line_amount": "90.00"},
+        ],
+    }
+
+    response, document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=SimpleNamespace(id=uuid.uuid4()),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_vendor_review"
+    assert (
+        "PO line amounts do not reconcile to subtotal"
+        in response.json()["validation_issues"]
+    )
+    assert document.status == "needs_vendor_review"
+    db.add.assert_not_called()
+
+
 def test_parse_document_not_found(monkeypatch):
     from src.db.session_db import get_db
 
@@ -902,14 +1050,22 @@ def test_parse_document_download_failure(monkeypatch):
     assert response.status_code >= 400
 
 
-def test_parse_document_classification_failure(monkeypatch):
+@pytest.mark.parametrize(
+    "classification_result",
+    [
+        ("invoice", 0.2),
+        ("unrecognized", 0.99),
+        RuntimeError("Classification failed"),
+    ],
+)
+def test_parse_document_classification_failure(monkeypatch, classification_result):
     from src.db.session_db import get_db
 
     document_id = uuid.uuid4()
 
     document = SimpleNamespace(
         id=document_id,
-        original_filename="invoice.pdf",
+        original_filename="miscellaneous.pdf",
         storage_path=f"documents/{document_id}.pdf",
         status="received",
         doc_type=None,
@@ -934,7 +1090,7 @@ def test_parse_document_classification_failure(monkeypatch):
         def convert(self, path):
             return SimpleNamespace(
                 document=SimpleNamespace(
-                    export_to_markdown=lambda: "Invoice INV-101. Total 1500"
+                    export_to_markdown=lambda: "Reference materials and terms"
                 )
             )
 
@@ -949,13 +1105,15 @@ def test_parse_document_classification_failure(monkeypatch):
         fake_converter_module,
     )
 
-    def fail_classification(text):
-        raise RuntimeError("Classification failed")
+    def classify(text):
+        if isinstance(classification_result, Exception):
+            raise classification_result
+        return classification_result
 
     monkeypatch.setattr(
         document_routers,
         "classify_document",
-        fail_classification,
+        classify,
     )
 
     app.dependency_overrides[get_db] = lambda: db
@@ -967,7 +1125,48 @@ def test_parse_document_classification_failure(monkeypatch):
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
 
-    assert response.status_code >= 400
+    assert response.status_code == 200
+    assert response.json()["status"] == "other"
+    assert document.doc_type == "other"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("Password required to open PDF", "password-protected"),
+        ("Corrupt PDF: unexpected EOF", "appears damaged"),
+        ("Unsupported input format", "unsupported"),
+    ],
+)
+def test_parse_failure_has_plain_language_reason(error, expected):
+    message = document_routers._document_failure_message(RuntimeError(error))
+    assert expected in message
+
+
+def test_parse_marks_unsupported_stored_file_failed(monkeypatch):
+    from src.db.session_db import get_db
+
+    document = SimpleNamespace(
+        id=uuid.uuid4(),
+        original_filename="unsupported.exe",
+        storage_path="documents/unsupported.exe",
+        status="received",
+        failure_message=None,
+        email_sender=None,
+    )
+    db = MagicMock()
+    query = db.query.return_value
+    query.filter.return_value.with_for_update.return_value.first.return_value = document
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
+    try:
+        response = client.post(f"/api/documents/{document.id}/parse")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == 200
+    assert document.status == "failed"
+    assert "unsupported" in document.failure_message
 
 
 def test_parse_document_extraction_failure(monkeypatch):

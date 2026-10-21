@@ -5,10 +5,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _table_definition(name: str) -> str:
-    schema = (ROOT / "database" / "001_initial_schema.sql").read_text()
+    bootstrap = (ROOT / "database" / "001_initial_schema.sql").read_text()
+    schema_name = "auth" if name in {"users", "refresh_sessions"} else "core"
     match = re.search(
-        rf"CREATE TABLE {name}\s*\((.*?)\n\);",
-        schema,
+        rf"CREATE TABLE {schema_name}\.{name}\s*\((.*?)\n\);",
+        bootstrap,
         re.DOTALL,
     )
     assert match is not None
@@ -21,7 +22,7 @@ def test_users_bootstrap_matches_ap_auth_column_and_default_contract():
     assert re.search(r"^\s*name varchar NOT NULL,", users, re.MULTILINE)
     assert re.search(r"^\s*email varchar NOT NULL UNIQUE,", users, re.MULTILINE)
     assert re.search(r"^\s*password_hash varchar NOT NULL,", users, re.MULTILINE)
-    assert re.search(r"^\s*role user_role NOT NULL,", users, re.MULTILINE)
+    assert re.search(r"^\s*role auth\.user_role NOT NULL,", users, re.MULTILINE)
     assert "must_change_password boolean NOT NULL DEFAULT false" in users
     assert "role user_role NOT NULL DEFAULT" not in users
 
@@ -38,6 +39,20 @@ def test_shared_audit_columns_are_present_without_invented_foreign_keys():
         )
 
 
+def test_document_email_message_id_has_root_partial_unique_index():
+    documents = _table_definition("documents")
+    schema = re.sub(
+        r"\s+", " ", (ROOT / "database" / "001_initial_schema.sql").read_text()
+    )
+
+    assert "email_message_id varchar(300)" in documents
+    assert (
+        "CREATE UNIQUE INDEX uq_documents_email_message_id_root "
+        "ON core.documents(email_message_id) "
+        "WHERE parent_document_id IS NULL AND email_message_id IS NOT NULL"
+    ) in schema
+
+
 def test_reconciliation_preserves_existing_table_constraints():
     exchange_rates = _table_definition("exchange_rates")
     match_runs = _table_definition("match_runs")
@@ -51,11 +66,39 @@ def test_reconciliation_preserves_existing_table_constraints():
     )
     assert "CONSTRAINT uq_match_run_no UNIQUE(invoice_id, run_no)" in match_runs
     assert (
-        "invoice_id uuid NOT NULL REFERENCES invoices(id) ON DELETE CASCADE"
+        "invoice_id uuid NOT NULL REFERENCES core.invoices(id) ON DELETE CASCADE"
         in match_runs
     )
-    assert "created_by uuid REFERENCES users(id)" in audit_log
+    assert "created_by uuid REFERENCES auth.users(id)" in audit_log
     assert (
         "CREATE INDEX ix_audit_entity_timeline "
-        "ON audit_log(entity_type, entity_id, created_at)"
+        "ON core.audit_log(entity_type, entity_id, created_at)"
     ) in schema
+
+
+def test_email_poll_state_and_parent_metadata_are_in_shared_bootstrap():
+    state = _table_definition("email_poll_state")
+    documents = _table_definition("documents")
+
+    assert "mailbox varchar(300) NOT NULL" in state
+    assert "folder varchar(300) NOT NULL" in state
+    assert "uidvalidity integer NOT NULL" in state
+    assert "last_uid integer NOT NULL DEFAULT 0" in state
+    assert "last_run_at timestamptz" in state
+    assert "last_result jsonb" in state
+    assert "PRIMARY KEY (mailbox, folder)" in state
+    assert "email_uid integer" in documents
+    assert "email_body_preview text" in documents
+    assert "email_eml_key varchar(500)" in documents
+
+
+def test_email_message_retry_rows_are_folder_and_uid_scoped():
+    messages = _table_definition("email_messages")
+
+    assert "folder varchar(300) NOT NULL DEFAULT 'INBOX'" in messages
+    assert "uid integer NOT NULL" in messages
+    assert "attempts integer NOT NULL DEFAULT 0" in messages
+    assert (
+        "ON core.email_messages(mailbox, folder, uid)"
+        in (ROOT / "database" / "001_initial_schema.sql").read_text()
+    )

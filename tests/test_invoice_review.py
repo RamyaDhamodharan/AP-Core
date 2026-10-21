@@ -37,6 +37,10 @@ def _setup_review(invoice):
 def _invoice(match_status="ready_for_review"):
     return SimpleNamespace(
         id=uuid.uuid4(),
+        source_document_id=None,
+        po_id=None,
+        po_number_raw=None,
+        invoice_no="TEST-1",
         match_status=match_status,
         final_status=None,
         final_by=None,
@@ -87,7 +91,7 @@ def test_review_invoice_rejects_invoice():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "rejected"},
+            json={"decision": "rejected", "reason": "Duplicate invoice"},
         )
     finally:
         teardown()
@@ -104,7 +108,7 @@ def test_review_invoice_places_invoice_on_hold():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "on_hold"},
+            json={"decision": "on_hold", "reason": "Awaiting clarification"},
         )
     finally:
         teardown()
@@ -127,6 +131,38 @@ def test_review_invoice_blocks_approval_with_match_issues():
         teardown()
 
     assert response.status_code == 409
+    assert invoice.final_status is None
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
+
+
+def test_review_invoice_blocks_critical_finding_even_if_match_status_is_ready(
+    monkeypatch,
+):
+    import src.api.rest.routers.invoice_routers as invoice_routers
+
+    invoice = _invoice()
+    _, db, teardown = _setup_review(invoice)
+    monkeypatch.setattr(
+        invoice_routers,
+        "recommend_invoice_review",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            checks=[
+                SimpleNamespace(outcome="mismatch", severity="error"),
+            ]
+        ),
+    )
+
+    try:
+        response = client.post(
+            f"/api/invoices/{invoice.id}/review",
+            json={"decision": "approved"},
+        )
+    finally:
+        teardown()
+
+    assert response.status_code == 409
+    assert "critical findings" in response.json()["detail"]
     assert invoice.final_status is None
     db.add.assert_not_called()
     db.commit.assert_not_called()

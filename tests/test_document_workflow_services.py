@@ -1,6 +1,7 @@
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from src.models.document_models import Document
 from src.models.goods_receipt_models import GoodsReceipt
@@ -301,6 +302,59 @@ def test_workflow_comparison_flags_unit_price_mismatch():
     )
 
 
+def test_workflow_unit_price_at_exactly_two_percent_passes():
+    checks = _checks(invoice_price="10.2")
+    assert (
+        next(check for check in checks if check.name == "unit_price").outcome
+        == "passed"
+    )
+
+
+def test_workflow_unit_price_above_two_percent_is_issue():
+    checks = _checks(invoice_price="10.201")
+    assert (
+        next(check for check in checks if check.name == "unit_price").outcome
+        == "mismatch"
+    )
+
+
+def test_workflow_tax_difference_is_issue():
+    invoice, po, receipt, po_line, invoice_line = _records()
+    invoice.tax_amount = Decimal("2")
+    po.tax_amount = Decimal("1")
+    checks = compare_available_records(
+        invoice=invoice,
+        purchase_order=po,
+        receipts=[receipt],
+        po_lines=[po_line],
+        invoice_lines=[invoice_line],
+    )
+    assert next(check for check in checks if check.name == "tax").outcome == "mismatch"
+
+
+def test_workflow_currency_conversion_uses_exchange_rate():
+    from datetime import date
+
+    invoice, po, receipt, po_line, invoice_line = _records()
+    invoice.currency = "EUR"
+    rate = SimpleNamespace(rate=Decimal("1.1"), rate_date=date(2026, 10, 20))
+    query = MagicMock()
+    query.filter.return_value.order_by.return_value.first.return_value = rate
+    db = MagicMock()
+    db.query.return_value = query
+    checks = compare_available_records(
+        db=db,
+        invoice=invoice,
+        purchase_order=po,
+        receipts=[receipt],
+        po_lines=[po_line],
+        invoice_lines=[invoice_line],
+    )
+    assert (
+        next(check for check in checks if check.name == "currency").outcome == "passed"
+    )
+
+
 def test_invoice_item_code_mismatch_is_not_linked_by_matching_description():
     invoice, purchase_order, receipt, po_line, invoice_line = _records()
     invoice_line.po_line_id = None
@@ -348,10 +402,8 @@ def test_workflow_evaluates_the_same_complete_match_from_any_upload_anchor():
 
 
 def test_invoice_and_po_without_receipt_are_a_partial_comparison():
-    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = (
-        _workflow_session(
+    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = _workflow_session(
         with_receipt=False
-        )
     )
 
     result = evaluate_document_workflow(session, invoice_doc.id)
@@ -363,10 +415,8 @@ def test_invoice_and_po_without_receipt_are_a_partial_comparison():
 
 
 def test_invoice_and_extracted_receipt_without_po_are_partial():
-    session, _rows, _sources, _invoice_doc, _po_doc, gr_doc, *_ = (
-        _workflow_session(
+    session, _rows, _sources, _invoice_doc, _po_doc, gr_doc, *_ = _workflow_session(
         with_po=False
-        )
     )
 
     result = evaluate_document_workflow(session, gr_doc.id)
@@ -380,8 +430,8 @@ def test_invoice_and_extracted_receipt_without_po_are_partial():
 
 
 def test_only_invoice_awaits_related_documents():
-    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = (
-        _workflow_session(with_po=False, with_receipt=False)
+    session, _rows, _sources, invoice_doc, _po_doc, _gr_doc, *_ = _workflow_session(
+        with_po=False, with_receipt=False
     )
 
     result = evaluate_document_workflow(session, invoice_doc.id)
@@ -526,6 +576,9 @@ def test_invoice_recommendation_reports_actual_full_match_and_unknown_payment():
     assert result.processing_status == "extracted"
     assert result.approval_status == "awaiting_decision"
     assert result.payment_status == "unknown"
+    assert all(check.finding_id for check in result.checks)
+    assert all(check.category for check in result.checks)
+    assert all(check.evidence_record_ids for check in result.checks)
     assert {record.type for record in result.supporting_records} >= {
         "invoice",
         "po",
@@ -533,6 +586,23 @@ def test_invoice_recommendation_reports_actual_full_match_and_unknown_payment():
     }
     assert result.next_recommended_action == (
         "Submit the invoice through the existing human approval workflow"
+    )
+
+
+def test_invoice_recommendation_finding_ids_are_stable_and_status_is_explicit():
+    session, _rows, _sources, _doc, _po, _gr, invoice, owner = _workflow_session()
+
+    first = recommend_invoice_review(session, invoice, owner_id=owner)
+    second = recommend_invoice_review(session, invoice, owner_id=owner)
+
+    assert [check.finding_id for check in first.checks] == [
+        check.finding_id for check in second.checks
+    ]
+    assert {check.finding_status for check in first.checks} == {"supported"}
+    assert all(
+        set(check.evidence_record_ids)
+        == {record.id for record in first.supporting_records}
+        for check in first.checks
     )
 
 
@@ -563,6 +633,11 @@ def test_invoice_recommendation_includes_extraction_validation_issue():
     assert result.matching_status == "review_required"
     assert "extraction_validation_issue" in result.reason_codes
     assert any(item.name == "extraction_validation" for item in result.discrepancies)
+    finding = next(
+        item for item in result.checks if item.name == "extraction_validation"
+    )
+    assert finding.finding_status == "open"
+    assert finding.category == "extraction_validation"
 
 
 def test_invoice_recommendation_reports_multiple_po_candidates():
@@ -596,8 +671,7 @@ def test_invoice_recommendation_reports_duplicate_gr_and_invoice_candidates():
     assert any(candidate.id == duplicate_invoice.id for candidate in result.candidates)
     assert any(candidate.id == duplicate_receipt.id for candidate in result.candidates)
     assert any(
-        candidate.id == duplicate_receipt.id
-        for candidate in result.supporting_records
+        candidate.id == duplicate_receipt.id for candidate in result.supporting_records
     )
 
 
@@ -613,6 +687,8 @@ def test_invoice_recommendation_reports_total_discrepancy_values():
 
     assert result.matching_status == "review_required"
     assert line_total_check.reason_code == "line_total_discrepancy"
+    assert line_total_check.finding_status == "open"
+    assert line_total_check.category == "financial"
     assert line_total_check.expected == Decimal("95.00")
     assert line_total_check.actual == Decimal("100.00")
     assert line_total_check.difference == Decimal("5.00")

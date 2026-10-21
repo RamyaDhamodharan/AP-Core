@@ -19,6 +19,8 @@ InvoiceFinalStatus = Literal["approved", "rejected", "on_hold"]
 
 class InvoiceReviewRequest(BaseModel):
     decision: InvoiceFinalStatus
+    comment: str | None = None
+    reason: str | None = None
 
 
 class InvoiceReviewResponse(BaseModel):

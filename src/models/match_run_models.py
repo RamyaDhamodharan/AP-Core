@@ -26,7 +26,7 @@ class MatchRun(Base):
         ForeignKey("purchase_orders.id"),
     )
     result = mapped_column(
-        ENUM(name="match_result", create_type=False),
+        ENUM(name="match_result", schema="core", create_type=False),
         nullable=False,
     )
     exchange_rate_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -49,7 +49,7 @@ class MatchRun(Base):
         nullable=False,
         server_default=func.now(),
     )
-    created_by = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_by = mapped_column(UUID(as_uuid=True), ForeignKey("auth.users.id"))
     updated_at = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -58,5 +58,5 @@ class MatchRun(Base):
     )
     updated_by = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("users.id"),
+        ForeignKey("auth.users.id"),
     )

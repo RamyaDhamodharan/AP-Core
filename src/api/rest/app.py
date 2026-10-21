@@ -1,9 +1,12 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.rest.routers import (
     document_routers,
     document_workflow_routers,
+    email_polling_routers,
     goods_receipt_routers,
     invoice_routers,
     notification_routers,
@@ -25,19 +28,23 @@ def health_check():
 
 app.include_router(vendor_routers.router)
 app.include_router(document_routers.router)
+app.include_router(email_polling_routers.router)
 app.include_router(document_workflow_routers.router)
 app.include_router(invoice_routers.router)
 app.include_router(purchase_order_routers.router)
-app.include_router(goods_receipt_routers.router)
+if os.getenv("ENABLE_GOODS_RECEIPT", "false").casefold() in {"1", "true", "yes", "on"}:
+    app.include_router(goods_receipt_routers.router)
 app.include_router(notification_routers.router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ALLOWED_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],

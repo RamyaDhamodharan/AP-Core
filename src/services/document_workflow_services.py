@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 
 from sqlalchemy import func, or_, select
@@ -5,6 +6,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.models.document_models import Document
 from src.models.document_workflow_models import DocumentWorkflow
+from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
@@ -23,6 +25,8 @@ DOCUMENT_TYPE_BY_MODEL = {
     PurchaseOrder: "po",
     GoodsReceipt: "goods_receipt",
 }
+
+MATCH_PRICE_TOLERANCE_PCT = Decimal("0.02")
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -64,15 +68,20 @@ def _receipt_documents_for_reference(
         func.lower(func.trim(Document.extracted_json[field].astext)) == normalized
         for field in reference_fields
     ]
-    return db.query(Document).filter(
-        Document.doc_type == "goods_receipt",
-        or_(*expressions),
-        *_owner_scope(Document, owner_id),
-    ).all()
+    return (
+        db.query(Document)
+        .filter(
+            Document.doc_type == "goods_receipt",
+            or_(*expressions),
+            *_owner_scope(Document, owner_id),
+        )
+        .all()
+    )
 
 
 def compare_available_records(
     *,
+    db: Session | None = None,
     invoice: Invoice | None,
     purchase_order: PurchaseOrder | None,
     receipts: list[GoodsReceipt],
@@ -141,6 +150,7 @@ def compare_available_records(
                 actual=invoice.po_number_raw,
             )
 
+        currency_multiplier = Decimal(1)
         invoice_currency = normalize_value(invoice.currency).upper()
         po_currency = normalize_value(purchase_order.currency).upper()
         if not invoice_currency or not po_currency:
@@ -148,16 +158,57 @@ def compare_available_records(
         elif invoice_currency == po_currency:
             check("currency", "passed", "Invoice and PO currencies match")
         else:
-            check(
-                "currency",
-                "mismatch",
-                "Invoice and PO currencies differ",
-                expected=po_currency,
-                actual=invoice_currency,
+            rate = (
+                (
+                    db.query(ExchangeRate)
+                    .filter(
+                        ExchangeRate.from_currency == invoice_currency,
+                        ExchangeRate.to_currency == po_currency,
+                    )
+                    .order_by(ExchangeRate.rate_date.desc())
+                    .first()
+                )
+                if db is not None
+                else None
             )
+            if rate is None:
+                check(
+                    "currency",
+                    "not_possible",
+                    "Currencies differ and no exchange rate is available",
+                    expected=po_currency,
+                    actual=invoice_currency,
+                )
+            else:
+                currency_multiplier = _decimal(rate.rate) or Decimal(1)
+                check(
+                    "currency",
+                    "passed",
+                    "Invoice amount converted using exchange rate",
+                    expected=po_currency,
+                    actual=invoice_currency,
+                    difference=currency_multiplier,
+                )
+
+        invoice_tax = _decimal(getattr(invoice, "tax_amount", None))
+        po_tax = _decimal(getattr(purchase_order, "tax_amount", None))
+        if invoice_tax is not None and po_tax is not None:
+            if invoice_tax == po_tax:
+                check("tax", "passed", "Invoice and PO tax amounts match")
+            else:
+                check(
+                    "tax",
+                    "mismatch",
+                    "Invoice tax amount differs from the PO",
+                    expected=po_tax,
+                    actual=invoice_tax,
+                    difference=invoice_tax - po_tax,
+                )
 
         invoice_total = _decimal(invoice.total_amount)
         po_total = _decimal(purchase_order.total_amount)
+        if invoice_total is not None:
+            invoice_total *= currency_multiplier
         if invoice_total is None or po_total is None:
             check(
                 "document_total",
@@ -365,11 +416,7 @@ def compare_available_records(
                         and normalize_value(line.item_code)
                         == normalize_value(inv_line.item_code)
                     ]
-                    if (
-                        not matches
-                        and not inv_line.item_code
-                        and inv_line.description
-                    ):
+                    if not matches and not inv_line.item_code and inv_line.description:
                         matches = [
                             line
                             for line in po_lines
@@ -441,11 +488,15 @@ def compare_available_records(
                         "not_possible",
                         "Invoice or PO unit price is missing or invalid",
                     )
-                elif abs(invoice_unit_price - unit_price) <= Decimal("0.01"):
+                elif invoice_unit_price == unit_price or (
+                    unit_price != 0
+                    and abs(invoice_unit_price - unit_price) / abs(unit_price)
+                    <= MATCH_PRICE_TOLERANCE_PCT
+                ):
                     check(
                         "unit_price",
                         "passed",
-                        "Invoice unit price matches the PO within one cent",
+                        "Invoice unit price matches the PO within 2%",
                         expected=unit_price,
                         actual=invoice_unit_price,
                         difference=invoice_unit_price - unit_price,
@@ -454,7 +505,7 @@ def compare_available_records(
                     check(
                         "unit_price",
                         "mismatch",
-                        "Invoice unit price differs from the PO",
+                        "Invoice unit price differs from the PO by more than 2%",
                         expected=unit_price,
                         actual=invoice_unit_price,
                         difference=invoice_unit_price - unit_price,
@@ -580,10 +631,14 @@ def evaluate_document_workflow(
     invoice = (
         db.query(Invoice).filter(Invoice.source_document_id == document.id).first()
     )
-    purchase_order = db.query(PurchaseOrder).filter(
-        PurchaseOrder.source_document_id == document.id,
-        *_owner_scope(PurchaseOrder, owner_id),
-    ).first()
+    purchase_order = (
+        db.query(PurchaseOrder)
+        .filter(
+            PurchaseOrder.source_document_id == document.id,
+            *_owner_scope(PurchaseOrder, owner_id),
+        )
+        .first()
+    )
     receipts = (
         db.query(GoodsReceipt)
         .options(selectinload(GoodsReceipt.lines))
@@ -595,32 +650,52 @@ def evaluate_document_workflow(
     )
 
     if invoice is not None and purchase_order is None and invoice.po_id:
-        purchase_order = db.query(PurchaseOrder).filter(
-            PurchaseOrder.id == invoice.po_id,
-            *_owner_scope(PurchaseOrder, owner_id),
-        ).first()
+        purchase_order = (
+            db.query(PurchaseOrder)
+            .filter(
+                PurchaseOrder.id == invoice.po_id,
+                *_owner_scope(PurchaseOrder, owner_id),
+            )
+            .first()
+        )
     if receipts and purchase_order is None:
-        purchase_order = db.query(PurchaseOrder).filter(
-            PurchaseOrder.id == receipts[0].po_id,
-            *_owner_scope(PurchaseOrder, owner_id),
-        ).first()
+        purchase_order = (
+            db.query(PurchaseOrder)
+            .filter(
+                PurchaseOrder.id == receipts[0].po_id,
+                *_owner_scope(PurchaseOrder, owner_id),
+            )
+            .first()
+        )
     if confirmed_invoice_id is not None:
-        selected_invoice = db.query(Invoice).filter(
-            Invoice.id == confirmed_invoice_id,
-            *_owner_scope(Invoice, owner_id),
-        ).first()
+        selected_invoice = (
+            db.query(Invoice)
+            .filter(
+                Invoice.id == confirmed_invoice_id,
+                *_owner_scope(Invoice, owner_id),
+            )
+            .first()
+        )
         if selected_invoice is not None and selected_invoice.is_current:
             invoice = selected_invoice
             if purchase_order is None and selected_invoice.po_id:
-                purchase_order = db.query(PurchaseOrder).filter(
-                    PurchaseOrder.id == selected_invoice.po_id,
-                    *_owner_scope(PurchaseOrder, owner_id),
-                ).first()
+                purchase_order = (
+                    db.query(PurchaseOrder)
+                    .filter(
+                        PurchaseOrder.id == selected_invoice.po_id,
+                        *_owner_scope(PurchaseOrder, owner_id),
+                    )
+                    .first()
+                )
     if purchase_order is None and po_number:
-        candidates = db.query(PurchaseOrder).filter(
-            PurchaseOrder.is_current.is_(True),
-            *_owner_scope(PurchaseOrder, owner_id),
-        ).all()
+        candidates = (
+            db.query(PurchaseOrder)
+            .filter(
+                PurchaseOrder.is_current.is_(True),
+                *_owner_scope(PurchaseOrder, owner_id),
+            )
+            .all()
+        )
         candidates = [
             po
             for po in candidates
@@ -635,9 +710,9 @@ def evaluate_document_workflow(
     invoice_candidates: list[Invoice] = []
     if invoice is None and purchase_order is None and po_number:
         invoice_candidates = (
-            db.query(Invoice).filter(
-                Invoice.is_current.is_(True), *_owner_scope(Invoice, owner_id)
-            ).all()
+            db.query(Invoice)
+            .filter(Invoice.is_current.is_(True), *_owner_scope(Invoice, owner_id))
+            .all()
         )
         invoice_candidates = [
             row
@@ -648,9 +723,9 @@ def evaluate_document_workflow(
         ambiguous = ambiguous or len(invoice_candidates) > 1
     if invoice is None and purchase_order is not None:
         invoice_candidates = (
-            db.query(Invoice).filter(
-                Invoice.is_current.is_(True), *_owner_scope(Invoice, owner_id)
-            ).all()
+            db.query(Invoice)
+            .filter(Invoice.is_current.is_(True), *_owner_scope(Invoice, owner_id))
+            .all()
         )
         invoice_candidates = [
             row
@@ -728,9 +803,11 @@ def evaluate_document_workflow(
             continue
         source_id = getattr(record, "source_document_id", None)
         if source_id:
-            source = db.query(Document).filter(
-                Document.id == source_id, *_owner_scope(Document, owner_id)
-            ).first()
+            source = (
+                db.query(Document)
+                .filter(Document.id == source_id, *_owner_scope(Document, owner_id))
+                .first()
+            )
             if source is not None:
                 docs[str(source.id)] = WorkflowDocument(
                     id=source.id,
@@ -775,6 +852,7 @@ def evaluate_document_workflow(
         kind for kind in ("po", "goods_receipt", "invoice") if kind not in types_present
     ]
     checks = compare_available_records(
+        db=db,
         invoice=invoice,
         purchase_order=purchase_order,
         receipts=receipts,
@@ -1231,32 +1309,88 @@ def _reason_code(check: WorkflowCheck) -> str:
     )
 
 
+def _finding_category(check: WorkflowCheck) -> str:
+    name = check.name
+    if name.startswith("duplicate"):
+        return "duplicate_integrity"
+    if "vendor" in name:
+        return "vendor_identity"
+    if any(part in name for part in ("quantity", "receipt", "lines")):
+        return "quantity_receipt"
+    if any(part in name for part in ("total", "price", "currency", "tax")):
+        return "financial"
+    if "extraction" in name:
+        return "extraction_validation"
+    if "candidate" in name or "purchase_order" in name or "po_" in name:
+        return "document_matching"
+    return "evidence_availability"
+
+
+def _annotate_findings(
+    invoice_id: uuid.UUID,
+    checks: list[WorkflowCheck],
+    records: list[WorkflowDocument],
+) -> list[WorkflowCheck]:
+    evidence_ids = [record.id for record in records]
+    annotated = []
+    for check in checks:
+        payload = "|".join(
+            (
+                str(invoice_id),
+                check.name,
+                str(check.expected),
+                str(check.actual),
+                str(check.difference),
+                check.reason,
+            )
+        )
+        finding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, payload))
+        finding_status = {
+            "passed": "supported",
+            "mismatch": "open",
+            "not_possible": "not_verifiable",
+        }[check.outcome]
+        annotated.append(
+            check.model_copy(
+                update={
+                    "finding_id": finding_id,
+                    "category": _finding_category(check),
+                    "finding_status": finding_status,
+                    "evidence_record_ids": evidence_ids,
+                }
+            )
+        )
+    return annotated
+
+
 def recommend_invoice_review(
     db: Session, invoice: Invoice, *, owner_id
 ) -> InvoiceRecommendation:
     """Return a deterministic recommendation using only uploader-owned records."""
     if invoice.source_document_id is not None:
-        source = db.query(Document).filter(
-            Document.id == invoice.source_document_id,
-            or_(
-                Document.created_by == owner_id,
-                Document.id.in_(
-                    select(Invoice.source_document_id).where(
-                        or_(
-                            Invoice.owner_user_id == owner_id,
-                            Invoice.created_by == owner_id,
+        source = (
+            db.query(Document)
+            .filter(
+                Document.id == invoice.source_document_id,
+                or_(
+                    Document.created_by == owner_id,
+                    Document.id.in_(
+                        select(Invoice.source_document_id).where(
+                            or_(
+                                Invoice.owner_user_id == owner_id,
+                                Invoice.created_by == owner_id,
+                            )
                         )
-                    )
+                    ),
                 ),
-            ),
-        ).first()
+            )
+            .first()
+        )
     else:
         source = None
 
     if source is not None:
-        workflow = evaluate_document_workflow(
-            db, source.id, owner_id=owner_id
-        )
+        workflow = evaluate_document_workflow(db, source.id, owner_id=owner_id)
         checks = list(workflow.checks)
         if source.status in {"needs_vendor_review", "incomplete", "failed"}:
             extraction_failed = source.status == "failed"
@@ -1296,19 +1430,25 @@ def recommend_invoice_review(
         # extraction and comparisons requiring absent evidence are explicitly unknown.
         po_candidates = []
         if invoice.po_id:
-            po = db.query(PurchaseOrder).filter(
-                PurchaseOrder.id == invoice.po_id,
-                *_owner_scope(PurchaseOrder, owner_id),
-            ).first()
+            po = (
+                db.query(PurchaseOrder)
+                .filter(
+                    PurchaseOrder.id == invoice.po_id,
+                    *_owner_scope(PurchaseOrder, owner_id),
+                )
+                .first()
+            )
             if po is not None:
                 po_candidates = [po]
         elif invoice.po_number_raw:
             po_candidates = [
                 row
-                for row in db.query(PurchaseOrder).filter(
+                for row in db.query(PurchaseOrder)
+                .filter(
                     PurchaseOrder.is_current.is_(True),
                     *_owner_scope(PurchaseOrder, owner_id),
-                ).all()
+                )
+                .all()
                 if normalize_value(row.po_number)
                 == normalize_value(invoice.po_number_raw)
             ]
@@ -1328,6 +1468,7 @@ def recommend_invoice_review(
         if po is not None:
             checks.extend(
                 compare_available_records(
+                    db=db,
                     invoice=invoice,
                     purchase_order=po,
                     receipts=receipts,
@@ -1393,12 +1534,20 @@ def recommend_invoice_review(
             check.name == "partial_receipt" and check.outcome == "passed"
             for check in checks
         )
-        status = "awaiting_human_decision" if len(po_candidates) > 1 else (
-            "review_required" if has_mismatch else
-            "awaiting_related_documents" if missing else
-            "partial_match" if partial_receipt else
-            "review_required" if has_unknown else
-            "matched"
+        status = (
+            "awaiting_human_decision"
+            if len(po_candidates) > 1
+            else (
+                "review_required"
+                if has_mismatch
+                else "awaiting_related_documents"
+                if missing
+                else "partial_match"
+                if partial_receipt
+                else "review_required"
+                if has_unknown
+                else "matched"
+            )
         )
         action = (
             "Select the correct purchase order"
@@ -1422,6 +1571,7 @@ def recommend_invoice_review(
         )
         for check in checks
     ]
+    checks = _annotate_findings(invoice.id, checks, supporting)
     codes = list(
         dict.fromkeys(check.reason_code for check in checks if check.reason_code)
     )

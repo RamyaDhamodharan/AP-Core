@@ -1,4 +1,5 @@
 import os
+import uuid
 
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -10,7 +11,7 @@ bearer_scheme = HTTPBearer()
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-) -> dict:
+) -> dict[str, object]:
     token = credentials.credentials
 
     secret = os.getenv("JWT_SECRET_KEY")
@@ -26,12 +27,22 @@ def get_current_user(
             algorithms=[algorithm],
         )
 
-        if payload.get("type") != "access" or not payload.get("sub"):
+        subject = payload.get("sub")
+        if payload.get("type") != "access" or not subject:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid access token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+        try:
+            payload["sub"] = str(uuid.UUID(str(subject)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authenticated user ID is invalid",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
 
         return payload
 
@@ -42,3 +53,12 @@ def get_current_user(
             detail="Invalid or expired access token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from e
+
+
+def require_role(role: str):
+    def role_dependency(current_user: dict[str, object] = Depends(get_current_user)):
+        if current_user.get("role") != role:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return current_user
+
+    return role_dependency

@@ -38,6 +38,7 @@ class AuditLog(Base):
             "warning",
             "error",
             name="step_result",
+            schema="core",
             create_type=False,
         ),
         nullable=False,
@@ -53,7 +54,7 @@ class AuditLog(Base):
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("users.id"),
+        ForeignKey("auth.users.id"),
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -63,5 +64,5 @@ class AuditLog(Base):
     )
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("users.id"),
+        ForeignKey("auth.users.id"),
     )

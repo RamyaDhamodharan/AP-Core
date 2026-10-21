@@ -33,6 +33,11 @@ def test_list_documents_returns_only_authenticated_owner_page():
         failure_message=None,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
+        source="email_poll",
+        parent_document_id=None,
+        email_sender="billing@example.com",
+        email_subject="Invoice INV-12",
+        email_received_at=datetime.now(UTC),
     )
     count_query = MagicMock()
     count_query.filter.return_value.scalar.return_value = 1
@@ -47,9 +52,7 @@ def test_list_documents_returns_only_authenticated_owner_page():
     _override(owner_id, db)
 
     try:
-        response = client.get(
-            "/api/documents?page=1&page_size=10&status=extracted"
-        )
+        response = client.get("/api/documents?page=1&page_size=10&status=extracted")
     finally:
         _clear_overrides()
 
@@ -58,11 +61,36 @@ def test_list_documents_returns_only_authenticated_owner_page():
     assert body["total"] == 1
     assert body["items"][0]["id"] == str(document.id)
     assert body["items"][0]["status"] == "extracted"
+    assert body["items"][0]["email_sender"] == "billing@example.com"
+    assert body["items"][0]["email_subject"] == "Invoice INV-12"
+    assert body["items"][0]["source"] == "email_poll"
     assert len(page_query.filter.call_args.args) == 2
     owner_filter = page_query.filter.call_args.args[0]
     compiled = owner_filter.compile(dialect=postgresql.dialect())
     assert "documents.created_by" in str(compiled)
     assert "invoices.owner_user_id" in str(compiled)
+
+
+def test_document_list_supports_type_source_status_and_parent_filters():
+    owner_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+    count_query = MagicMock()
+    count_query.filter.return_value.scalar.return_value = 0
+    page_query = MagicMock()
+    query = page_query.filter.return_value.order_by.return_value.offset.return_value
+    query.limit.return_value.all.return_value = []
+    db = MagicMock()
+    db.query.side_effect = [count_query, page_query]
+    _override(owner_id, db)
+    try:
+        response = client.get(
+            "/api/documents?doc_type=other&source=email_poll&status=other"
+            f"&parent_document_id={parent_id}"
+        )
+    finally:
+        _clear_overrides()
+    assert response.status_code == 200
+    assert len(page_query.filter.call_args.args) == 5
 
 
 def test_empty_document_workspace_returns_zero_from_owner_scoped_api():
@@ -71,8 +99,7 @@ def test_empty_document_workspace_returns_zero_from_owner_scoped_api():
     count_query.filter.return_value.scalar.return_value = 0
     page_query = MagicMock()
     (
-        page_query.filter.return_value.order_by.return_value.offset.return_value
-        .limit.return_value.all.return_value
+        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
     ) = []
     db = MagicMock()
     db.query.side_effect = [count_query, page_query]
@@ -116,6 +143,11 @@ def test_document_detail_includes_evidence_and_audit_history():
         updated_at=datetime.now(UTC),
         raw_text="Invoice source text",
         extracted_json={"invoice_number": "INV-1"},
+        source="email_poll",
+        parent_document_id=None,
+        email_sender="billing@example.com",
+        email_subject="Invoice INV-1",
+        email_received_at=datetime.now(UTC),
     )
     event = SimpleNamespace(
         action="document_processing_retry_requested",
@@ -146,6 +178,6 @@ def test_document_detail_includes_evidence_and_audit_history():
     body = response.json()
     assert body["raw_text"] == "Invoice source text"
     assert body["extracted_json"] == {"invoice_number": "INV-1"}
-    assert body["audit_history"][0]["action"] == (
-        "document_processing_retry_requested"
-    )
+    assert body["email_sender"] == "billing@example.com"
+    assert body["email_subject"] == "Invoice INV-1"
+    assert body["audit_history"][0]["action"] == ("document_processing_retry_requested")

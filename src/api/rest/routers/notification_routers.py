@@ -18,8 +18,33 @@ from src.schemas.notification_schemas import (
     NotificationListResponse,
     NotificationStatus,
 )
+from src.services.notification_services import send_notification
 
 router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
+
+
+@router.post("/{notification_id}/retry")
+def retry_notification(
+    notification_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    notification = db.get(Notification, notification_id)
+    if notification is None:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    if notification.status == "sent":
+        raise HTTPException(
+            status_code=409, detail="Notification has already been sent"
+        )
+    sent = send_notification(notification)
+    db.commit()
+    return {
+        "id": str(notification.id),
+        "status": notification.status,
+        "attempts": notification.attempts,
+        "sent": sent,
+    }
+
 
 _EXCEPTION_MATCH_STATUSES = (
     "match_issues",

@@ -2,13 +2,14 @@ import os
 from logging.config import fileConfig
 
 from dotenv import load_dotenv
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 from alembic import context
 from src.models import (
     audit_models,
     document_models,
     document_workflow_models,
+    email_models,
     exchange_rate_models,
     goods_receipt_models,
     invoice_models,
@@ -24,6 +25,7 @@ _MODEL_MODULES = (
     audit_models,
     document_models,
     document_workflow_models,
+    email_models,
     exchange_rate_models,
     goods_receipt_models,
     invoice_models,
@@ -49,7 +51,17 @@ target_metadata = Base.metadata
 
 
 def include_object(object, name, type_, reflected, compare_to):
+    if type_ == "table" and getattr(object, "schema", None) != "core":
+        return False
     return not (reflected and compare_to is None and type_ in {"table", "column"})
+
+
+def include_name(name, type_, parent_names):
+    if type_ == "schema":
+        return name in (None, "core", "auth")
+    if type_ == "table":
+        return parent_names.get("schema_name") in (None, "core")
+    return True
 
 
 def run_migrations_offline() -> None:
@@ -60,8 +72,15 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         include_object=include_object,
+        include_name=include_name,
+        include_schemas=True,
         version_table="core_alembic_version",
+        version_table_schema="core",
     )
+
+    # Core revisions use unqualified table and enum names; mirror the online
+    # connection's lookup order in generated SQL as well.
+    context.execute("SET search_path TO core, auth, public")
 
     with context.begin_transaction():
         context.run_migrations()
@@ -75,12 +94,19 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS core"))
+        connection.commit()
+        connection.execute(text("SET search_path TO core, auth, public"))
+        connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
             include_object=include_object,
+            include_name=include_name,
+            include_schemas=True,
             version_table="core_alembic_version",
+            version_table_schema="core",
         )
 
         with context.begin_transaction():

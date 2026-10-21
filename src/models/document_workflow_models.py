@@ -35,7 +35,7 @@ class DocumentWorkflow(Base):
     decision_target_type: Mapped[str | None] = mapped_column(String(30))
     decision_reason: Mapped[str | None] = mapped_column(String(500))
     decision_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
+        UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

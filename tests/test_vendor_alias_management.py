@@ -25,6 +25,7 @@ def _setup(db=None):
     app.dependency_overrides[get_current_user] = lambda: {
         "sub": str(uuid.uuid4()),
         "type": "access",
+        "role": "admin",
     }
 
     def teardown():
@@ -144,6 +145,29 @@ def test_resolution_filters_out_inactive_aliases_and_vendors():
     assert any(
         "vendors.is_active IS true" in str(expression) for expression in compiled
     )
+
+
+def test_resolution_uses_unique_active_tax_id_before_vendor_name():
+    vendor = _vendor(name="Canonical Vendor")
+    tax_query = MagicMock()
+    tax_query.filter.return_value.all.return_value = [vendor]
+    db = MagicMock()
+    db.query.return_value = tax_query
+
+    assert (
+        resolve_vendor(db, "Different extracted spelling", tax_id="US-12 34") is vendor
+    )
+    db.query.assert_called_once()
+
+
+def test_unmatched_tax_id_does_not_fall_back_to_similar_vendor_name():
+    tax_query = MagicMock()
+    tax_query.filter.return_value.all.return_value = []
+    db = MagicMock()
+    db.query.return_value = tax_query
+
+    assert resolve_vendor(db, "Canonical Vendor", tax_id="MISMATCH") is None
+    db.query.assert_called_once()
 
 
 def test_create_alias_normalizes_and_persists_mapping():
