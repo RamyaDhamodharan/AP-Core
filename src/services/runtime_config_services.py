@@ -12,18 +12,37 @@ def is_running_in_container() -> bool:
     return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
 
 
+def _is_localhost_endpoint(value: str) -> bool:
+    candidate = value if "://" in value else f"//{value}"
+    hostname = urlparse(candidate).hostname
+    return hostname == "localhost" or hostname == "::1" or (
+        hostname is not None and hostname.startswith("127.")
+    )
+
+
 def warn_if_container_redis_url_is_localhost() -> None:
     app_env = os.getenv("APP_ENV", "").casefold()
     if app_env == "dev" or not is_running_in_container():
         return
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    hostname = urlparse(redis_url).hostname
-    if hostname == "localhost" or hostname == "::1" or (
-        hostname is not None and hostname.startswith("127.")
-    ):
+    if _is_localhost_endpoint(redis_url):
         logger.warning(
             "REDIS_URL points to localhost inside a container (APP_ENV=%s); "
             "use the Redis service hostname, for example redis://redis:6379/0",
+            app_env or "unset",
+        )
+
+
+def warn_if_container_minio_endpoint_is_localhost() -> None:
+    app_env = os.getenv("APP_ENV", "").casefold()
+    if app_env == "dev" or not is_running_in_container():
+        return
+
+    endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+    if _is_localhost_endpoint(endpoint):
+        logger.warning(
+            "MINIO_ENDPOINT points to localhost inside a container (APP_ENV=%s); "
+            "use the reachable MinIO service or host endpoint",
             app_env or "unset",
         )
