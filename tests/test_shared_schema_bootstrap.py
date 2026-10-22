@@ -98,6 +98,12 @@ def test_email_message_retry_rows_are_folder_and_uid_scoped():
     assert "folder varchar(300) NOT NULL DEFAULT 'INBOX'" in messages
     assert "uid integer NOT NULL" in messages
     assert "attempts integer NOT NULL DEFAULT 0" in messages
+    assert "next_retry_at timestamptz" in messages
+    assert "failure_reason varchar(200)" in messages
+    assert "raw_object_key varchar(500)" in messages
+    assert "ix_email_messages_due_retry" in (
+        ROOT / "database" / "001_initial_schema.sql"
+    ).read_text()
     assert (
         "ON core.email_messages(mailbox, folder, uid)"
         in (ROOT / "database" / "001_initial_schema.sql").read_text()

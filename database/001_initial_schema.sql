@@ -309,14 +309,19 @@ CREATE TABLE core.email_messages (
   subject varchar(500),
   received_at timestamptz,
   body_preview text,
-  raw_object_key varchar(500) NOT NULL,
+  raw_object_key varchar(500),
   status varchar(40) NOT NULL DEFAULT 'received',
+  failure_reason varchar(200),
   attempts integer NOT NULL DEFAULT 0,
+  next_retry_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT uq_email_messages_message_id UNIQUE (message_id)
 );
 CREATE INDEX ix_email_messages_mailbox_folder_uid
   ON core.email_messages(mailbox, folder, uid);
+CREATE INDEX ix_email_messages_due_retry
+  ON core.email_messages(mailbox, folder, next_retry_at)
+  WHERE status = 'failed';
 
 CREATE TABLE core.notifications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

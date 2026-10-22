@@ -1,4 +1,6 @@
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +16,26 @@ from src.api.rest.routers import (
     purchase_order_routers,
     vendor_routers,
 )
+from src.services.llm_pipeline_services import validate_llm_provider_config
+from src.services.runtime_config_services import (
+    warn_if_container_minio_endpoint_is_localhost,
+    warn_if_container_redis_url_is_localhost,
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    warn_if_container_redis_url_is_localhost()
+    warn_if_container_minio_endpoint_is_localhost()
+    validate_llm_provider_config()
+    yield
+
 
 app = FastAPI(
     title="GenWorx AP Core Service",
     version="0.1.0",
     description="Core API for GenWorx AP Assistant",
+    lifespan=lifespan,
 )
 
 

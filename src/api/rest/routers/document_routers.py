@@ -55,6 +55,7 @@ from ....services.llm_pipeline_services import (
     classify_document,
     extract_document,
     extract_e2e_test_document_text,
+    is_e2e_stub_enabled,
     validate_extracted_data,
 )
 from ....services.vendor_resolution_services import (
@@ -171,6 +172,7 @@ def list_documents(
     doc_type: Annotated[str | None, Query(max_length=40)] = None,
     source: Annotated[str | None, Query(max_length=40)] = None,
     parent_document_id: uuid.UUID | None = None,
+    include_parents: bool = False,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentListResponse:
@@ -185,6 +187,8 @@ def list_documents(
         filters.append(Document.source == source)
     if parent_document_id:
         filters.append(Document.parent_document_id == parent_document_id)
+    if not include_parents:
+        filters.append(Document.email_message_id.is_(None))
 
     total = db.query(func.count(Document.id)).filter(*filters).scalar() or 0
     rows = (
@@ -1548,7 +1552,7 @@ def parse_document(
         document.failure_message = None
 
         # Step 2: Parse using Docling.
-        if os.getenv("AP_E2E_MOCK_EXTRACTION"):
+        if os.getenv("AP_E2E_MOCK_EXTRACTION") or is_e2e_stub_enabled():
             raw_text = extract_e2e_test_document_text(content)
         else:
             document_converter = importlib.import_module(

@@ -116,7 +116,10 @@ def ingest_file(
                 logger.exception("MinIO cleanup failed after ingestion error")
         if source == "email_poll":
             logger.warning("Email file ingestion failed (%s)", type(exc).__name__)
-            return IngestResult("failed", None, "Email file ingestion failed")
+            raise RuntimeError(
+                "Email file persistence failed while saving to storage/database: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
         logger.exception("File ingestion failed for %s", filename)
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 

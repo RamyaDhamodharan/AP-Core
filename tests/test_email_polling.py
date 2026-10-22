@@ -134,6 +134,15 @@ class FakeIMAP:
             uid = int(args[0])
             query = str(args[1])
             self.fetch_queries.append((uid, query))
+            if "HEADER.FIELDS" in query:
+                original = email_polling_services.email.message_from_bytes(
+                    self.messages[uid]
+                )
+                headers = MIMEMessage()
+                headers["Message-ID"] = str(original.get("Message-ID", ""))
+                return "OK", [
+                    (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)])", headers.as_bytes())
+                ]
             assert "BODY.PEEK[]" in query
             received = self.internal_dates.get(uid, datetime.now(UTC))
             internal_date = received.strftime("%d-%b-%Y %H:%M:%S %z")
@@ -265,9 +274,12 @@ def test_uid_checkpoint_only_processes_uids_after_checkpoint_and_overlap_dedupes
     result, client = _poll(db, messages)
 
     assert result["attachments"] == 1
-    assert result["duplicates"] == 2
+    assert result["skipped_known"] == 2
+    assert result["duplicates"] == 0
     assert state.last_uid == 3
     assert [uid for uid, _ in client.fetch_queries] == [1, 2, 3]
+    assert "HEADER.FIELDS" in client.fetch_queries[0][1]
+    assert "HEADER.FIELDS" in client.fetch_queries[1][1]
     assert "UID 3:*" in client.search_queries
     assert "UID 1:2" in client.search_queries
     assert client.selected_readonly
@@ -291,12 +303,39 @@ def test_first_run_does_not_backfill_by_default(monkeypatch):
     monkeypatch.setenv("IMAP_USER", "ap@test-mail.test")
     monkeypatch.setenv("IMAP_PASSWORD", "local-test-password")
     monkeypatch.setenv("EMAIL_POLL_INITIAL_LOOKBACK_HOURS", "0")
-    result, _ = _poll(
+    result, client = _poll(
         db,
         {1: _mail(), 2: _mail("<two@vendor.test>")},
     )
     assert result["emails"] == 0
     assert _state(db).last_uid == 2
+    assert client.fetch_queries == []
+    assert not _documents(db)
+
+
+def test_first_successful_poll_after_imap_setup_failure_does_not_backfill(
+    monkeypatch,
+):
+    db = FakeDB()
+    monkeypatch.setenv("IMAP_HOST", "")
+    monkeypatch.setenv("IMAP_USER", "ap@test-mail.test")
+    monkeypatch.setenv("IMAP_PASSWORD", "local-test-password")
+    monkeypatch.setenv("EMAIL_POLL_INITIAL_LOOKBACK_HOURS", "0")
+
+    unavailable = email_polling_services.poll_email_messages(db)
+    assert unavailable["failed"] == 1
+    assert _state(db).uidvalidity == 0
+
+    monkeypatch.setenv("IMAP_HOST", "imap.test")
+    result, client = _poll(
+        db,
+        {1: _mail(), 2: _mail("<two@vendor.test>")},
+    )
+
+    assert result["emails"] == 0
+    assert _state(db).uidvalidity == 7
+    assert _state(db).last_uid == 2
+    assert client.fetch_queries == []
     assert not _documents(db)
 
 
@@ -384,7 +423,7 @@ def test_failure_blocks_checkpoint_past_failing_uid(polling_setup):
     assert failed.attempts == 1
 
 
-def test_failed_uid_retries_up_to_three_then_is_skipped(polling_setup):
+def test_failed_uid_retries_with_backoff_then_is_skipped(polling_setup, monkeypatch):
     db, _, _ = polling_setup
     state = _state(db)
 
@@ -394,7 +433,13 @@ def test_failed_uid_retries_up_to_three_then_is_skipped(polling_setup):
                 return "NO", []
             return super().uid(command, *args)
 
+    monkeypatch.setenv("EMAIL_MAX_ATTEMPTS", "3")
     for _ in range(3):
+        row = next(
+            (item for item in db.rows if isinstance(item, EmailMessageRecord)), None
+        )
+        if row:
+            row.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
         email_polling_services.poll_email_messages(
             db, lambda *_: BrokenFetch({1: _mail()}), sleep=lambda _: None
         )
@@ -402,6 +447,58 @@ def test_failed_uid_retries_up_to_three_then_is_skipped(polling_setup):
     assert row.attempts == 3
     assert row.status == "failed_final"
     assert state.last_uid == 1
+
+
+def test_transient_and_permanent_error_classification():
+    assert email_polling_services._is_transient_email_error(
+        TimeoutError("socket timed out")
+    )
+    assert email_polling_services._is_transient_email_error(
+        RuntimeError("MinIO connection reset")
+    )
+    assert not email_polling_services._is_transient_email_error(
+        ValueError("unparseable MIME message")
+    )
+
+
+def test_permanent_processing_error_is_final_without_retry(polling_setup, monkeypatch):
+    db, _, _ = polling_setup
+
+    def permanent_failure(*_args, **_kwargs):
+        raise ValueError("Unparseable attachment payload")
+
+    monkeypatch.setattr(email_polling_services, "ingest_file", permanent_failure)
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                attachments=[("bill.pdf", PDF, "application", "pdf")]
+            )
+        },
+    )
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert result["failed"] == 1
+    assert row.status == "failed_final"
+    assert row.attempts == 1
+    assert row.next_retry_at is None
+    assert any(
+        audit.action == "email_failed_final"
+        for audit in db.rows
+        if isinstance(audit, AuditLog)
+    )
+
+
+def test_retry_backoff_schedule_is_bounded_at_six_hours():
+    now = datetime.now(UTC)
+    delays = [
+        (email_polling_services._retry_at(attempt) - now).total_seconds()
+        for attempt in range(1, 6)
+    ]
+    expected = [300, 900, 3600, 21600, 21600]
+    assert all(
+        abs(actual - target) < 2
+        for actual, target in zip(delays, expected, strict=True)
+    )
 
 
 def test_failed_uid_is_retried_and_committed_on_next_poll(polling_setup):
@@ -421,12 +518,106 @@ def test_failed_uid_is_retried_and_committed_on_next_poll(polling_setup):
     first, _ = _poll(db, {1: message}, client_type=FailsOnce)
     assert first["failed"] == 1
     assert state.last_uid == 0
+    failed_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert failed_row.next_retry_at > datetime.now(UTC) + timedelta(minutes=4)
+
+    too_soon, early_client = _poll(db, {1: message})
+    assert too_soon["failed"] == 0
+    assert not any("BODY.PEEK[]" in query for _, query in early_client.fetch_queries)
+    assert failed_row.attempts == 1
+    failed_row.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
 
     second, _ = _poll(db, {1: message})
     assert second["attachments"] == 1
     assert state.last_uid == 1
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
     assert row.attempts == 2
+
+
+def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
+    polling_setup, monkeypatch, caplog
+):
+    import logging
+
+    db, uploads, _ = polling_setup
+    state = _state(db)
+    message = _mail(
+        "<storage-failure@vendor.test>",
+        [("broken.pdf", PDF, "application", "pdf")],
+    )
+    good_pdf = b"%PDF-1.7\n" + b"unique successful mail attachment " * 20
+    good_message = _mail(
+        "<same-batch-success@vendor.test>",
+        [("good.pdf", good_pdf, "application", "pdf")],
+    )
+    real_upload = document_ingest_services.upload_file
+
+    def failing_upload(key, body, content_type):
+        if key.endswith("/broken.pdf"):
+            raise RuntimeError(
+                "MinIO connection failed; IMAP_PASSWORD=local-test-password; "
+                "Authorization: Bearer private-token"
+            )
+        return real_upload(key, body, content_type)
+
+    monkeypatch.setattr(document_ingest_services, "upload_file", failing_upload)
+
+    with caplog.at_level(logging.ERROR, logger=email_polling_services.__name__):
+        monkeypatch.setenv("EMAIL_MAX_ATTEMPTS", "5")
+        for attempt in range(5):
+            failed_before = next(
+                (row for row in db.rows if isinstance(row, EmailMessageRecord)
+                 and row.message_id == "<storage-failure@vendor.test>"),
+                None,
+            )
+            if failed_before:
+                failed_before.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+            result, _ = _poll(db, {1: message, 2: good_message})
+            assert result["failed"] == 1, (
+                attempt,
+                result,
+                [
+                    (row.message_id, row.status, row.attempts)
+                    for row in db.rows
+                    if isinstance(row, EmailMessageRecord)
+                ],
+                state.last_uid,
+            )
+            assert any(
+                document.original_filename == "good.pdf"
+                for document in _documents(db)
+            )
+            if attempt == 0:
+                assert state.last_uid == 0
+                failure = next(
+                    row
+                    for row in reversed(db.rows)
+                    if isinstance(row, AuditLog) and row.action == "email_failed"
+                )
+                assert "RuntimeError" in failure.technical_detail
+                assert "MinIO connection failed" in failure.technical_detail
+                assert "[REDACTED]" in failure.technical_detail
+                assert len(failure.technical_detail) <= 500
+
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "MinIO connection failed" in caplog.text
+    assert "local-test-password" not in caplog.text
+    assert "private-token" not in caplog.text
+    failed = next(
+        row
+        for row in db.rows
+        if isinstance(row, EmailMessageRecord)
+        and row.message_id == "<storage-failure@vendor.test>"
+    )
+    assert failed.attempts == 5
+    assert failed.status == "failed_final"
+    assert state.last_uid == 2
+    assert any(
+        row.action == "email_failed_final"
+        for row in db.rows
+        if isinstance(row, AuditLog)
+    )
+    assert any(key.endswith("/good.pdf") for key, _, _ in uploads)
 
 
 @pytest.mark.parametrize(
@@ -439,7 +630,7 @@ def test_failed_uid_is_retried_and_committed_on_next_poll(polling_setup):
             "Invoice",
             "",
             "",
-            "bounce_or_mailer_daemon",
+            "blocked_sender",
         ),
         (
             "vendor@example.test",
@@ -494,6 +685,28 @@ def test_configurable_sender_and_automation_filters(
     )
 
 
+def test_sender_blocklist_matches_configured_domain_or_pattern(
+    polling_setup, monkeypatch
+):
+    db, _, _ = polling_setup
+    monkeypatch.setenv("EMAIL_SENDER_BLOCKLIST", "blocked.test,no-reply")
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                "<blocked@vendor.test>",
+                sender="ap@blocked.test",
+                attachments=[("bill.pdf", PDF, "application", "pdf")],
+            )
+        },
+    )
+    assert result["filtered"] == 1
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert row.status == "ignored"
+    assert row.raw_object_key is None
+    assert not _documents(db)
+
+
 def test_bounce_subject_and_auto_submitted_no_filter(polling_setup):
     db, _, _ = polling_setup
     result, _ = _poll(
@@ -520,13 +733,13 @@ def test_bad_magic_attachment_is_rejected(polling_setup):
     result, _ = _poll(
         db, {1: _mail(attachments=[("bill.pdf", b"x" * 500, "application", "pdf")])}
     )
-    parent = next(row for row in _documents(db) if row.parent_document_id is None)
-    child = next(row for row in _documents(db) if row.parent_document_id == parent.id)
-    assert child.status == "failed"
-    assert "signature" in child.failure_message
-    assert parent.status == "ignored"
-    assert parent.failure_message == "No bill attachment found"
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert email_row.status == "ignored"
+    assert email_row.raw_object_key is None
+    assert email_row.failure_reason == "invalid_attachment"
     assert result["attachments"] == 0
+    assert result["filtered"] == 1
+    assert not _documents(db)
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
@@ -537,10 +750,12 @@ def test_oversized_attachment_is_failed_without_storage(polling_setup, monkeypat
     result, _ = _poll(
         db, {1: _mail(attachments=[("big.pdf", content, "application", "pdf")])}
     )
-    child = next(row for row in _documents(db) if row.parent_document_id is not None)
-    assert child.status == "failed"
-    assert "exceeds the 1 MB limit" in child.failure_message
-    assert result["failed"] == 1
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert email_row.status == "ignored"
+    assert email_row.raw_object_key is None
+    assert email_row.failure_reason == "attachment_too_large"
+    assert result["filtered"] == 1
+    assert not _documents(db)
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
@@ -549,9 +764,11 @@ def test_inline_image_under_five_kb_is_skipped(polling_setup):
     result, _ = _poll(
         db, {1: _mail(attachments=[("pixel.png", PNG, "image", "png", "inline")])}
     )
-    parent = next(row for row in _documents(db) if row.parent_document_id is None)
     assert result["attachments"] == 0
-    assert parent.failure_message == "No bill attachment found"
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert email_row.status == "ignored"
+    assert email_row.raw_object_key is None
+    assert email_row.failure_reason == "inline_image_below_min_size"
 
 
 def test_at_most_ten_attachments_are_ingested(polling_setup):
@@ -577,6 +794,7 @@ def test_email_and_attachment_objects_use_safe_keys_and_db_metadata(polling_setu
     message_hash = hashlib.sha1(parent.email_message_id.encode()).hexdigest()
     eml_key = f"emails/{parent.email_received_at:%Y/%m}/{message_hash}.eml"
     assert result["attachments"] == 1
+    assert parent.status == "processed"
     assert parent.email_uid == 9
     assert parent.email_eml_key == eml_key
     assert len(parent.email_body_preview) <= 2000
@@ -605,20 +823,21 @@ def test_html_body_is_stripped_when_no_plain_text(polling_setup):
         subtype="html",
     )
     _poll(db, {1: message.as_bytes()})
-    parent = next(row for row in _documents(db) if row.parent_document_id is None)
-    assert parent.email_body_preview == "Readable & clear"
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert email_row.body_preview == "Readable & clear"
+    assert email_row.raw_object_key is None
 
 
 def test_no_attachment_queues_allowlist_protected_notification(polling_setup):
     db, _, notifications = polling_setup
     result, _ = _poll(db, {1: _mail()})
-    parent = next(row for row in _documents(db) if row.parent_document_id is None)
-    notification = next(row for row in db.rows if isinstance(row, Notification))
-    assert parent.status == "ignored"
-    assert parent.failure_message == "No bill attachment found"
-    assert notification.recipient_email == "billing@test-mail.test"
-    assert notification.status == "queued"
-    assert notifications == [parent.id]
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert email_row.status == "ignored"
+    assert email_row.raw_object_key is None
+    assert email_row.failure_reason == "no_valid_attachment"
+    assert not _documents(db)
+    assert not any(isinstance(row, Notification) for row in db.rows)
+    assert notifications == []
     assert result["attachments"] == 0
 
 
@@ -642,6 +861,7 @@ def test_uid_fetch_failure_does_not_leak_imap_secret(polling_setup, caplog):
     assert result["message"] == email_polling_services.IMAP_AUTH_ERROR
     assert secret not in caplog.text
     assert secret not in str(result)
+    assert not any(isinstance(row, EmailMessageRecord) for row in db.rows)
     assert all(
         secret not in (row.technical_detail or "")
         for row in db.rows

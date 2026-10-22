@@ -57,16 +57,18 @@ class EmailMessage(Base):
     subject: Mapped[str | None] = mapped_column(String(500))
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     body_preview: Mapped[str | None] = mapped_column(Text)
-    raw_object_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    raw_object_key: Mapped[str | None] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(
         String(40),
         nullable=False,
         default="received",
         server_default=text("'received'"),
     )
+    failure_reason: Mapped[str | None] = mapped_column(String(200))
     attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

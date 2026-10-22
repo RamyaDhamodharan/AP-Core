@@ -64,7 +64,7 @@ def test_list_documents_returns_only_authenticated_owner_page():
     assert body["items"][0]["email_sender"] == "billing@example.com"
     assert body["items"][0]["email_subject"] == "Invoice INV-12"
     assert body["items"][0]["source"] == "email_poll"
-    assert len(page_query.filter.call_args.args) == 2
+    assert len(page_query.filter.call_args.args) == 3
     owner_filter = page_query.filter.call_args.args[0]
     compiled = owner_filter.compile(dialect=postgresql.dialect())
     assert "documents.created_by" in str(compiled)
@@ -85,12 +85,35 @@ def test_document_list_supports_type_source_status_and_parent_filters():
     try:
         response = client.get(
             "/api/documents?doc_type=other&source=email_poll&status=other"
-            f"&parent_document_id={parent_id}"
+            f"&parent_document_id={parent_id}&include_parents=true"
         )
     finally:
         _clear_overrides()
     assert response.status_code == 200
     assert len(page_query.filter.call_args.args) == 5
+
+
+def test_email_parents_are_hidden_by_default_and_can_be_included():
+    owner_id = uuid.uuid4()
+    count_query = MagicMock()
+    count_query.filter.return_value.scalar.return_value = 0
+    page_query = MagicMock()
+    (
+        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
+    ) = []
+    db = MagicMock()
+    db.query.side_effect = [count_query, page_query]
+    _override(owner_id, db)
+    try:
+        response = client.get("/api/documents")
+    finally:
+        _clear_overrides()
+    assert response.status_code == 200
+    filters = page_query.filter.call_args.args
+    assert len(filters) == 2
+    assert "email_message_id IS NULL" in str(
+        filters[-1].compile(dialect=postgresql.dialect())
+    )
 
 
 def test_empty_document_workspace_returns_zero_from_owner_scoped_api():
