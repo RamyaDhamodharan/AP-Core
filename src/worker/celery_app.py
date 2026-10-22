@@ -30,6 +30,12 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_default_retry_delay=10,
     broker_connection_retry_on_startup=True,
+    task_default_queue="documents",
+    task_routes={
+        "ap.poll_email": {"queue": "email"},
+        "ap.send_notification": {"queue": "email"},
+        "ap.process_document": {"queue": "documents"},
+    },
 )
 
 if (

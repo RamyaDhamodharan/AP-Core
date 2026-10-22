@@ -24,7 +24,8 @@ from src.services.document_ingest_services import ingest_file
 
 logger = logging.getLogger(__name__)
 OVERLAP_UIDS = 10
-MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 5
+RETRY_DELAYS_MINUTES = (5, 15, 60, 360)
 MAX_ATTACHMENTS_PER_EMAIL = 10
 INLINE_IMAGE_MIN_BYTES = 5 * 1024
 IMAP_AUTH_ERROR = "Gmail rejected the login: use an App Password and enable IMAP"
@@ -36,6 +37,7 @@ EMPTY_COUNTS = {
     "duplicates": 0,
     "filtered": 0,
     "failed": 0,
+    "skipped_known": 0,
 }
 ATTACHMENT_FORMATS = {
     "application/pdf": (".pdf", lambda data: data.startswith(b"%PDF-")),
@@ -175,6 +177,102 @@ def _uidvalidity(client) -> int:
     return int(value)
 
 
+class IMAPConnectionError(RuntimeError):
+    """A mailbox connection failure that must fail the whole poll run."""
+
+
+def _is_imap_connection_failure(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            IMAPConnectionError,
+            OSError,
+            TimeoutError,
+            ConnectionError,
+            imaplib.IMAP4.abort,
+        ),
+    )
+
+
+def _fetch_message_id_header(client, uid: int) -> str | None:
+    status, response = client.uid(
+        "fetch", str(uid), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+    )
+    if status != "OK" or not response:
+        raise IMAPConnectionError("Could not fetch IMAP Message-ID header")
+    raw = next((item[1] for item in response if isinstance(item, tuple)), None)
+    if not isinstance(raw, bytes):
+        return None
+    parsed = email.message_from_bytes(raw, policy=policy.default)
+    return str(parsed.get("Message-ID", "")) or None
+
+
+def _max_attempts() -> int:
+    try:
+        return max(1, int(os.getenv("EMAIL_MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))))
+    except ValueError:
+        return DEFAULT_MAX_ATTEMPTS
+
+
+def _is_transient_email_error(exc: Exception) -> bool:
+    if isinstance(exc, (OSError, TimeoutError, ConnectionError, imaplib.IMAP4.abort)):
+        return True
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    class_name = type(exc).__name__.casefold()
+    if any(
+        hint in class_name
+        for hint in (
+            "operationalerror", "interfaceerror", "connecttimeout", "readtimeout",
+            "protocolerror", "connectionclosed", "serviceunavailable",
+        )
+    ):
+        return True
+    message = str(exc).casefold()
+    return any(
+        hint in message
+        for hint in (
+            "connection refused", "connection reset", "connection aborted",
+            "connection timed out", "timed out", "ssl eof", "unexpected eof",
+            "temporarily unavailable", "server disconnected", "broken pipe",
+            "minio", "database connection", "could not connect", "connection is closed",
+        )
+    )
+
+
+def _retry_at(attempt_no: int) -> datetime:
+    index = min(max(attempt_no - 1, 0), len(RETRY_DELAYS_MINUTES) - 1)
+    return datetime.now(UTC) + timedelta(minutes=RETRY_DELAYS_MINUTES[index])
+
+
+def _record_email_failure(db, row, uid: int, counts: dict, exc: Exception) -> bool:
+    attempt_no = row.attempts or 1
+    transient = _is_transient_email_error(exc)
+    final = not transient or attempt_no >= _max_attempts()
+    row.status = "failed_final" if final else "failed"
+    row.next_retry_at = None if final else _retry_at(attempt_no)
+    retry_text = row.next_retry_at.isoformat() if row.next_retry_at else "none"
+    detail = (
+        f"{_email_exception_detail(uid, exc)}; attempt={attempt_no}; "
+        f"next_retry_at={retry_text}"
+    )[:500]
+    _audit(
+        db,
+        "email_failed_final" if final else "email_failed",
+        (
+            "Email processing failed permanently"
+            if final
+            else "Email processing failed; retry scheduled"
+        ),
+        result="error",
+        entity_id=row.id,
+        detail=detail,
+    )
+    db.commit()
+    counts["failed"] += 1
+    return final
+
+
 def _uid_search(client, criteria: str) -> list[int]:
     status, data = client.uid("search", None, criteria)
     if status != "OK":
@@ -302,7 +400,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
     try:
         status, _ = client.select(folder, readonly=True)
         if status != "OK":
-            raise RuntimeError("Could not select IMAP folder")
+            raise IMAPConnectionError("Could not select IMAP folder")
         validity = _uidvalidity(client)
         state = (
             db.query(EmailPollState)
@@ -312,6 +410,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
         )
         all_uids = _uid_search(client, "ALL")
         highest_uid = max(all_uids, default=0)
+        due_retry_uids: set[int] = set()
         initial_cutoff = None
         # uidvalidity=0 is the placeholder created when IMAP was unavailable
         # before the mailbox could be inspected. Treat the next successful
@@ -368,6 +467,17 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
             uids = _uid_search(client, "UID 1:*")
             uids = uids[:max_messages]
         else:
+            now = datetime.now(UTC)
+            retry_rows = (
+                db.query(EmailMessage)
+                .filter_by(mailbox=mailbox, folder=folder, status="failed")
+                .all()
+            )
+            due_retry_uids = {
+                row.uid
+                for row in retry_rows
+                if row.next_retry_at is None or row.next_retry_at <= now
+            }
             new_uids = _uid_search(client, f"UID {state.last_uid + 1}:*")
             new_uids = new_uids[:max_messages]
             overlap_start = max(1, state.last_uid - OVERLAP_UIDS + 1)
@@ -376,14 +486,50 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                 if state.last_uid > 0
                 else []
             )
-            uids = sorted(set(overlap_uids + new_uids))
+            uids = sorted(set(overlap_uids + new_uids + list(due_retry_uids)))
 
         uids = [uid for uid in sorted(set(uids)) if uid <= highest_uid]
         blocked_by_failure = False
 
         for uid in uids:
-            counts["emails"] += 1
             was_new_uid = uid > state.last_uid
+            is_retry = (
+                uid in due_retry_uids
+                if not initial_run and state.uidvalidity == validity
+                else False
+            )
+            is_overlap = not was_new_uid and not is_retry and not initial_run
+            retry_record = (
+                db.query(EmailMessage)
+                .filter_by(mailbox=mailbox, folder=folder, uid=uid)
+                .first()
+            )
+            if (
+                retry_record
+                and retry_record.status == "failed"
+                and retry_record.next_retry_at
+                and retry_record.next_retry_at > datetime.now(UTC)
+            ):
+                if was_new_uid:
+                    blocked_by_failure = True
+                continue
+            if is_overlap:
+                message_id = _fetch_message_id_header(client, uid)
+                known = (
+                    db.query(EmailMessage).filter_by(message_id=message_id).first()
+                    if message_id
+                    else None
+                )
+                if known and known.status in {"processed", "ignored", "failed_final"}:
+                    counts["skipped_known"] += 1
+                    continue
+                # The overlap is a reconciliation window, never a reason to
+                # download an unknown message body or repeat a non-due retry.
+                if not known or known.status != "failed" or (
+                    known.next_retry_at and known.next_retry_at > datetime.now(UTC)
+                ):
+                    continue
+            counts["emails"] += 1
             try:
                 safe_to_advance = _process_uid(
                     db,
@@ -395,6 +541,8 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                     received_after=initial_cutoff if initial_run else None,
                 )
             except Exception as exc:
+                if _is_imap_connection_failure(exc):
+                    raise IMAPConnectionError(_friendly_imap_error(exc)) from None
                 db.rollback()
                 _log_email_exception(uid, exc)
                 safe_to_advance = _record_uid_fetch_failure(
@@ -490,14 +638,17 @@ def _imap_factory(host: str, port: int):
 
 def _sender_filter_reason(msg: Message, mailbox: str, sender: str) -> str | None:
     sender_key = sender.casefold()
-    mailbox_key = email.utils.parseaddr(mailbox)[1].casefold() or mailbox.casefold()
-    if sender_key and sender_key == mailbox_key:
-        return "sender_is_mailbox"
-    auto_header = msg.get("Auto-Submitted")
-    if auto_header is not None and str(auto_header).strip().casefold() != "no":
-        return "auto_submitted"
-    if str(msg.get("Precedence", "")).strip().casefold() in {"bulk", "junk"}:
-        return "precedence_bulk_or_junk"
+    blocklist = _address_list("EMAIL_SENDER_BLOCKLIST")
+    blocklist.update(_address_list("EMAIL_BLOCKED_SENDERS"))
+    local, _, domain = sender_key.partition("@")
+    if any(
+        item == sender_key
+        or item.lstrip("@.") == domain
+        or item in local
+        or item in sender_key
+        for item in blocklist
+    ):
+        return "blocked_sender"
     subject = str(msg.get("Subject", "")).casefold()
     bounce_sender = (
         sender_key == "mailer-daemon"
@@ -518,19 +669,29 @@ def _sender_filter_reason(msg: Message, mailbox: str, sender: str) -> str | None
     )
     if bounce_sender or bounce_subject:
         return "bounce_or_mailer_daemon"
+    auto_header = msg.get("Auto-Submitted")
+    if auto_header is not None and str(auto_header).strip().casefold() != "no":
+        return "auto_submitted"
+    if str(msg.get("Precedence", "")).strip().casefold() in {"bulk", "junk"}:
+        return "precedence_bulk_or_junk"
+    mailbox_key = email.utils.parseaddr(mailbox)[1].casefold() or mailbox.casefold()
+    if sender_key and sender_key == mailbox_key:
+        return "sender_is_mailbox"
     allowed = _address_list("EMAIL_ALLOWED_SENDERS")
-    blocked = _address_list("EMAIL_BLOCKED_SENDERS")
-    if sender_key in blocked:
-        return "blocked_sender"
     if allowed and sender_key not in allowed:
         return "sender_not_allowlisted"
     return None
 
 
 def _address_list(variable: str) -> set[str]:
+    default = (
+        "no-reply,noreply,mailer-daemon,postmaster"
+        if variable == "EMAIL_SENDER_BLOCKLIST"
+        else ""
+    )
     return {
         item.strip().casefold()
-        for item in os.getenv(variable, "").split(",")
+        for item in os.getenv(variable, default).split(",")
         if item.strip()
     }
 
@@ -603,10 +764,12 @@ def _process_uid(
     try:
         status, response = client.uid("fetch", str(uid), "(INTERNALDATE BODY.PEEK[])")
     except Exception as exc:
+        if _is_imap_connection_failure(exc):
+            raise
         _log_email_exception(uid, exc)
         return _record_uid_fetch_failure(db, mailbox, folder, uid, counts, exc)
     if status != "OK" or not response:
-        exc = RuntimeError("IMAP UID fetch failed")
+        exc = TimeoutError("IMAP UID fetch returned a non-OK response")
         _log_email_exception(uid, exc)
         return _record_uid_fetch_failure(db, mailbox, folder, uid, counts, exc)
     raw = next((item[1] for item in response if isinstance(item, tuple)), None)
@@ -651,7 +814,7 @@ def _process_uid(
             subject=subject or None,
             received_at=received,
             body_preview=preview,
-            raw_object_key=eml_key,
+            raw_object_key=None,
             status="processing",
             attempts=attempt_no,
         )
@@ -664,13 +827,15 @@ def _process_uid(
         prior.subject = subject or None
         prior.received_at = received
         prior.body_preview = preview
-        prior.raw_object_key = eml_key
+        prior.raw_object_key = None
         prior.status = "processing"
         prior.attempts = attempt_no
+        prior.next_retry_at = None
     db.commit()
 
     if received_after and (received is None or received < received_after):
         prior.status = "ignored"
+        prior.failure_reason = "outside_initial_lookback"
         _audit(
             db,
             "email_skipped_filtered",
@@ -685,12 +850,28 @@ def _process_uid(
     filter_reason = _sender_filter_reason(msg, mailbox, sender)
     if filter_reason:
         prior.status = "ignored"
+        prior.failure_reason = filter_reason
         _audit(
             db,
             "email_skipped_filtered",
             "Email was skipped by configured sender or automation filters",
             entity_id=prior.id,
             detail=filter_reason,
+        )
+        db.commit()
+        counts["filtered"] += 1
+        return True
+
+    if not _has_valid_attachment(msg):
+        prior.status = "ignored"
+        prior.raw_object_key = None
+        prior.failure_reason = _invalid_attachment_reason(msg)
+        _audit(
+            db,
+            "email_skipped_filtered",
+            "Email has no valid supported attachment",
+            entity_id=prior.id,
+            detail=prior.failure_reason,
         )
         db.commit()
         counts["filtered"] += 1
@@ -729,6 +910,8 @@ def _process_uid(
             root = db.get(Document, result.document_id)
         if root is None:
             raise RuntimeError("Raw email document was unavailable after commit")
+        prior.raw_object_key = eml_key
+        db.commit()
 
         _audit(
             db,
@@ -854,15 +1037,6 @@ def _process_uid(
                 valid += 1
             else:
                 attachment_failure = True
-                counts["failed"] += 1
-                _audit(
-                    db,
-                    "email_failed",
-                    "Email attachment could not be ingested",
-                    result="error",
-                    entity_id=prior.id,
-                    detail="attachment_ingestion_failed",
-                )
 
         if not valid:
             root.status = "ignored"
@@ -874,22 +1048,24 @@ def _process_uid(
                 entity_id=prior.id,
             )
             _queue_no_attachment_notification(db, root, sender)
-        if attachment_failure:
-            prior.status = "failed_final" if attempt_no >= MAX_ATTEMPTS else "failed"
-            _audit(
-                db,
-                "email_failed",
-                "Email processing failed",
-                result="error",
-                entity_id=prior.id,
-                detail=f"UID {uid}: attachment ingestion failed",
-            )
-        else:
-            prior.status = "processed" if valid else "ignored"
+        prior.status = "processed" if valid else "ignored"
+        if valid:
+            root.status = "processed"
+            root.failure_message = None
         db.commit()
         if not valid:
             _dispatch_queued_notifications(db, root.id)
-        return not attachment_failure or attempt_no >= MAX_ATTEMPTS
+        if attachment_failure:
+            return _record_email_failure(
+                db,
+                prior,
+                uid,
+                counts,
+                RuntimeError(
+                    "Email attachment ingestion returned an unsuccessful result"
+                ),
+            )
+        return True
     except Exception as exc:
         _log_email_exception(uid, exc)
         db.rollback()
@@ -906,18 +1082,50 @@ def _process_uid(
             )
             db.add(retry_row)
         retry_row.attempts = attempt_no
-        retry_row.status = "failed_final" if attempt_no >= MAX_ATTEMPTS else "failed"
-        _audit(
-            db,
-            "email_failed",
-            "Email processing failed",
-            result="error",
-            entity_id=retry_row.id,
-            detail=_email_exception_detail(uid, exc),
-        )
-        db.commit()
-        counts["failed"] += 1
-        return attempt_no >= MAX_ATTEMPTS
+        retry_row.raw_object_key = eml_key if retry_row.raw_object_key else None
+        return _record_email_failure(db, retry_row, uid, counts, exc)
+
+
+def _has_valid_attachment(msg: Message) -> bool:
+    max_bytes = max(1, int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20"))) * 1024 * 1024
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        if not (part.get_filename() or disposition in {"attachment", "inline"}):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if (
+            disposition == "inline"
+            and part.get_content_type().casefold().startswith("image/")
+            and len(payload) < INLINE_IMAGE_MIN_BYTES
+        ):
+            continue
+        if len(payload) <= max_bytes and _attachment_format(part, payload):
+            return True
+    return False
+
+
+def _invalid_attachment_reason(msg: Message) -> str:
+    max_bytes = max(1, int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20"))) * 1024 * 1024
+    found_candidate = False
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        if not (part.get_filename() or disposition in {"attachment", "inline"}):
+            continue
+        found_candidate = True
+        payload = part.get_payload(decode=True) or b""
+        if (
+            disposition == "inline"
+            and part.get_content_type().casefold().startswith("image/")
+            and len(payload) < INLINE_IMAGE_MIN_BYTES
+        ):
+            return "inline_image_below_min_size"
+        if len(payload) > max_bytes:
+            return "attachment_too_large"
+    return "invalid_attachment" if found_candidate else "no_valid_attachment"
 
 
 def _queue_no_attachment_notification(db, root: Document, sender: str) -> None:
@@ -972,22 +1180,12 @@ def _record_uid_fetch_failure(
             uid=uid,
             mailbox=mailbox,
             folder=folder,
-            raw_object_key=f"emails/pending/{key_digest}.eml",
+            raw_object_key=None,
             status="failed",
             attempts=attempt_no,
         )
         db.add(row)
     else:
         row.attempts = attempt_no
-    row.status = "failed_final" if attempt_no >= MAX_ATTEMPTS else "failed"
-    _audit(
-        db,
-        "email_failed",
-        "Email could not be fetched",
-        result="error",
-        entity_id=row.id,
-        detail=_email_exception_detail(uid, exc),
-    )
-    db.commit()
-    counts["failed"] += 1
-    return attempt_no >= MAX_ATTEMPTS
+    row.attempts = attempt_no
+    return _record_email_failure(db, row, uid, counts, exc)

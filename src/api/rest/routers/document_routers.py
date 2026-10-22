@@ -172,6 +172,7 @@ def list_documents(
     doc_type: Annotated[str | None, Query(max_length=40)] = None,
     source: Annotated[str | None, Query(max_length=40)] = None,
     parent_document_id: uuid.UUID | None = None,
+    include_parents: bool = False,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentListResponse:
@@ -186,6 +187,8 @@ def list_documents(
         filters.append(Document.source == source)
     if parent_document_id:
         filters.append(Document.parent_document_id == parent_document_id)
+    if not include_parents:
+        filters.append(Document.email_message_id.is_(None))
 
     total = db.query(func.count(Document.id)).filter(*filters).scalar() or 0
     rows = (

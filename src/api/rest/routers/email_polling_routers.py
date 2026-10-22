@@ -45,6 +45,7 @@ def email_poll_status(
             "emails": 0,
             "attachments": 0,
             "duplicates": 0,
+            "skipped_known": 0,
             "filtered": 0,
             "failed": 0,
         },
