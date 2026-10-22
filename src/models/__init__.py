@@ -5,6 +5,9 @@ from src.models import email_models as email_models
 from src.models import exchange_rate_models as exchange_rate_models
 from src.models import goods_receipt_models as goods_receipt_models
 from src.models import invoice_models as invoice_models
+from src.models import (
+    invoice_supporting_document_models as invoice_supporting_document_models,
+)
 from src.models import match_run_models as match_run_models
 from src.models import notification_models as notification_models
 from src.models import purchase_order_models as purchase_order_models
@@ -19,6 +22,7 @@ __all__ = [
     "email_models",
     "goods_receipt_models",
     "invoice_models",
+    "invoice_supporting_document_models",
     "match_run_models",
     "notification_models",
     "purchase_order_models",

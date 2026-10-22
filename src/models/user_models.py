@@ -16,6 +16,7 @@ class User(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    name: Mapped[str] = mapped_column(String, nullable=False)
     email: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     role: Mapped[str] = mapped_column(
         ENUM(

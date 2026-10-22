@@ -137,6 +137,7 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
     query.first.return_value = (invoice, document)
     db = MagicMock()
     db.query.return_value = query
+    query.scalar.return_value = 0
     owner_id = uuid.uuid4()
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
@@ -147,6 +148,7 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
         app.dependency_overrides.pop(get_current_user, None)
     assert response.status_code == 200
     assert response.json()["low_confidence_fields"] == ["invoice_no"]
+    assert response.json()["supporting_documents_count"] == 0
 
 
 def test_invoice_list_applies_filters_and_search():

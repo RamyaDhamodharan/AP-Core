@@ -9,6 +9,7 @@ from src.api.rest.routers import (
     email_polling_routers,
     goods_receipt_routers,
     invoice_routers,
+    invoice_supporting_document_routers,
     notification_routers,
     purchase_order_routers,
     vendor_routers,
@@ -31,6 +32,7 @@ app.include_router(document_routers.router)
 app.include_router(email_polling_routers.router)
 app.include_router(document_workflow_routers.router)
 app.include_router(invoice_routers.router)
+app.include_router(invoice_supporting_document_routers.router)
 app.include_router(purchase_order_routers.router)
 if os.getenv("ENABLE_GOODS_RECEIPT", "false").casefold() in {"1", "true", "yes", "on"}:
     app.include_router(goods_receipt_routers.router)
