@@ -291,12 +291,39 @@ def test_first_run_does_not_backfill_by_default(monkeypatch):
     monkeypatch.setenv("IMAP_USER", "ap@test-mail.test")
     monkeypatch.setenv("IMAP_PASSWORD", "local-test-password")
     monkeypatch.setenv("EMAIL_POLL_INITIAL_LOOKBACK_HOURS", "0")
-    result, _ = _poll(
+    result, client = _poll(
         db,
         {1: _mail(), 2: _mail("<two@vendor.test>")},
     )
     assert result["emails"] == 0
     assert _state(db).last_uid == 2
+    assert client.fetch_queries == []
+    assert not _documents(db)
+
+
+def test_first_successful_poll_after_imap_setup_failure_does_not_backfill(
+    monkeypatch,
+):
+    db = FakeDB()
+    monkeypatch.setenv("IMAP_HOST", "")
+    monkeypatch.setenv("IMAP_USER", "ap@test-mail.test")
+    monkeypatch.setenv("IMAP_PASSWORD", "local-test-password")
+    monkeypatch.setenv("EMAIL_POLL_INITIAL_LOOKBACK_HOURS", "0")
+
+    unavailable = email_polling_services.poll_email_messages(db)
+    assert unavailable["failed"] == 1
+    assert _state(db).uidvalidity == 0
+
+    monkeypatch.setenv("IMAP_HOST", "imap.test")
+    result, client = _poll(
+        db,
+        {1: _mail(), 2: _mail("<two@vendor.test>")},
+    )
+
+    assert result["emails"] == 0
+    assert _state(db).uidvalidity == 7
+    assert _state(db).last_uid == 2
+    assert client.fetch_queries == []
     assert not _documents(db)
 
 
@@ -427,6 +454,79 @@ def test_failed_uid_is_retried_and_committed_on_next_poll(polling_setup):
     assert state.last_uid == 1
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
     assert row.attempts == 2
+
+
+def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
+    polling_setup, monkeypatch, caplog
+):
+    import logging
+
+    db, uploads, _ = polling_setup
+    state = _state(db)
+    message = _mail(
+        "<storage-failure@vendor.test>",
+        [("broken.pdf", PDF, "application", "pdf")],
+    )
+    good_pdf = b"%PDF-1.7\n" + b"unique successful mail attachment " * 20
+    good_message = _mail(
+        "<same-batch-success@vendor.test>",
+        [("good.pdf", good_pdf, "application", "pdf")],
+    )
+    real_upload = document_ingest_services.upload_file
+
+    def failing_upload(key, body, content_type):
+        if key.endswith("/broken.pdf"):
+            raise RuntimeError(
+                "MinIO connection failed; IMAP_PASSWORD=local-test-password; "
+                "Authorization: Bearer private-token"
+            )
+        return real_upload(key, body, content_type)
+
+    monkeypatch.setattr(document_ingest_services, "upload_file", failing_upload)
+
+    with caplog.at_level(logging.ERROR, logger=email_polling_services.__name__):
+        for attempt in range(3):
+            result, _ = _poll(db, {1: message, 2: good_message})
+            assert result["failed"] == 1, (
+                attempt,
+                result,
+                [
+                    (row.message_id, row.status, row.attempts)
+                    for row in db.rows
+                    if isinstance(row, EmailMessageRecord)
+                ],
+                state.last_uid,
+            )
+            assert any(
+                document.original_filename == "good.pdf"
+                for document in _documents(db)
+            )
+            if attempt == 0:
+                assert state.last_uid == 0
+                failure = next(
+                    row
+                    for row in reversed(db.rows)
+                    if isinstance(row, AuditLog) and row.action == "email_failed"
+                )
+                assert "RuntimeError" in failure.technical_detail
+                assert "MinIO connection failed" in failure.technical_detail
+                assert "[REDACTED]" in failure.technical_detail
+                assert len(failure.technical_detail) <= 500
+
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "MinIO connection failed" in caplog.text
+    assert "local-test-password" not in caplog.text
+    assert "private-token" not in caplog.text
+    failed = next(
+        row
+        for row in db.rows
+        if isinstance(row, EmailMessageRecord)
+        and row.message_id == "<storage-failure@vendor.test>"
+    )
+    assert failed.attempts == 3
+    assert failed.status == "failed_final"
+    assert state.last_uid == 2
+    assert any(key.endswith("/good.pdf") for key, _, _ in uploads)
 
 
 @pytest.mark.parametrize(

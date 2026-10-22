@@ -24,8 +24,10 @@ from tests.e2e.sample_documents import (
     po_payload,
 )
 
-CORE_URL = os.getenv("E2E_CORE_URL", "http://127.0.0.1:18000")
-AUTH_URL = os.getenv("E2E_AUTH_URL", "http://127.0.0.1:18001")
+CORE_PORT = os.getenv("E2E_CORE_HOST_PORT", "18000")
+AUTH_PORT = os.getenv("E2E_AUTH_HOST_PORT", "18001")
+CORE_URL = os.getenv("E2E_CORE_URL", f"http://127.0.0.1:{CORE_PORT}")
+AUTH_URL = os.getenv("E2E_AUTH_URL", f"http://127.0.0.1:{AUTH_PORT}")
 DB_URL = os.getenv(
     "E2E_DB_URL",
     "postgresql://ap_e2e_user:e2e-only-postgres-password@"
@@ -34,10 +36,16 @@ DB_URL = os.getenv(
 ADMIN_EMAIL = os.getenv("E2E_ADMIN_EMAIL", "admin@localhost")
 TEST_PASSWORD = "e2e-local-user-password-only"
 SMTP_HOST = os.getenv("E2E_SMTP_HOST", "127.0.0.1")
-SMTP_PORT = int(os.getenv("E2E_SMTP_PORT", "13025"))
+SMTP_PORT = int(
+    os.getenv("E2E_SMTP_PORT", os.getenv("E2E_GREENMAIL_SMTP_HOST_PORT", "13025"))
+)
 IMAP_HOST = os.getenv("E2E_IMAP_HOST", "127.0.0.1")
-IMAP_PORT = int(os.getenv("E2E_IMAP_PORT", "13143"))
-MINIO_ENDPOINT = os.getenv("E2E_MINIO_ENDPOINT", "127.0.0.1:19000")
+IMAP_PORT = int(
+    os.getenv("E2E_IMAP_PORT", os.getenv("E2E_GREENMAIL_IMAP_HOST_PORT", "13143"))
+)
+MINIO_ENDPOINT = os.getenv(
+    "E2E_MINIO_ENDPOINT", f"127.0.0.1:{os.getenv('E2E_MINIO_HOST_PORT', '19000')}"
+)
 MINIO_BUCKET = os.getenv("E2E_MINIO_BUCKET", "ap-documents")
 RUN_ID = uuid.uuid4().hex[:10]
 

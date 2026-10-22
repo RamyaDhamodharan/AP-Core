@@ -43,6 +43,46 @@ ATTACHMENT_FORMATS = {
     "image/jpeg": (".jpg", lambda data: data.startswith(b"\xff\xd8\xff")),
     "image/jpg": (".jpg", lambda data: data.startswith(b"\xff\xd8\xff")),
 }
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|"
+    r"imap_password\s*[:=]\s*|"
+    r"(?:password|passwd|token|access_token|refresh_token|secret|api[_-]?key)\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_URL_CREDENTIALS = re.compile(r"(?i)(://[^:/\s]+:)[^@/\s]+(@)")
+
+
+def _sanitize_exception_message(message: str) -> str:
+    message = _SENSITIVE_ASSIGNMENT.sub(r"\1[REDACTED]", str(message))
+    message = _URL_CREDENTIALS.sub(r"\1[REDACTED]\2", message)
+    for name in (
+        "IMAP_PASSWORD",
+        "MINIO_SECRET_KEY",
+        "JWT_SECRET_KEY",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY",
+    ):
+        secret = os.getenv(name, "")
+        if secret and len(secret) >= 4:
+            message = message.replace(secret, "[REDACTED]")
+    return message[:500]
+
+
+def _email_exception_detail(uid: int, exc: Exception) -> str:
+    message = _sanitize_exception_message(str(exc)) or "No exception message"
+    return f"UID {uid}: {type(exc).__name__}: {message}"[:500]
+
+
+def _log_email_exception(uid: int, exc: Exception) -> None:
+    safe_exception = RuntimeError(
+        f"{type(exc).__name__}: "
+        f"{_sanitize_exception_message(str(exc)) or 'No exception message'}"
+    )
+    logger.exception(
+        "Email processing failed for UID %s",
+        uid,
+        exc_info=(RuntimeError, safe_exception, exc.__traceback__),
+    )
 
 
 def _friendly_imap_error(exc: Exception) -> str:
@@ -273,17 +313,24 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
         all_uids = _uid_search(client, "ALL")
         highest_uid = max(all_uids, default=0)
         initial_cutoff = None
-        initial_run = state is None
+        # uidvalidity=0 is the placeholder created when IMAP was unavailable
+        # before the mailbox could be inspected. Treat the next successful
+        # connection as the real first run and establish a baseline checkpoint.
+        initial_run = state is None or state.uidvalidity == 0
 
         max_messages = max(1, int(os.getenv("EMAIL_POLL_MAX_MESSAGES", "25")))
-        if state is None:
-            state = EmailPollState(
-                mailbox=mailbox,
-                folder=folder,
-                uidvalidity=validity,
-                last_uid=highest_uid,
-            )
-            db.add(state)
+        if initial_run:
+            if state is None:
+                state = EmailPollState(
+                    mailbox=mailbox,
+                    folder=folder,
+                    uidvalidity=validity,
+                    last_uid=highest_uid,
+                )
+                db.add(state)
+            else:
+                state.uidvalidity = validity
+                state.last_uid = highest_uid
             lookback_hours = max(
                 0, int(os.getenv("EMAIL_POLL_INITIAL_LOOKBACK_HOURS", "0"))
             )
@@ -349,6 +396,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                 )
             except Exception as exc:
                 db.rollback()
+                _log_email_exception(uid, exc)
                 safe_to_advance = _record_uid_fetch_failure(
                     db, mailbox, folder, uid, counts, exc
                 )
@@ -555,21 +603,17 @@ def _process_uid(
     try:
         status, response = client.uid("fetch", str(uid), "(INTERNALDATE BODY.PEEK[])")
     except Exception as exc:
+        _log_email_exception(uid, exc)
         return _record_uid_fetch_failure(db, mailbox, folder, uid, counts, exc)
     if status != "OK" or not response:
-        return _record_uid_fetch_failure(
-            db, mailbox, folder, uid, counts, RuntimeError("IMAP UID fetch failed")
-        )
+        exc = RuntimeError("IMAP UID fetch failed")
+        _log_email_exception(uid, exc)
+        return _record_uid_fetch_failure(db, mailbox, folder, uid, counts, exc)
     raw = next((item[1] for item in response if isinstance(item, tuple)), None)
     if not isinstance(raw, bytes):
-        return _record_uid_fetch_failure(
-            db,
-            mailbox,
-            folder,
-            uid,
-            counts,
-            RuntimeError("IMAP UID had no message body"),
-        )
+        exc = RuntimeError("IMAP UID had no message body")
+        _log_email_exception(uid, exc)
+        return _record_uid_fetch_failure(db, mailbox, folder, uid, counts, exc)
 
     server_received = _internal_date(response)
     msg, message_id, sender, subject, received, preview = _metadata(raw)
@@ -678,7 +722,10 @@ def _process_uid(
                 object_key=eml_key,
             )
             if result.status != "received" or result.document_id is None:
-                raise RuntimeError("Raw email document could not be persisted")
+                raise RuntimeError(
+                    "Raw email document could not be persisted: "
+                    f"{result.message}"
+                )
             root = db.get(Document, result.document_id)
         if root is None:
             raise RuntimeError("Raw email document was unavailable after commit")
@@ -844,6 +891,7 @@ def _process_uid(
             _dispatch_queued_notifications(db, root.id)
         return not attachment_failure or attempt_no >= MAX_ATTEMPTS
     except Exception as exc:
+        _log_email_exception(uid, exc)
         db.rollback()
         retry_row = db.query(EmailMessage).filter_by(message_id=message_id).first()
         if retry_row is None:
@@ -865,7 +913,7 @@ def _process_uid(
             "Email processing failed",
             result="error",
             entity_id=retry_row.id,
-            detail=f"UID {uid}: {type(exc).__name__}",
+            detail=_email_exception_detail(uid, exc),
         )
         db.commit()
         counts["failed"] += 1
@@ -938,7 +986,7 @@ def _record_uid_fetch_failure(
         "Email could not be fetched",
         result="error",
         entity_id=row.id,
-        detail=f"UID {uid}: {type(exc).__name__}",
+        detail=_email_exception_detail(uid, exc),
     )
     db.commit()
     counts["failed"] += 1

@@ -6,7 +6,11 @@ from celery import Celery
 from celery.schedules import schedule
 
 from src.services.llm_pipeline_services import validate_llm_provider_config
+from src.services.runtime_config_services import (
+    warn_if_container_redis_url_is_localhost,
+)
 
+warn_if_container_redis_url_is_localhost()
 validate_llm_provider_config()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
