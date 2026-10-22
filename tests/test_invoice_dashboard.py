@@ -57,6 +57,7 @@ def _invoice(**overrides):
         "currency": "USD",
         "match_status": "ready_for_review",
         "final_status": None,
+        "workflow_status": "received",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -95,11 +96,40 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "currency": "USD",
             "match_status": "ready_for_review",
             "final_status": None,
+            "workflow_status": "received",
+            "gl_code": None,
+            "confidence": None,
+            "can_resubmit": False,
         }
     ]
     query.offset.assert_called_once_with(20)
     query.limit.assert_called_once_with(10)
     assert db.query.call_count == 2
+
+
+def test_invoice_list_accepts_verification_filters_and_sorting():
+    invoice = _invoice(gl_code="6100", field_confidence={"total": {"confidence": 92}})
+    _db, _count_query, query, teardown = _setup_dashboard(
+        [(invoice, "ABC Supplies", "extracted")], total=1
+    )
+    try:
+        response = client.get(
+            "/api/invoices",
+            params={
+                "workflow_status": "verifying",
+                "bucket": "invoice",
+                "amount_min": "10",
+                "amount_max": "200",
+                "gl_code": "6100",
+                "confidence_min": "85",
+                "sort_by": "days_overdue",
+            },
+        )
+    finally:
+        teardown()
+    assert response.status_code == 200
+    assert query.filter.called
+    assert query.order_by.called
 
 
 def test_overdue_filter_excludes_approved_and_rejected_invoices():

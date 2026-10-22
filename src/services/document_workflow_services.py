@@ -1,3 +1,4 @@
+import os
 import uuid
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
+from src.models.vendor_models import Vendor
 from src.schemas.document_workflow_schemas import (
     InvoiceRecommendation,
     WorkflowCandidate,
@@ -191,19 +193,37 @@ def compare_available_records(
                 )
 
         invoice_tax = _decimal(getattr(invoice, "tax_amount", None))
-        po_tax = _decimal(getattr(purchase_order, "tax_amount", None))
-        if invoice_tax is not None and po_tax is not None:
-            if invoice_tax == po_tax:
-                check("tax", "passed", "Invoice and PO tax amounts match")
+        expected_tax = _decimal(getattr(purchase_order, "tax_amount", None))
+        tax_basis = "PO tax amount"
+        if expected_tax is None:
+            rate = _decimal(getattr(purchase_order, "tax_rate", None))
+            subtotal = _decimal(getattr(purchase_order, "subtotal", None))
+            if rate is None and db is not None and invoice.vendor_id:
+                vendor = db.get(Vendor, invoice.vendor_id)
+                rate = _decimal(getattr(vendor, "default_tax_rate", None))
+                subtotal = _decimal(getattr(invoice, "subtotal", None))
+                tax_basis = "vendor default tax rate"
             else:
-                check(
-                    "tax",
-                    "mismatch",
-                    "Invoice tax amount differs from the PO",
-                    expected=po_tax,
-                    actual=invoice_tax,
-                    difference=invoice_tax - po_tax,
-                )
+                tax_basis = "PO tax rate"
+            if rate is not None and subtotal is not None:
+                expected_tax = subtotal * rate / Decimal(100)
+        try:
+            tax_tolerance = max(
+                Decimal(0), Decimal(os.getenv("INVOICE_TAX_TOLERANCE", "0.01"))
+            )
+        except Exception:
+            tax_tolerance = Decimal("0.01")
+        if invoice_tax is not None and expected_tax is not None:
+            tax_difference = invoice_tax - expected_tax
+            check(
+                "tax",
+                "passed" if abs(tax_difference) <= tax_tolerance else "mismatch",
+                f"Invoice tax compared with {tax_basis} within tolerance "
+                f"{tax_tolerance}",
+                expected=expected_tax,
+                actual=invoice_tax,
+                difference=tax_difference,
+            )
 
         invoice_total = _decimal(invoice.total_amount)
         po_total = _decimal(purchase_order.total_amount)
@@ -559,8 +579,10 @@ def compare_available_records(
                 else:
                     check(
                         "invoice_vs_accepted_quantity",
-                        "not_possible",
-                        "Accepted receipt quantities are unavailable",
+                        "mismatch",
+                        "A goods receipt is missing; billed quantity cannot be "
+                        "verified",
+                        severity="error",
                     )
                 invoice_total = _decimal(invoice.total_amount)
                 line_total_values = [

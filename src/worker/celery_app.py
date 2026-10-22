@@ -20,17 +20,36 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_default_retry_delay=10,
     broker_connection_retry_on_startup=True,
+    task_default_queue="documents",
+    task_routes={
+        "ap.process_document": {"queue": "documents"},
+        "ap.poll_email": {"queue": "email"},
+        "ap.send_notification": {"queue": "email"},
+        "ap.mark_overdue": {"queue": "email"},
+        "ap.run_follow_ups": {"queue": "email"},
+    },
 )
+
+# The documents Compose worker uses this environment value with a prefork pool.
+# Each child process caches its Docling converter/model once in memory.
+WORKER_CONCURRENCY = max(1, int(os.getenv("WORKER_CONCURRENCY", "2")))
+
+celery_app.conf.beat_schedule = {
+    "mark-overdue-invoices-hourly": {
+        "task": "ap.mark_overdue",
+        "schedule": schedule(3600),
+    },
+    "run-follow-ups-every-15-minutes": {
+        "task": "ap.run_follow_ups",
+        "schedule": schedule(900),
+    },
+}
 
 if (
     os.getenv("EMAIL_POLL_ENABLED", "false").lower() == "true"
     and os.getenv("EMAIL_PROVIDER", "imap").lower() == "imap"
 ):
-    celery_app.conf.beat_schedule = {
-        "poll-ap-email": {
-            "task": "ap.poll_email",
-            "schedule": schedule(
-                float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "300"))
-            ),
-        }
+    celery_app.conf.beat_schedule["poll-ap-email"] = {
+        "task": "ap.poll_email",
+        "schedule": schedule(float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "300"))),
     }

@@ -184,6 +184,7 @@ def create_vendor(
     vendor = Vendor(
         name=payload.name,
         tax_id=payload.tax_id,
+        default_tax_rate=payload.default_tax_rate,
         contact_name=payload.contact_name,
         contact_email=(str(payload.contact_email) if payload.contact_email else None),
         contact_phone=payload.contact_phone,

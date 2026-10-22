@@ -15,12 +15,29 @@ InvoiceMatchStatus = Literal[
     "no_match",
 ]
 InvoiceFinalStatus = Literal["approved", "rejected", "on_hold"]
+InvoiceWorkflowStatus = Literal[
+    "received",
+    "reading",
+    "verifying",
+    "matching",
+    "match_approved",
+    "match_issues",
+    "no_match",
+    "approved",
+    "rejected",
+    "on_hold",
+    "paid",
+    "overdue",
+    "resubmitted",
+    "failed",
+]
 
 
 class InvoiceReviewRequest(BaseModel):
     decision: InvoiceFinalStatus
     comment: str | None = None
     reason: str | None = None
+    override_reason: str | None = None
 
 
 class InvoiceReviewResponse(BaseModel):
@@ -42,6 +59,10 @@ class InvoiceDashboardItem(BaseModel):
     currency: str | None
     match_status: InvoiceMatchStatus
     final_status: InvoiceFinalStatus | None
+    workflow_status: InvoiceWorkflowStatus = "received"
+    gl_code: str | None = None
+    confidence: float | None = None
+    can_resubmit: bool = False
 
 
 class InvoiceDashboardResponse(BaseModel):

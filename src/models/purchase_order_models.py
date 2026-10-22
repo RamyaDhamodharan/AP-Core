@@ -61,6 +61,7 @@ class PurchaseOrder(Base):
     currency: Mapped[str] = mapped_column(CHAR(3), nullable=False)
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
     total_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     payment_terms: Mapped[Any | None] = mapped_column(JSONB)
     delivery_details: Mapped[Any | None] = mapped_column(JSONB)

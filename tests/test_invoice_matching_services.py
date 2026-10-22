@@ -15,7 +15,7 @@ def _query(previous=None, max_run=0):
     return query
 
 
-def test_pipeline_match_auto_approves_and_is_idempotent(monkeypatch):
+def test_pipeline_match_sets_match_approved_without_admin_decision(monkeypatch):
     invoice_id = uuid.uuid4()
     run_id = uuid.uuid4()
     invoice = SimpleNamespace(
@@ -45,12 +45,14 @@ def test_pipeline_match_auto_approves_and_is_idempotent(monkeypatch):
         "recommend_invoice_review",
         lambda *_args, **_kwargs: SimpleNamespace(checks=[]),
     )
+    monkeypatch.setattr(matching, "sync_invoice_issues", lambda *_args, **_kwargs: [])
 
     run = matching.run_match_for_invoice(db, invoice_id)
 
     assert run.result == "match_ok"
     assert run.run_no == 1
-    assert invoice.final_status == "approved"
+    assert invoice.final_status is None
+    assert invoice.workflow_status == "match_approved"
     assert invoice.final_by is None
     assert invoice.final_run_id == run_id
 

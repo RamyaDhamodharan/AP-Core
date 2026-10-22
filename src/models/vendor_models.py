@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -7,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     MetaData,
+    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -30,6 +32,7 @@ class Vendor(Base):
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     tax_id: Mapped[str | None] = mapped_column(String(30))
+    default_tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     contact_name: Mapped[str | None] = mapped_column(String(120))
     contact_email: Mapped[str | None] = mapped_column(String(200))

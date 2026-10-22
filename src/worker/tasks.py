@@ -22,31 +22,10 @@ def process_document(self, document_id: str) -> None:
 
 @celery_app.task(name="ap.send_notification", bind=True, max_retries=2)
 def send_notification(self, notification_id: str) -> None:
-    """Send one queued notification and retry transient failures at most twice."""
-    from src.db.session_db import SessionLocal
-    from src.models.notification_models import Notification
-    from src.services.notification_services import send_notification as send
+    """Process one queued notification through the shared email outbox."""
+    from src.worker.dispatch import _send_notification_in_process
 
-    db = SessionLocal()
-    should_retry = False
-    try:
-        notification = db.get(Notification, uuid.UUID(notification_id))
-        if notification is None or notification.status == "sent":
-            return
-        sent = send(notification)
-        db.commit()
-        should_retry = not sent and notification.attempts < 3
-    except Exception as exc:
-        db.rollback()
-        should_retry = True
-        error = exc
-    finally:
-        db.close()
-    if should_retry:
-        raise self.retry(
-            exc=locals().get("error", RuntimeError("SMTP send failed")),
-            countdown=2**self.request.retries,
-        )
+    _send_notification_in_process(uuid.UUID(notification_id))
 
 
 @celery_app.task(name="ap.poll_email", bind=True, max_retries=0)
@@ -58,5 +37,31 @@ def poll_email(self) -> dict:
     db = SessionLocal()
     try:
         return poll_email_with_lock(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="ap.mark_overdue", bind=True, max_retries=0)
+def mark_overdue(self) -> int:
+    """Move approved unpaid invoices past their local due date into overdue."""
+    from src.db.session_db import SessionLocal
+    from src.services.follow_up_services import mark_overdue as mark_overdue_service
+
+    db = SessionLocal()
+    try:
+        return mark_overdue_service(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="ap.run_follow_ups", bind=True, max_retries=0)
+def run_follow_ups(self) -> dict:
+    """Process due internal reminders and create vendor drafts as needed."""
+    from src.db.session_db import SessionLocal
+    from src.services.follow_up_services import run_follow_ups as run_follow_ups_service
+
+    db = SessionLocal()
+    try:
+        return run_follow_ups_service(db)
     finally:
         db.close()

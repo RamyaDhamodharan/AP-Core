@@ -652,6 +652,34 @@ def _process_uid(
         counts["filtered"] += 1
         return True
 
+    # Replies to a sent draft without a bill attachment are conversation events,
+    # not new bill documents. Attachments still use the regular intake path.
+    from src.services.email_draft_services import match_reply, record_vendor_reply
+
+    in_reply_to = str(msg.get("In-Reply-To", "")).strip() or None
+    reply_draft = match_reply(db, subject, in_reply_to)
+    has_bill_attachment = any(
+        part.get_filename()
+        and part.get_content_type().casefold() in ATTACHMENT_FORMATS
+        and bool(part.get_payload(decode=True))
+        for part in msg.walk()
+    )
+    if reply_draft is not None and not has_bill_attachment:
+        record_vendor_reply(
+            db, reply_draft, sender=sender, subject=subject, message_id=message_id
+        )
+        prior.status = "processed"
+        _audit(
+            db,
+            "vendor_replied",
+            "Vendor replied to an email draft",
+            entity_id=prior.id,
+            detail=hashlib.sha256(message_id.encode()).hexdigest()[:16],
+        )
+        db.commit()
+        counts["emails"] += 1
+        return True
+
     try:
         root = (
             db.query(Document)
@@ -691,6 +719,16 @@ def _process_uid(
             detail=hashlib.sha256(message_id.encode()).hexdigest()[:16],
         )
         db.commit()
+        if reply_draft is not None:
+            record_vendor_reply(
+                db,
+                reply_draft,
+                sender=sender,
+                subject=subject,
+                message_id=message_id,
+                document_id=root.id,
+            )
+            db.commit()
         valid = 0
         attachment_failure = False
         accepted_attachment_count = 0

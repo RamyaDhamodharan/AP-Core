@@ -42,6 +42,10 @@ class DocumentAuditEntry(BaseModel):
     message: str | None
     old_value: dict[str, Any] | None
     new_value: dict[str, Any] | None
+    step_name: str | None = None
+    duration_ms: int | None = None
+    input_ref: str | None = None
+    output_summary: dict[str, Any] | None = None
     created_by: uuid.UUID | None
     created_at: datetime
 

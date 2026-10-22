@@ -15,7 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import CHAR, ENUM, UUID
+from sqlalchemy.dialects.postgresql import CHAR, ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.vendor_models import Base
@@ -59,6 +59,9 @@ class Invoice(Base):
         UUID(as_uuid=True),
         ForeignKey("documents.id"),
     )
+    resubmitted_from_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("invoices.id")
+    )
     invoice_no: Mapped[str | None] = mapped_column(String(60))
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_current: Mapped[bool] = mapped_column(
@@ -78,6 +81,10 @@ class Invoice(Base):
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     total_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    field_confidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    gl_code: Mapped[str | None] = mapped_column(String(60))
     po_number_raw: Mapped[str | None] = mapped_column(String(60))
     po_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -109,6 +116,29 @@ class Invoice(Base):
             create_type=False,
         ),
     )
+    workflow_status: Mapped[str] = mapped_column(
+        ENUM(
+            "received",
+            "reading",
+            "verifying",
+            "matching",
+            "match_approved",
+            "match_issues",
+            "no_match",
+            "approved",
+            "rejected",
+            "on_hold",
+            "paid",
+            "overdue",
+            "resubmitted",
+            "failed",
+            name="invoice_workflow_status",
+            schema="core",
+            create_type=False,
+        ),
+        nullable=False,
+        server_default=text("'received'"),
+    )
     final_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("match_runs.id")
     )
@@ -127,6 +157,9 @@ class Invoice(Base):
     final_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
     )
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_method: Mapped[str | None] = mapped_column(String(60))
+    payment_reference: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -157,6 +190,9 @@ class InvoiceLine(Base):
     qty: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
     unit_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
     line_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    field_confidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     po_line_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("po_lines.id")
     )

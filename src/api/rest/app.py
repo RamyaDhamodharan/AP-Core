@@ -4,14 +4,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.rest.routers import (
+    audit_routers,
+    command_center_routers,
     document_routers,
     document_workflow_routers,
+    email_draft_routers,
     email_polling_routers,
+    follow_up_routers,
     goods_receipt_routers,
     invoice_routers,
     invoice_supporting_document_routers,
+    issue_routers,
     notification_routers,
     purchase_order_routers,
+    user_routers,
     vendor_routers,
 )
 
@@ -30,11 +36,17 @@ def health_check():
 app.include_router(vendor_routers.router)
 app.include_router(document_routers.router)
 app.include_router(email_polling_routers.router)
+app.include_router(email_draft_routers.router)
 app.include_router(document_workflow_routers.router)
 app.include_router(invoice_routers.router)
+app.include_router(command_center_routers.router)
+app.include_router(follow_up_routers.router)
+app.include_router(user_routers.router)
+app.include_router(issue_routers.router)
+app.include_router(audit_routers.router)
 app.include_router(invoice_supporting_document_routers.router)
 app.include_router(purchase_order_routers.router)
-if os.getenv("ENABLE_GOODS_RECEIPT", "false").casefold() in {"1", "true", "yes", "on"}:
+if os.getenv("ENABLE_GOODS_RECEIPT", "true").casefold() in {"1", "true", "yes", "on"}:
     app.include_router(goods_receipt_routers.router)
 app.include_router(notification_routers.router)
 

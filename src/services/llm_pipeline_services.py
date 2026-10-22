@@ -21,13 +21,21 @@ _E2E_PAYLOAD_PATTERN = re.compile(
 
 
 def _e2e_mock_enabled() -> bool:
-    """Enable deterministic extraction only in an explicitly marked test app."""
+    """Enable the deterministic stub only in explicitly isolated test/e2e apps."""
     enabled = os.getenv("AP_E2E_MOCK_EXTRACTION", "")
-    if not enabled:
-        return False
-    if enabled != "1" or os.getenv("APP_ENV") != "test":
-        raise RuntimeError("AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1")
-    return True
+    app_env = os.getenv("APP_ENV", "")
+    provider = os.getenv("LLM_PROVIDER", "").casefold()
+    if provider == "stub":
+        if app_env != "e2e":
+            raise RuntimeError("LLM_PROVIDER=stub requires APP_ENV=e2e")
+        return True
+    if enabled:
+        if enabled != "1" or app_env != "test":
+            raise RuntimeError(
+                "AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1"
+            )
+        return True
+    return False
 
 
 def _e2e_payload(raw_text: str) -> dict[str, Any]:
@@ -173,11 +181,17 @@ def _groq_extract(
                         "po_number, gr_number, receipt_date, received_qty, "
                         "accepted_qty, "
                         "rejected_qty, invoice_date, po_date, due_date, "
-                        "currency, subtotal, tax, total, payment_terms, "
+                        "currency, subtotal, tax, tax_rate, total, payment_terms, "
                         "delivery_details, delivery_address, ship_to, "
                         "expected_delivery_date, and line_items with item_code, "
                         "description, qty, unit_price, line_amount "
-                        "when applicable. "
+                        "when applicable. Include field_confidence as an object "
+                        "with a 0-100 confidence and derived=false for vendor, "
+                        "invoice_number, invoice_date, due_date, currency, "
+                        "subtotal, tax, total, order_number, gl_code; include "
+                        "the same confidence object for qty, unit_price, and "
+                        "line_amount inside each line item. If confidence is "
+                        "uncertain, use a lower score. "
                         "Preserve values as they appear in the source."
                     ),
                 },
@@ -243,7 +257,33 @@ def extract_document(
             payload_type = "goods_receipt"
         if payload_type != doc_type:
             raise ValueError("E2E mock type does not match classified document")
-        return {key: value for key, value in payload.items() if key != "document_type"}
+        result = {
+            key: value for key, value in payload.items() if key != "document_type"
+        }
+        if doc_type == "invoice" and "field_confidence" not in result:
+            result["field_confidence"] = {
+                field: {"confidence": 100, "derived": False}
+                for field in (
+                    "vendor",
+                    "invoice_number",
+                    "invoice_date",
+                    "due_date",
+                    "currency",
+                    "subtotal",
+                    "tax",
+                    "total",
+                    "order_number",
+                    "gl_code",
+                )
+            }
+            result["field_confidence"]["line_items"] = [
+                {
+                    field: {"confidence": 100, "derived": False}
+                    for field in ("qty", "unit_price", "line_amount")
+                }
+                for _line in result.get("line_items", [])
+            ]
+        return result
 
     api_key = os.getenv("GROQ_API_KEY", "")
     primary_model = os.getenv("GROQ_MODEL", "")
