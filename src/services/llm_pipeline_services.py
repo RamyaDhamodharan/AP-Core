@@ -20,14 +20,35 @@ _E2E_PAYLOAD_PATTERN = re.compile(
 )
 
 
+def validate_llm_provider_config() -> None:
+    """Reject the local stub outside E2E and require it for E2E deployments."""
+    app_env = os.getenv("APP_ENV", "").casefold()
+    provider = os.getenv("LLM_PROVIDER", "").casefold()
+    if provider == "stub" and app_env != "e2e":
+        raise RuntimeError("LLM_PROVIDER=stub requires APP_ENV=e2e")
+    if app_env == "e2e" and provider != "stub":
+        raise RuntimeError("APP_ENV=e2e requires LLM_PROVIDER=stub")
+
+
+def is_e2e_stub_enabled() -> bool:
+    """Whether deterministic synthetic-document parsing is enabled."""
+    validate_llm_provider_config()
+    return (
+        os.getenv("APP_ENV", "").casefold() == "e2e"
+        and os.getenv("LLM_PROVIDER", "").casefold() == "stub"
+    )
+
+
 def _e2e_mock_enabled() -> bool:
-    """Enable deterministic extraction only in an explicitly marked test app."""
+    """Keep the legacy unit-test hook and add the isolated E2E-only provider."""
     enabled = os.getenv("AP_E2E_MOCK_EXTRACTION", "")
-    if not enabled:
-        return False
-    if enabled != "1" or os.getenv("APP_ENV") != "test":
-        raise RuntimeError("AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1")
-    return True
+    if enabled:
+        if enabled != "1" or os.getenv("APP_ENV") != "test":
+            raise RuntimeError(
+                "AP_E2E_MOCK_EXTRACTION requires APP_ENV=test and value 1"
+            )
+        return True
+    return is_e2e_stub_enabled()
 
 
 def _e2e_payload(raw_text: str) -> dict[str, Any]:

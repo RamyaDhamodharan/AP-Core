@@ -124,3 +124,7 @@ verification is enabled; Microsoft 365 work accounts may require an admin to
 enable authenticated IMAP or app passwords. Never use a production mailbox for
 testing. Configure the interval with `EMAIL_POLL_INTERVAL_SECONDS` (default
 120) and the folder with `IMAP_FOLDER` (default `INBOX`).
+
+## Backend E2E check
+
+From the repository root on Windows, with Docker Desktop and `uv` installed, run `powershell -ExecutionPolicy Bypass -File .\scripts\run_e2e.ps1` (or `make e2e-backend` where Make is installed). The runner starts a separate Compose project with its own PostgreSQL and MinIO volumes, GreenMail for local SMTP/IMAP, and deterministic `LLM_PROVIDER=stub`. It applies both migration sets, seeds an isolated admin account, runs the HTTP/IMAP checks, then removes only that E2E project and its volumes. It does not connect to Gmail or call a paid LLM provider.
