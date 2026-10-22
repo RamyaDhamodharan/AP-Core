@@ -23,6 +23,10 @@ from src.schemas.document_workflow_schemas import (
     WorkflowResult,
 )
 from src.services.document_workflow_services import evaluate_document_workflow
+from src.services.invoice_state_services import (
+    legacy_workflow_status,
+    transition_invoice,
+)
 from src.services.po_matching_services import normalize_value
 from src.services.vendor_resolution_services import resolve_vendor
 
@@ -127,6 +131,10 @@ def decide_document_workflow(
     state, result = _load_result(db, document_id, actor_id)
     old_decision = state.decision
     target = None
+    if payload.action in {"hold", "confirm_candidate", "reject_candidate"} and not (
+        payload.reason or ""
+    ).strip():
+        raise HTTPException(status_code=422, detail="A reason is required")
     rejected_candidate_can_be_replaced = (
         state.decision == "reject_candidate"
         and payload.action == "confirm_candidate"
@@ -178,7 +186,16 @@ def decide_document_workflow(
             )
             if invoice is not None:
                 invoice.po_id = target.id
-                invoice.match_status = "pending"
+                if legacy_workflow_status(invoice) not in {
+                    "approved", "rejected", "on_hold", "paid"
+                }:
+                    transition_invoice(
+                        db,
+                        invoice,
+                        "matching",
+                        changed_by=actor_id,
+                        reason=payload.reason or "Purchase order candidate confirmed",
+                    )
             elif receipt is not None:
                 if receipt.vendor_id != target.vendor_id:
                     raise HTTPException(
@@ -273,7 +290,16 @@ def decide_document_workflow(
                     ),
                 )
             target.po_id = selected_po.id
-            target.match_status = "pending"
+            if legacy_workflow_status(target) not in {
+                "approved", "rejected", "on_hold", "paid"
+            }:
+                transition_invoice(
+                    db,
+                    target,
+                    "matching",
+                    changed_by=actor_id,
+                    reason=payload.reason or "Purchase order candidate confirmed",
+                )
         else:
             raise HTTPException(
                 status_code=422,

@@ -18,7 +18,7 @@ from src.schemas.notification_schemas import (
     NotificationListResponse,
     NotificationStatus,
 )
-from src.services.notification_services import send_notification
+from src.services.email_draft_services import ensure_notification_draft, send_draft
 
 router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
 
@@ -29,14 +29,24 @@ def retry_notification(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    notification = db.get(Notification, notification_id)
+    notification = (
+        db.query(Notification)
+        .filter_by(id=notification_id)
+        .with_for_update()
+        .first()
+    )
     if notification is None:
         raise HTTPException(status_code=404, detail="Notification not found")
     if notification.status == "sent":
         raise HTTPException(
             status_code=409, detail="Notification has already been sent"
         )
-    sent = send_notification(notification)
+    draft = ensure_notification_draft(db, notification)
+    sent = send_draft(db, draft, uuid.UUID(str(current_user["sub"])))
+    notification.attempts = draft.attempts
+    notification.sent_at = draft.sent_at
+    notification.last_error = draft.last_error
+    notification.status = "sent" if draft.status == "sent" else "failed"
     db.commit()
     return {
         "id": str(notification.id),

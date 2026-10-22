@@ -45,6 +45,11 @@ class AuditLog(Base):
         server_default=text("'success'"),
     )
     message: Mapped[str | None] = mapped_column(String(500))
+    reason: Mapped[str | None] = mapped_column(Text)
+    step_name: Mapped[str | None] = mapped_column(String(60))
+    duration_ms: Mapped[int | None] = mapped_column()
+    input_ref: Mapped[str | None] = mapped_column(String(500))
+    output_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     technical_detail: Mapped[str | None] = mapped_column(Text)
     request_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(

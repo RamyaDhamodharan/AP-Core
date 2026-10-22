@@ -25,6 +25,7 @@ def _setup_review(invoice):
     app.dependency_overrides[get_current_user] = lambda: {
         "sub": str(reviewer_id),
         "type": "access",
+        "role": "admin",
     }
 
     def teardown():
@@ -68,7 +69,10 @@ def test_review_invoice_approves_and_audits_decision():
     db.commit.assert_called_once()
 
     audit = next(
-        item for item in db.add.call_args_list[0].args if isinstance(item, AuditLog)
+        item
+        for call in db.add.call_args_list
+        for item in call.args
+        if isinstance(item, AuditLog)
     )
     assert audit.action == "invoice_review_decision"
     assert audit.entity_type == "invoice"
@@ -76,6 +80,7 @@ def test_review_invoice_approves_and_audits_decision():
     assert audit.created_by == reviewer_id
     assert audit.old_value == {
         "final_status": None,
+        "workflow_status": "match_approved",
         "final_by": None,
         "final_at": None,
     }

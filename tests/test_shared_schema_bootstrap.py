@@ -108,3 +108,48 @@ def test_email_message_retry_rows_are_folder_and_uid_scoped():
         "ON core.email_messages(mailbox, folder, uid)"
         in (ROOT / "database" / "001_initial_schema.sql").read_text()
     )
+
+
+def test_email_draft_outbox_schema_is_in_shared_bootstrap():
+    drafts = _table_definition("email_drafts")
+    events = _table_definition("email_draft_events")
+    assert "invoice_id uuid REFERENCES core.invoices(id)" in drafts
+    assert "to_addresses jsonb NOT NULL" in drafts
+    assert "blocked_by_allowlist boolean NOT NULL DEFAULT false" in drafts
+    assert "status IN ('draft','approved','sent','failed','discarded')" in drafts
+    assert "draft_id uuid NOT NULL REFERENCES core.email_drafts(id)" in events
+    assert "'vendor_replied'" in events
+
+
+def test_email_draft_migration_is_reversible_and_idempotent():
+    migration = (
+        ROOT / "alembic" / "versions" / "20261022_0014_email_drafts.py"
+    ).read_text()
+    assert 'down_revision = "20261022_0013"' in migration
+    assert "CREATE TABLE IF NOT EXISTS core.email_drafts" in migration
+    assert "CREATE TABLE IF NOT EXISTS core.email_draft_events" in migration
+    assert "DROP TABLE IF EXISTS core.email_draft_events" in migration
+    assert "DROP TABLE IF EXISTS core.email_drafts" in migration
+
+
+def test_lifecycle_migration_creates_audit_fields_before_confidence_backfill():
+    lifecycle = (
+        ROOT / "alembic" / "versions" / "20261022_0012_invoice_lifecycle_audit.py"
+    ).read_text()
+    confidence = (
+        ROOT
+        / "alembic"
+        / "versions"
+        / "20261022_0013_invoice_verification_confidence.py"
+    ).read_text()
+    assert 'revision = "20261022_0012"' in lifecycle
+    assert 'down_revision = "20261022_0011"' in lifecycle
+    for column in ("reason", "step_name", "duration_ms", "input_ref"):
+        assert f'("{column}",' in lifecycle
+    assert "ADD COLUMN IF NOT EXISTS" in lifecycle
+    assert "DROP COLUMN IF EXISTS" in lifecycle
+    assert "CREATE TABLE IF NOT EXISTS core.invoice_state_history" not in confidence
+    assert confidence.index("ADD COLUMN IF NOT EXISTS") < confidence.index(
+        "INSERT INTO core.invoice_state_history"
+    )
+    assert "INSERT INTO core.invoice_state_history" in confidence

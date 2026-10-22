@@ -1,19 +1,30 @@
+import os
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import func, or_
+from sqlalchemy import Float, cast, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.api.rest.dependencies import get_current_user
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
-from src.models.invoice_models import Invoice
+from src.models.email_draft_models import EmailDraft, EmailDraftEvent
+from src.models.follow_up_models import FollowUp
+from src.models.invoice_issue_models import InvoiceIssue
+from src.models.invoice_models import Invoice, InvoiceLine
+from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.invoice_supporting_document_models import InvoiceSupportingDocument
 from src.models.match_run_models import MatchRun
+from src.models.notification_models import Notification
+from src.models.payment_models import Payment
 from src.models.purchase_order_models import PurchaseOrder
+from src.models.user_models import User
 from src.models.vendor_models import Vendor
 from src.schemas.document_workflow_schemas import InvoiceRecommendation
 from src.schemas.invoice_schemas import (
@@ -23,14 +34,33 @@ from src.schemas.invoice_schemas import (
     InvoiceMatchStatus,
     InvoiceReviewRequest,
     InvoiceReviewResponse,
+    InvoiceWorkflowStatus,
 )
 from src.services.document_workflow_services import (
     recommend_invoice_review,
 )
+from src.services.invoice_confidence_services import (
+    confidence_threshold,
+    requires_verification,
+)
+from src.services.invoice_issue_services import _assignment
 from src.services.invoice_matching_services import run_match_for_invoice
+from src.services.invoice_state_services import (
+    legacy_workflow_status,
+    transition_invoice,
+)
+from src.services.vendor_resolution_services import resolve_vendor
 from src.worker.dispatch import dispatch_queued_notifications
 
 router = APIRouter(prefix="/api/invoices", tags=["Invoices"])
+
+
+def _app_local_today() -> date:
+    try:
+        zone = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Kolkata"))
+    except Exception:
+        zone = ZoneInfo("Asia/Kolkata")
+    return datetime.now(zone).date()
 
 
 def _owner_id(user: dict) -> uuid.UUID:
@@ -133,6 +163,12 @@ def _invoice_dashboard_filters(
     search: str | None,
     review_queue: bool,
     owner_id: uuid.UUID,
+    workflow_status: str | None = None,
+    bucket: str | None = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    gl_code: str | None = None,
+    confidence_min: float | None = None,
 ) -> list:
     filters = [_invoice_owner_filter(owner_id)]
     if match_status:
@@ -141,6 +177,21 @@ def _invoice_dashboard_filters(
         filters.append(Invoice.final_status == final_status)
     if vendor_id:
         filters.append(Invoice.vendor_id == vendor_id)
+    if workflow_status:
+        filters.append(Invoice.workflow_status == workflow_status)
+    if bucket:
+        filters.append(Document.doc_type == bucket)
+    if amount_min is not None:
+        filters.append(Invoice.total_amount >= amount_min)
+    if amount_max is not None:
+        filters.append(Invoice.total_amount <= amount_max)
+    if gl_code:
+        filters.append(Invoice.gl_code == gl_code)
+    if confidence_min is not None:
+        total_confidence = cast(
+            Invoice.field_confidence["total"]["confidence"].as_float(), Float
+        )
+        filters.append(total_confidence >= confidence_min)
     if invoice_date_from:
         filters.append(Invoice.invoice_date >= invoice_date_from)
     if invoice_date_to:
@@ -187,13 +238,19 @@ def _invoice_dashboard_response(
         .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
         .order_by(
-            (
-                Invoice.created_at.desc()
-                if sort_by == "received_date"
-                else Invoice.total_amount.desc()
-                if sort_by == "amount"
-                else Invoice.due_date.asc().nullslast()
-            ),
+            {
+                "received_date": Invoice.created_at.desc(),
+                "date_received": Invoice.created_at.desc(),
+                "amount": Invoice.total_amount.desc().nullslast(),
+                "due_date": Invoice.due_date.asc().nullslast(),
+                "days_overdue": Invoice.due_date.asc().nullslast(),
+                "confidence": cast(
+                    Invoice.field_confidence["total"]["confidence"].as_float(),
+                    Float,
+                )
+                .asc()
+                .nullslast(),
+            }.get(sort_by, Invoice.created_at.desc()),
             Invoice.id,
         )
         .offset((page - 1) * page_size)
@@ -215,6 +272,14 @@ def _invoice_dashboard_response(
                 currency=invoice.currency,
                 match_status=invoice.match_status,
                 final_status=invoice.final_status,
+                workflow_status=getattr(invoice, "workflow_status", "received"),
+                gl_code=getattr(invoice, "gl_code", None),
+                confidence=(
+                    (getattr(invoice, "field_confidence", None) or {})
+                    .get("total", {})
+                    .get("confidence")
+                ),
+                can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
             )
             for invoice, vendor_name, document_status in rows
         ],
@@ -237,6 +302,12 @@ def _dashboard_query_parameters(
     search: str | None,
     review_queue: bool,
     owner_id: uuid.UUID,
+    workflow_status: str | None = None,
+    bucket: str | None = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    gl_code: str | None = None,
+    confidence_min: float | None = None,
 ) -> list:
     if invoice_date_from and invoice_date_to and invoice_date_from > invoice_date_to:
         raise HTTPException(
@@ -258,6 +329,14 @@ def _dashboard_query_parameters(
             status_code=422,
             detail="search must not be blank",
         )
+    if amount_min is not None and amount_max is not None and amount_min > amount_max:
+        raise HTTPException(
+            status_code=422, detail="amount_min must not exceed amount_max"
+        )
+    if confidence_min is not None and not 0 <= confidence_min <= 100:
+        raise HTTPException(
+            status_code=422, detail="confidence_min must be from 0 to 100"
+        )
 
     return _invoice_dashboard_filters(
         match_status=match_status,
@@ -271,6 +350,12 @@ def _dashboard_query_parameters(
         search=search,
         review_queue=review_queue,
         owner_id=owner_id,
+        workflow_status=workflow_status,
+        bucket=bucket,
+        amount_min=amount_min,
+        amount_max=amount_max,
+        gl_code=gl_code,
+        confidence_min=confidence_min,
     )
 
 
@@ -293,8 +378,17 @@ def list_invoices(
     owner_user_id: uuid.UUID | None = None,
     overdue: bool = False,
     sort_by: Annotated[
-        str, Query(pattern="^(received_date|amount|due_date)$")
-    ] = "received_date",
+        str,
+        Query(
+            pattern="^(received_date|date_received|amount|due_date|days_overdue|confidence)$"
+        ),
+    ] = "date_received",
+    workflow_status: InvoiceWorkflowStatus | None = None,
+    bucket: Annotated[str | None, Query(max_length=40)] = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    gl_code: Annotated[str | None, Query(max_length=60)] = None,
+    confidence_min: Annotated[float | None, Query(ge=0, le=100)] = None,
     search: Annotated[str | None, Query(max_length=200)] = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -311,13 +405,19 @@ def list_invoices(
         search=search,
         review_queue=False,
         owner_id=_owner_id(current_user),
+        workflow_status=workflow_status,
+        bucket=bucket,
+        amount_min=amount_min,
+        amount_max=amount_max,
+        gl_code=gl_code,
+        confidence_min=confidence_min,
     )
     if owner_user_id:
         filters.append(Invoice.owner_user_id == owner_user_id)
     if overdue:
         filters.extend(
             [
-                Invoice.due_date < date.today(),
+                Invoice.due_date < _app_local_today(),
                 or_(
                     Invoice.final_status.is_(None),
                     Invoice.final_status.notin_(["approved", "rejected"]),
@@ -331,6 +431,307 @@ def list_invoices(
         filters=filters,
         sort_by=sort_by,
     )
+
+
+@router.get("/{invoice_id:uuid}/verification")
+def get_invoice_verification(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    owner_id = _owner_id(current_user)
+    invoice = (
+        db.query(Invoice)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
+        .filter(Invoice.id == invoice_id, _invoice_owner_filter(owner_id))
+        .first()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    confidence = getattr(invoice, "field_confidence", None) or {}
+    values = {
+        "vendor": invoice.vendor_name_raw,
+        "invoice_number": invoice.invoice_no,
+        "invoice_date": invoice.invoice_date,
+        "due_date": invoice.due_date,
+        "currency": invoice.currency,
+        "subtotal": invoice.subtotal,
+        "tax": invoice.tax_amount,
+        "total": invoice.total_amount,
+        "order_number": invoice.po_number_raw,
+        "gl_code": getattr(invoice, "gl_code", None),
+    }
+    lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
+    gl_codes = {
+        code.strip().casefold()
+        for code in os.getenv("GL_CODE_LIST", "").split(",")
+        if code.strip()
+    }
+    return {
+        "invoice_id": str(invoice.id),
+        "fields": {
+            key: {
+                "value": value.isoformat() if hasattr(value, "isoformat") else value,
+                **(confidence.get(key) or {"confidence": 0, "derived": True}),
+            }
+            for key, value in values.items()
+        },
+        "line_items": [
+            {
+                "id": str(line.id),
+                "qty": line.qty,
+                "unit_price": line.unit_price,
+                "line_amount": line.line_amount,
+                "confidence": line.field_confidence or {},
+            }
+            for line in lines
+        ],
+        "needs_verification": requires_verification(confidence),
+        "threshold": confidence_threshold(),
+        "gl_code_warning": (
+            f"Unknown GL code: {invoice.gl_code}"
+            if gl_codes
+            and invoice.gl_code
+            and invoice.gl_code.casefold() not in gl_codes
+            else None
+        ),
+    }
+
+
+@router.post("/{invoice_id:uuid}/verify")
+def verify_invoice_fields(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    actor_id = _owner_id(current_user)
+    invoice = (
+        db.query(Invoice)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
+        .filter(Invoice.id == invoice_id, _invoice_owner_filter(actor_id))
+        .with_for_update()
+        .first()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if legacy_workflow_status(invoice) not in {"verifying", "rejected"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Invoice is not waiting for field verification",
+        )
+    fields = payload.get(
+        "confirmed_values",
+        payload.get("values", payload.get("fields", payload.get("edits", {}))),
+    )
+    if not isinstance(fields, dict):
+        raise HTTPException(status_code=422, detail="values must be an object")
+    reason = str(payload.get("reason") or "").strip()
+    if fields and not reason:
+        raise HTTPException(status_code=422, detail="A reason is required for edits")
+    allowed = {
+        "vendor",
+        "invoice_number",
+        "invoice_date",
+        "due_date",
+        "currency",
+        "subtotal",
+        "tax",
+        "total",
+        "order_number",
+        "gl_code",
+    }
+    unknown = set(fields) - allowed - {"line_items"}
+    if unknown:
+        raise HTTPException(status_code=422, detail="Unsupported invoice field")
+    line_edits = fields.get("line_items", [])
+    if not isinstance(line_edits, list):
+        raise HTTPException(status_code=422, detail="line_items must be a list")
+    columns = {
+        "invoice_number": "invoice_no",
+        "invoice_date": "invoice_date",
+        "due_date": "due_date",
+        "currency": "currency",
+        "subtotal": "subtotal",
+        "tax": "tax_amount",
+        "total": "total_amount",
+        "order_number": "po_number_raw",
+        "gl_code": "gl_code",
+    }
+    old_workflow = legacy_workflow_status(invoice)
+    for field, value in fields.items():
+        if field == "line_items":
+            continue
+        attr = "vendor_name_raw" if field == "vendor" else columns[field]
+        old_value = getattr(invoice, attr)
+        if field in {"invoice_date", "due_date"} and value:
+            try:
+                value = date.fromisoformat(str(value))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid {field}") from exc
+        elif field in {"subtotal", "tax", "total"} and value is not None:
+            try:
+                value = Decimal(str(value))
+            except InvalidOperation as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid {field}") from exc
+        elif value is not None:
+            value = str(value).strip()
+        setattr(invoice, attr, value)
+        if field == "vendor":
+            vendor = resolve_vendor(db, value)
+            invoice.vendor_id = vendor.id if vendor else None
+        if field == "order_number":
+            po = None
+            if value:
+                po = (
+                    db.query(PurchaseOrder)
+                    .filter(
+                        func.lower(func.trim(PurchaseOrder.po_number))
+                        == str(value).strip().casefold(),
+                        PurchaseOrder.is_current.is_(True),
+                    )
+                    .first()
+                )
+            invoice.po_id = po.id if po else None
+        db.add(
+            AuditLog(
+                action="invoice_field_edited",
+                entity_type="invoice",
+                entity_id=invoice.id,
+                old_value={field: str(old_value) if old_value is not None else None},
+                new_value={
+                    field: str(value) if value is not None else None,
+                    "reason": reason,
+                },
+                result="success",
+                message=f"Invoice {field} verified or edited",
+                created_by=actor_id,
+            )
+        )
+    confidence = dict(invoice.field_confidence or {})
+    for key, item in confidence.items():
+        if key == "line_items":
+            confidence[key] = [
+                {name: {"confidence": 100, "derived": False} for name in entry}
+                for entry in item
+            ]
+        elif isinstance(item, dict):
+            confidence[key] = {"confidence": 100, "derived": False}
+    invoice.field_confidence = confidence
+    lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
+    for line_edit in line_edits:
+        if not isinstance(line_edit, dict):
+            raise HTTPException(
+                status_code=422, detail="Each line edit must be an object"
+            )
+        if set(line_edit) - {"id", "qty", "unit_price", "line_amount"}:
+            raise HTTPException(
+                status_code=422, detail="Unsupported invoice line field"
+            )
+        line = next(
+            (item for item in lines if str(item.id) == str(line_edit.get("id"))),
+            None,
+        )
+        if line is None:
+            raise HTTPException(status_code=404, detail="Invoice line not found")
+        for field in ("qty", "unit_price", "line_amount"):
+            if field not in line_edit:
+                continue
+            old_value = getattr(line, field)
+            try:
+                new_value = Decimal(str(line_edit[field]))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid {field}") from exc
+            setattr(line, field, new_value)
+            db.add(
+                AuditLog(
+                    action="invoice_line_field_edited",
+                    entity_type="invoice",
+                    entity_id=invoice.id,
+                    old_value={"line_id": str(line.id), field: str(old_value)},
+                    new_value={
+                        "line_id": str(line.id),
+                        field: str(new_value),
+                        "reason": reason,
+                    },
+                    result="success",
+                    message=f"Invoice line {field} verified or edited",
+                    created_by=actor_id,
+                )
+            )
+    for line in lines:
+        line.field_confidence = {
+            field: {"confidence": 100, "derived": False}
+            for field in (
+                line.field_confidence
+                or {"qty": {}, "unit_price": {}, "line_amount": {}}
+            )
+        }
+    if old_workflow == "rejected":
+        transition_invoice(
+            db,
+            invoice,
+            "resubmitted",
+            changed_by=actor_id,
+            reason=reason or "Associate reopened no-match invoice",
+        )
+    if legacy_workflow_status(invoice) != "matching":
+        transition_invoice(
+            db,
+            invoice,
+            "matching",
+            changed_by=actor_id,
+            reason=reason or "Associate verified invoice fields",
+        )
+    if invoice.po_id and invoice.vendor_id:
+        run_match_for_invoice(db, invoice.id, actor_id)
+    else:
+        transition_invoice(
+            db,
+            invoice,
+            "no_match",
+            changed_by=actor_id,
+            reason="No Match: vendor or purchase order is missing",
+        )
+        transition_invoice(
+            db,
+            invoice,
+            "rejected",
+            changed_by=actor_id,
+            reason="No Match: vendor or purchase order is missing",
+        )
+        if invoice.source_document_id:
+            sender = (
+                db.query(Document.email_sender)
+                .filter(Document.id == invoice.source_document_id)
+                .scalar()
+            )
+            allowed_senders = {
+                item.strip().casefold()
+                for item in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
+                if item.strip()
+            }
+            if sender and sender.casefold() in allowed_senders:
+                db.add(
+                    Notification(
+                        document_id=invoice.source_document_id,
+                        recipient_email=sender,
+                        subject="Invoice needs attention",
+                        body=(
+                            "No Match: add a valid vendor and purchase order, "
+                            "then reopen."
+                        ),
+                        status="queued",
+                    )
+                )
+    db.commit()
+    if invoice.source_document_id:
+        dispatch_queued_notifications(db, invoice.source_document_id)
+    return {
+        "invoice_id": str(invoice.id),
+        "workflow_status": invoice.workflow_status,
+        "needs_verification": False,
+    }
 
 
 @router.get("/{invoice_id:uuid}")
@@ -350,7 +751,9 @@ def get_invoice_detail(
         raise HTTPException(status_code=404, detail="Invoice not found")
     invoice, document = row
     extracted = getattr(document, "extracted_json", None) or {}
-    confidence = extracted.get("field_confidence", extracted.get("confidence", {}))
+    confidence = getattr(invoice, "field_confidence", None) or extracted.get(
+        "field_confidence", extracted.get("confidence", {})
+    )
     confidence = confidence if isinstance(confidence, dict) else {}
     low_confidence_fields = []
     normalized_confidence = {}
@@ -361,7 +764,7 @@ def get_invoice_detail(
         except (TypeError, ValueError):
             continue
         normalized_confidence[field] = value
-        if value < 85:
+        if value < confidence_threshold():
             low_confidence_fields.append(field)
     return {
         "invoice_id": str(invoice.id),
@@ -376,9 +779,16 @@ def get_invoice_detail(
         "total_amount": invoice.total_amount,
         "po_id": str(invoice.po_id) if invoice.po_id else None,
         "po_number_raw": invoice.po_number_raw,
+        "gl_code": getattr(invoice, "gl_code", None),
         "match_status": invoice.match_status,
         "final_status": invoice.final_status,
+        "workflow_status": getattr(invoice, "workflow_status", "received"),
         "confidence": normalized_confidence,
+        "field_confidence": getattr(invoice, "field_confidence", None)
+        or normalized_confidence,
+        "needs_verification": requires_verification(
+            getattr(invoice, "field_confidence", None) or {}
+        ),
         "low_confidence_fields": low_confidence_fields,
         "supporting_documents_count": (
             db.query(func.count(InvoiceSupportingDocument.id))
@@ -458,9 +868,27 @@ def review_invoice(
             detail="Invoice not found",
         )
 
+    open_issues = 0
+    if payload.decision == "approved":
+        open_issues = (
+            db.query(InvoiceIssue)
+            .filter(
+                InvoiceIssue.invoice_id == invoice.id,
+                InvoiceIssue.status.in_(
+                    {"open", "in_progress", "waiting_vendor", "escalated"}
+                ),
+            )
+            .count()
+        )
+        if not isinstance(open_issues, int):
+            open_issues = 0
+    has_issue_override = open_issues > 0 and bool(
+        (payload.override_reason or "").strip()
+    )
     if (
         payload.decision == "approved"
         and invoice.match_status in _UNRESOLVED_MATCH_STATUSES
+        and not has_issue_override
     ):
         raise HTTPException(
             status_code=409,
@@ -468,6 +896,29 @@ def review_invoice(
         )
 
     if payload.decision == "approved":
+        if open_issues and not (payload.override_reason or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Invoice has open issues. Resolve them or provide override_reason."
+                ),
+            )
+        if open_issues:
+            db.add(
+                AuditLog(
+                    action="invoice_issue_override",
+                    entity_type="invoice",
+                    entity_id=invoice.id,
+                    old_value={"open_issue_count": open_issues},
+                    new_value={"override_reason": payload.override_reason.strip()},
+                    reason=payload.override_reason.strip(),
+                    result="warning",
+                    message="Approval proceeded with open issue override",
+                    created_by=reviewer_id,
+                )
+            )
+
+    if payload.decision == "approved" and not has_issue_override:
         recommendation = recommend_invoice_review(db, invoice, owner_id=reviewer_id)
         if any(
             check.outcome != "passed" and check.severity == "error"
@@ -484,13 +935,23 @@ def review_invoice(
     ):
         raise HTTPException(status_code=422, detail="A reason is required")
 
+    old_workflow_status = getattr(
+        invoice, "workflow_status", None
+    ) or legacy_workflow_status(invoice)
     old_value = {
         "final_status": invoice.final_status,
+        "workflow_status": old_workflow_status,
         "final_by": str(invoice.final_by) if invoice.final_by else None,
         "final_at": (invoice.final_at.isoformat() if invoice.final_at else None),
     }
     decided_at = datetime.now(UTC)
-    invoice.final_status = payload.decision
+    transition_invoice(
+        db,
+        invoice,
+        payload.decision,
+        changed_by=reviewer_id,
+        reason=payload.reason or payload.comment,
+    )
     invoice.final_by = reviewer_id
     invoice.final_at = decided_at
 
@@ -502,12 +963,13 @@ def review_invoice(
             old_value=old_value,
             new_value={
                 "final_status": payload.decision,
+                "workflow_status": payload.decision,
+                "reason": payload.reason or payload.comment,
                 "final_by": str(reviewer_id),
                 "final_at": decided_at.isoformat(),
             },
             message=f"Invoice {payload.decision} by reviewer {reviewer_id}",
             result="success",
-            technical_detail=payload.comment or payload.reason,
             created_by=reviewer_id,
         )
     )
@@ -537,7 +999,9 @@ def approve_invoice(
     return review_invoice(
         invoice_id,
         InvoiceReviewRequest(
-            decision="approved", comment=(payload or {}).get("comment")
+            decision="approved",
+            comment=(payload or {}).get("comment"),
+            override_reason=(payload or {}).get("override_reason"),
         ),
         db,
         current_user,
@@ -574,6 +1038,158 @@ def hold_invoice(
     )
 
 
+@router.post("/{invoice_id}/resubmit")
+def resubmit_invoice(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    actor_id = _owner_id(current_user)
+    old = db.query(Invoice).filter(Invoice.id == invoice_id).with_for_update().first()
+    if old is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if old.workflow_status != "rejected":
+        raise HTTPException(
+            status_code=409, detail="Only rejected invoices can be resubmitted"
+        )
+    prior_rejection = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.entity_type == "invoice",
+            AuditLog.entity_id == old.id,
+            AuditLog.action == "invoice_review_decision",
+        )
+        .order_by(AuditLog.created_at.desc())
+        .first()
+    )
+    reason = (
+        (prior_rejection.new_value or {}).get("reason")
+        if prior_rejection and prior_rejection.new_value
+        else None
+    )
+    allowed = {
+        "invoice_no",
+        "vendor_name_raw",
+        "invoice_date",
+        "due_date",
+        "currency",
+        "subtotal",
+        "tax_amount",
+        "total_amount",
+        "gl_code",
+        "po_number_raw",
+        "vendor_id",
+        "po_id",
+        "field_confidence",
+    }
+    bad_fields = set(payload) - allowed
+    if bad_fields:
+        raise HTTPException(
+            status_code=422, detail="Unsupported corrected invoice fields"
+        )
+    old.is_current = False
+    new = Invoice(
+        source_document_id=old.source_document_id,
+        resubmitted_from_id=old.id,
+        invoice_no=old.invoice_no,
+        version_no=old.version_no + 1,
+        is_current=True,
+        vendor_id=old.vendor_id,
+        vendor_name_raw=old.vendor_name_raw,
+        vendor_tax_id_raw=old.vendor_tax_id_raw,
+        invoice_date=old.invoice_date,
+        due_date=old.due_date,
+        currency=old.currency,
+        subtotal=old.subtotal,
+        tax_amount=old.tax_amount,
+        total_amount=old.total_amount,
+        field_confidence=old.field_confidence or {},
+        gl_code=old.gl_code,
+        po_number_raw=old.po_number_raw,
+        po_id=old.po_id,
+        match_status="pending",
+        final_status=None,
+        workflow_status="rejected",
+        owner_user_id=old.owner_user_id or _assignment(db),
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    for key, value in payload.items():
+        setattr(new, key, value)
+    db.add(new)
+    db.flush()
+    from src.models.invoice_models import InvoiceLine
+
+    lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == old.id).all()
+    for line in lines:
+        db.add(
+            InvoiceLine(
+                invoice_id=new.id,
+                item_code=line.item_code,
+                description=line.description,
+                uom=line.uom,
+                qty=line.qty,
+                unit_price=line.unit_price,
+                line_amount=line.line_amount,
+                field_confidence=line.field_confidence or {},
+            )
+        )
+    transition_invoice(
+        db,
+        new,
+        "resubmitted",
+        changed_by=actor_id,
+        reason=(
+            f"Corrected version of rejected invoice {old.id}; "
+            f"rejection: {reason or 'unspecified'}"
+        ),
+    )
+    transition_invoice(
+        db,
+        new,
+        "matching",
+        changed_by=actor_id,
+        reason="Start matching corrected invoice version",
+    )
+    db.add(
+        AuditLog(
+            action="invoice_resubmitted",
+            entity_type="invoice",
+            entity_id=new.id,
+            old_value={
+                "invoice_id": str(old.id),
+                "version_no": old.version_no,
+                "rejection_reason": reason,
+            },
+            new_value={
+                "invoice_id": str(new.id),
+                "version_no": new.version_no,
+                "is_current": True,
+            },
+            reason=reason,
+            result="success",
+            message="Rejected invoice resubmitted as a new version",
+            created_by=actor_id,
+        )
+    )
+    try:
+        run_match_for_invoice(db, new.id, actor_id)
+        db.commit()
+        db.refresh(new)
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "invoice_id": new.id,
+        "previous_invoice_id": old.id,
+        "version_no": new.version_no,
+        "workflow_status": new.workflow_status,
+        "can_resubmit": False,
+        "rejection_reason": reason,
+    }
+
+
 @router.get("/{invoice_id}/match-runs")
 def list_match_runs(
     invoice_id: uuid.UUID,
@@ -598,12 +1214,445 @@ def invoice_timeline(
 ):
     if db.get(Invoice, invoice_id) is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return (
-        db.query(AuditLog)
-        .filter(AuditLog.entity_type == "invoice", AuditLog.entity_id == invoice_id)
-        .order_by(AuditLog.created_at)
+    invoice = db.get(Invoice, invoice_id)
+    audit_filter = (AuditLog.entity_type == "invoice") & (
+        AuditLog.entity_id == invoice_id
+    )
+    if invoice.source_document_id:
+        audit_filter = audit_filter | (
+            (AuditLog.entity_type == "document")
+            & (AuditLog.entity_id == invoice.source_document_id)
+        )
+    audit_items = db.query(AuditLog).filter(audit_filter).all()
+    states = db.query(InvoiceStateHistory).filter_by(invoice_id=invoice_id).all()
+    draft_events = (
+        db.query(EmailDraftEvent)
+        .join(EmailDraft, EmailDraft.id == EmailDraftEvent.draft_id)
+        .filter(EmailDraft.invoice_id == invoice_id)
         .all()
     )
+    entries = [
+        {
+            "kind": "audit",
+            **{
+                key: getattr(item, key)
+                for key in (
+                    "id",
+                    "action",
+                    "entity_type",
+                    "entity_id",
+                    "old_value",
+                    "new_value",
+                    "result",
+                    "message",
+                    "created_by",
+                    "created_at",
+                    "step_name",
+                    "duration_ms",
+                    "input_ref",
+                    "output_summary",
+                )
+            },
+        }
+        for item in audit_items
+    ]
+    entries.extend(
+        {
+            "kind": "state_change",
+            "id": item.id,
+            "entity_type": "invoice",
+            "entity_id": item.invoice_id,
+            "action": "invoice_state_changed",
+            "old_value": {"workflow_status": item.from_status},
+            "new_value": {"workflow_status": item.to_status, "reason": item.reason},
+            "result": "success",
+            "message": item.reason,
+            "created_by": item.changed_by,
+            "created_at": item.created_at,
+        }
+        for item in states
+    )
+    entries.extend(
+        {
+            "kind": "email",
+            "id": item.id,
+            "entity_type": "invoice",
+            "entity_id": invoice_id,
+            "action": f"email_{item.event_type}",
+            "old_value": item.old_value,
+            "new_value": {"draft_id": item.draft_id, **(item.new_value or {})},
+            "result": "success" if item.event_type != "failed" else "error",
+            "message": f"Outbound email {item.event_type.replace('_', ' ')}",
+            "created_by": item.user_id,
+            "created_at": item.created_at,
+        }
+        for item in draft_events
+    )
+    return sorted(entries, key=lambda item: item["created_at"])
+
+
+@router.get("/{invoice_id}/state-history")
+def invoice_state_history(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    if db.get(Invoice, invoice_id) is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return (
+        db.query(InvoiceStateHistory)
+        .filter_by(invoice_id=invoice_id)
+        .order_by(InvoiceStateHistory.created_at.asc())
+        .all()
+    )
+
+
+@router.post("/{invoice_id}/pay", summary="Mark as paid")
+def record_invoice_payment(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    from datetime import date as date_type
+
+    paid_date_value = payload.get("paid_date")
+    try:
+        paid_date = (
+            paid_date_value
+            if isinstance(paid_date_value, date_type)
+            else date_type.fromisoformat(str(paid_date_value))
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail="A valid paid_date is required"
+        ) from exc
+    method = str(payload.get("method") or "").strip().casefold()
+    if method not in {"bank_transfer", "cheque", "upi", "cash", "other"}:
+        raise HTTPException(status_code=422, detail="Choose a valid payment method")
+    reference = str(payload.get("reference") or "").strip()
+    if not reference:
+        raise HTTPException(status_code=422, detail="Payment reference is required")
+    invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if getattr(invoice, "workflow_status", None) == "paid":
+        raise HTTPException(
+            status_code=409, detail="Invoice payment has already been recorded"
+        )
+    if (
+        getattr(invoice, "workflow_status", None) not in {"approved", "overdue"}
+        or getattr(invoice, "final_status", None) != "approved"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Only an approved, ready-to-pay invoice can be marked as paid",
+        )
+    if invoice.total_amount is None or Decimal(invoice.total_amount) <= 0:
+        raise HTTPException(status_code=409, detail="Invoice has no payable amount")
+    user_id = _owner_id(current_user)
+    paid_at = datetime.combine(paid_date, datetime.min.time(), tzinfo=UTC)
+    payment = Payment(
+        invoice_id=invoice.id,
+        amount=invoice.total_amount,
+        paid_date=paid_date,
+        method=method,
+        reference=reference[:200],
+        recorded_by=user_id,
+        note=str(payload.get("note") or "").strip() or None,
+    )
+    db.add(payment)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="An active payment is already recorded"
+        ) from exc
+    old = {"workflow_status": invoice.workflow_status, "payment_id": None}
+    # This records an external payment only; it never calls a bank or provider.
+    transition_invoice(
+        db, invoice, "paid", changed_by=user_id, reason="External payment recorded"
+    )
+    invoice.paid_at = paid_at
+    invoice.payment_method = method
+    invoice.payment_reference = reference[:200]
+    invoice.updated_by = user_id
+    db.add(
+        AuditLog(
+            action="invoice_payment_recorded",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value=old,
+            new_value={
+                "workflow_status": "paid",
+                "payment_id": str(payment.id) if payment.id else None,
+                "paid_date": paid_date.isoformat(),
+                "amount": str(payment.amount),
+                "method": method,
+                "reference": reference[:200],
+            },
+            message=(
+                "External payment recorded; no payment was initiated by this system"
+            ),
+            result="success",
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "payment_id": str(payment.id) if payment.id else None,
+        "workflow_status": "paid",
+        "paid_date": paid_date,
+        "amount": payment.amount,
+    }
+
+
+@router.post("/{invoice_id}/pay/void")
+def void_invoice_payment(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422, detail="A reason is required to void a payment"
+        )
+    invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    payment = (
+        db.query(Payment)
+        .filter(Payment.invoice_id == invoice.id, Payment.voided_at.is_(None))
+        .with_for_update()
+        .first()
+    )
+    if payment is None or invoice.workflow_status != "paid":
+        raise HTTPException(status_code=409, detail="No active payment can be voided")
+    user_id = _owner_id(current_user)
+    old = {
+        "payment_id": str(payment.id),
+        "workflow_status": invoice.workflow_status,
+        "paid_date": payment.paid_date.isoformat(),
+        "method": payment.method,
+        "reference": payment.reference,
+    }
+    now = datetime.now(UTC)
+    payment.voided_at = now
+    payment.voided_by = user_id
+    payment.void_reason = reason
+    transition_invoice(db, invoice, "approved", changed_by=user_id, reason=reason)
+    invoice.paid_at = None
+    invoice.payment_method = None
+    invoice.payment_reference = None
+    invoice.updated_by = user_id
+    db.add(
+        AuditLog(
+            action="invoice_payment_voided",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value=old,
+            new_value={
+                "payment_id": str(payment.id),
+                "workflow_status": "approved",
+                "void_reason": reason,
+                "voided_at": now.isoformat(),
+            },
+            reason=reason,
+            result="success",
+            message="Recorded payment voided",
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "payment_id": str(payment.id),
+        "workflow_status": "approved",
+        "voided_at": now,
+        "message": "Payment record voided",
+    }
+
+
+@router.post("/{invoice_id}/release-hold")
+def release_invoice_hold(
+    invoice_id: uuid.UUID,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.workflow_status != "on_hold":
+        raise HTTPException(status_code=409, detail="Invoice is not on hold")
+    user_id = _owner_id(current_user)
+    reason = (
+        str((payload or {}).get("reason") or "").strip() or "Hold released by associate"
+    )
+    old = {"workflow_status": invoice.workflow_status}
+    transition_invoice(db, invoice, "approved", changed_by=user_id, reason=reason)
+    db.add(
+        AuditLog(
+            action="invoice_hold_released",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value=old,
+            new_value={"workflow_status": "approved", "reason": reason},
+            reason=reason,
+            result="success",
+            message="Invoice hold released",
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    return {"invoice_id": str(invoice.id), "workflow_status": "approved"}
+
+
+@router.post("/{invoice_id}/escalate")
+def escalate_invoice(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="A reason is required to escalate")
+    invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    user_id = _owner_id(current_user)
+    allowlist = {
+        value.strip().casefold()
+        for value in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
+        if value.strip()
+    }
+    escalation = os.getenv("ESCALATION_EMAIL", "").strip().casefold()
+    if escalation:
+        recipients = [escalation] if escalation in allowlist else []
+    else:
+        associates = (
+            db.query(User)
+            .filter(
+                User.role == "associate", User.is_active.is_(True), User.id != user_id
+            )
+            .all()
+        )
+        recipients = [
+            user.email for user in associates if user.email.casefold() in allowlist
+        ]
+    for recipient in recipients:
+        if invoice.source_document_id:
+            db.add(
+                Notification(
+                    document_id=invoice.source_document_id,
+                    recipient_email=recipient,
+                    subject=(
+                        "AP internal reminder: Invoice escalated "
+                        f"{invoice.invoice_no or ''}"
+                    ),
+                    body=reason,
+                    status="queued",
+                    created_by=user_id,
+                )
+            )
+    db.add(
+        AuditLog(
+            action="invoice_escalated",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={
+                "owner_user_id": str(invoice.owner_user_id)
+                if invoice.owner_user_id
+                else None
+            },
+            new_value={"reason": reason, "notified": recipients},
+            reason=reason,
+            result="success",
+            message="Invoice escalated for internal review",
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    if invoice.source_document_id:
+        dispatch_queued_notifications(db, invoice.source_document_id)
+    return {"invoice_id": str(invoice.id), "escalated": True, "notified": recipients}
+
+
+@router.post("/{invoice_id}/reassign")
+def reassign_invoice(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="A reason is required to reassign")
+    try:
+        target_id = uuid.UUID(str(payload.get("owner_user_id")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail="A valid owner_user_id is required"
+        ) from exc
+    target = db.get(User, target_id)
+    if target is None or target.role != "associate" or not target.is_active:
+        raise HTTPException(
+            status_code=422, detail="Reassignment target must be an active associate"
+        )
+    invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    user_id = _owner_id(current_user)
+    old_id = invoice.owner_user_id
+    invoice.owner_user_id = target_id
+    invoice.updated_by = user_id
+    now = datetime.now(UTC)
+    followups = (
+        db.query(FollowUp)
+        .filter(
+            FollowUp.entity_type == "invoice",
+            FollowUp.entity_id == invoice.id,
+            FollowUp.stopped_at.is_(None),
+        )
+        .with_for_update()
+        .all()
+    )
+    for followup in followups:
+        followup.stopped_at = now
+        followup.stop_reason = "invoice reassigned"
+        db.add(
+            AuditLog(
+                action="follow_up_stopped",
+                entity_type="follow_up",
+                entity_id=followup.id,
+                old_value={"stopped_at": None},
+                new_value={"stop_reason": followup.stop_reason},
+                reason=reason,
+                result="success",
+                message="Follow-up stopped after reassignment",
+                created_by=user_id,
+            )
+        )
+    db.add(
+        AuditLog(
+            action="invoice_reassigned",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={"owner_user_id": str(old_id) if old_id else None},
+            new_value={"owner_user_id": str(target_id)},
+            reason=reason,
+            result="success",
+            message="Invoice reassigned",
+            created_by=user_id,
+        )
+    )
+    db.commit()
+    return {"invoice_id": str(invoice.id), "owner_user_id": str(target_id)}
 
 
 @router.post("/{invoice_id}/match")
@@ -737,7 +1786,19 @@ def confirm_invoice_po(
         raise HTTPException(status_code=404, detail="Purchase order not found")
     old = str(invoice.po_id) if invoice.po_id else None
     invoice.po_id = po_id
-    invoice.match_status = "pending"
+    if legacy_workflow_status(invoice) not in {
+        "approved",
+        "rejected",
+        "on_hold",
+        "paid",
+    }:
+        transition_invoice(
+            db,
+            invoice,
+            "matching",
+            changed_by=user_id,
+            reason="Purchase order confirmed",
+        )
     db.flush()
     run_match_for_invoice(db, invoice.id, user_id)
     db.add(

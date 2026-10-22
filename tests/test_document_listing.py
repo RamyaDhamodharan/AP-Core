@@ -42,10 +42,8 @@ def test_list_documents_returns_only_authenticated_owner_page():
     count_query = MagicMock()
     count_query.filter.return_value.scalar.return_value = 1
     page_query = MagicMock()
-    page_results = (
-        page_query.filter.return_value.order_by.return_value.offset.return_value
-        .limit.return_value.all
-    )
+    page_window = page_query.filter.return_value.order_by.return_value
+    page_results = page_window.offset.return_value.limit.return_value.all
     page_results.return_value = [document]
     db = MagicMock()
     db.query.side_effect = [count_query, page_query]
@@ -93,13 +91,51 @@ def test_document_list_supports_type_source_status_and_parent_filters():
     assert len(page_query.filter.call_args.args) == 5
 
 
+def test_document_list_accepts_invoice_filters_and_sorting():
+    owner_id = uuid.uuid4()
+    count_query = MagicMock()
+    count_query.outerjoin.return_value = count_query
+    count_query.filter.return_value.scalar.return_value = 0
+    page_query = MagicMock()
+    page_query.outerjoin.return_value = page_query
+    (
+        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
+    ) = []
+    db = MagicMock()
+    db.query.side_effect = [count_query, page_query]
+    _override(owner_id, db)
+    try:
+        response = client.get(
+            "/api/documents",
+            params={
+                "vendor": "Acme",
+                "workflow_status": "verifying",
+                "bucket": "invoice",
+                "due_date_from": "2026-01-01",
+                "due_date_to": "2026-12-31",
+                "amount_min": "1",
+                "amount_max": "1000",
+                "gl_code": "6100",
+                "owner_user_id": str(owner_id),
+                "confidence_min": "85",
+                "sort_by": "confidence",
+            },
+        )
+    finally:
+        _clear_overrides()
+    assert response.status_code == 200
+    assert page_query.filter.called
+    assert page_query.filter.return_value.order_by.called
+
+
 def test_email_parents_are_hidden_by_default_and_can_be_included():
     owner_id = uuid.uuid4()
     count_query = MagicMock()
     count_query.filter.return_value.scalar.return_value = 0
     page_query = MagicMock()
     (
-        page_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
+        page_query.filter.return_value.order_by.return_value.offset.return_value
+        .limit.return_value.all.return_value
     ) = []
     db = MagicMock()
     db.query.side_effect = [count_query, page_query]
@@ -111,7 +147,7 @@ def test_email_parents_are_hidden_by_default_and_can_be_included():
     assert response.status_code == 200
     filters = page_query.filter.call_args.args
     assert len(filters) == 2
-    assert "email_message_id IS NULL" in str(
+    assert "parent_document_id IS NOT NULL" in str(
         filters[-1].compile(dialect=postgresql.dialect())
     )
 

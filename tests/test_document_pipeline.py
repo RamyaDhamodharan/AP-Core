@@ -17,6 +17,15 @@ from src.models.invoice_models import Invoice
 client = TestClient(app)
 
 
+def _assert_no_purchase_order_persisted(db):
+    from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
+
+    assert not any(
+        isinstance(call.args[0], (PurchaseOrder, PurchaseOrderLine))
+        for call in db.add.call_args_list
+    )
+
+
 @pytest.fixture(autouse=True)
 def fake_minio_moves(monkeypatch):
     monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
@@ -62,10 +71,9 @@ def _save_invoice_for_matching(
         existing_invoice
     )
     versions_query = MagicMock()
-    versions_query_result = (
-        versions_query.filter.return_value.order_by.return_value
-        .with_for_update.return_value
-    )
+    versions_query_filtered = versions_query.filter.return_value
+    versions_query_ordered = versions_query_filtered.order_by.return_value
+    versions_query_result = versions_query_ordered.with_for_update.return_value
     versions_query_result.all.return_value = prior_versions or []
     db_version_query = versions_query
     invoice_query_count = 0
@@ -95,6 +103,24 @@ def _save_invoice_for_matching(
             return alias_query
         if model is PurchaseOrder:
             return po_query
+        from src.models.invoice_models import InvoiceLine
+
+        if model is InvoiceLine:
+            return MagicMock()
+        from src.models.invoice_issue_models import InvoiceIssue
+        from src.models.user_models import User
+
+        if model in {
+            InvoiceIssue,
+            User,
+            InvoiceIssue.owner_user_id,
+            Invoice.owner_user_id,
+        }:
+            empty = MagicMock()
+            empty.filter.return_value = empty
+            empty.group_by.return_value = empty
+            empty.all.return_value = []
+            return empty
         raise AssertionError(f"Unexpected queried model: {model}")
 
     db.query.side_effect = query_model
@@ -245,7 +271,7 @@ def test_parse_document_success(monkeypatch):
 
     def auto_match(_db, invoice_id, user_id):
         assert invoice_id == saved_invoice.id
-        saved_invoice.final_status = "approved"
+        saved_invoice.workflow_status = "match_approved"
 
     monkeypatch.setattr(document_routers, "run_match_for_invoice", auto_match)
 
@@ -339,7 +365,7 @@ def test_parse_document_success(monkeypatch):
         "total": 1500,
         "line_items": [],
     }
-    assert saved_invoice.final_status == "approved"
+    assert saved_invoice.final_status is None
 
 
 def test_invoice_matching_sets_po_and_ready_status():
@@ -358,7 +384,7 @@ def test_invoice_matching_sets_po_and_ready_status():
 
     assert invoice.po_id == po.id
     assert invoice.match_status == "ready_for_review"
-    db.add.assert_called_once_with(invoice)
+    assert any(call.args[0] is invoice for call in db.add.call_args_list)
 
 
 def test_invoice_matching_accepts_normalized_canonical_vendor_name():
@@ -531,7 +557,7 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
     db.flush.assert_called_once()
 
 
-def test_rematch_waiting_invoice_flags_amount_mismatch():
+def test_rematch_waiting_invoice_flags_amount_mismatch(monkeypatch):
     po = SimpleNamespace(
         id=uuid.uuid4(),
         po_number="PO-101",
@@ -540,6 +566,7 @@ def test_rematch_waiting_invoice_flags_amount_mismatch():
         total_amount=1500,
     )
     invoice = SimpleNamespace(
+        id=uuid.uuid4(),
         po_number_raw="PO-101",
         is_current=True,
         match_status="waiting_for_po",
@@ -550,6 +577,7 @@ def test_rematch_waiting_invoice_flags_amount_mismatch():
     )
 
     db = MagicMock()
+    monkeypatch.setattr(document_routers, "run_match_for_invoice", lambda *_args: None)
     (
         db.query.return_value.filter.return_value.with_for_update.return_value.all
     ).return_value = [invoice]
@@ -656,8 +684,55 @@ def test_invoice_persistence_creates_next_version_and_demotes_current():
     assert invoice.invoice_no == "INV-101"
     assert prior_historical.is_current is False
     assert prior_current.is_current is False
-    assert db.add.call_count == 1
+    from src.models.audit_models import AuditLog
+
+    added = [call.args[0] for call in db.add.call_args_list]
+    assert sum(isinstance(value, Invoice) for value in added) == 1
+    assert any(isinstance(value, AuditLog) for value in added)
     db.flush.assert_called()
+
+
+def test_invoice_persists_gl_and_field_confidence_for_header_and_lines():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    invoice, db, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=None,
+        extracted_data={
+            "gl_code": "6100",
+            "field_confidence": {
+                "invoice_number": {"confidence": 96, "derived": False},
+                "total": {"confidence": 90, "derived": False},
+            },
+            "line_items": [
+                {"qty": 2, "unit_price": 5, "line_amount": 10},
+            ],
+        },
+    )
+    assert invoice.gl_code == "6100"
+    assert invoice.field_confidence["invoice_number"] == {
+        "confidence": 96.0,
+        "derived": False,
+    }
+    from src.models.invoice_models import InvoiceLine
+
+    line = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], InvoiceLine)
+    )
+    assert line.field_confidence["qty"]["confidence"] == 75
+
+
+def test_historical_invoice_versions_do_not_block_resubmission():
+    vendor = SimpleNamespace(id=uuid.uuid4())
+    historical = SimpleNamespace(version_no=1, is_current=False)
+    invoice, _db, _ = _save_invoice_for_matching(
+        vendor=vendor,
+        purchase_order=None,
+        prior_versions=[historical],
+    )
+    assert invoice.version_no == 2
+    assert invoice.is_current is True
 
 
 def test_identical_current_invoice_is_blocked_as_duplicate():
@@ -777,7 +852,9 @@ def test_invoice_persistence_rerun_updates_current_source_without_new_version():
     assert invoice.version_no == 4
     assert invoice.is_current is True
     assert invoice.invoice_no == "INV-101"
-    db.add.assert_not_called()
+    from src.models.audit_models import AuditLog
+
+    assert any(isinstance(call.args[0], AuditLog) for call in db.add.call_args_list)
     db.version_query.filter.assert_not_called()
 
 
@@ -821,7 +898,13 @@ def test_parse_document_persists_valid_purchase_order(monkeypatch):
     assert response.json()["status"] == "extracted"
     assert document.doc_type == "po"
     assert document.extracted_json == data
-    assert db.add.call_count == 2
+    assert (
+        sum(
+            isinstance(call.args[0], (PurchaseOrder, PurchaseOrderLine))
+            for call in db.add.call_args_list
+        )
+        == 2
+    )
     purchase_order = next(
         record
         for record in (call.args[0] for call in db.add.call_args_list)
@@ -870,7 +953,11 @@ def test_parse_document_resolves_purchase_order_vendor_alias(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["status"] == "extracted"
-    purchase_order = db.add.call_args.args[0]
+    purchase_order = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], PurchaseOrder)
+    )
     assert isinstance(purchase_order, PurchaseOrder)
     assert purchase_order.vendor_id == vendor.id
 
@@ -895,7 +982,7 @@ def test_parse_document_does_not_persist_incomplete_purchase_order(
     assert response.json()["status"] == "needs_vendor_review"
     assert "Missing required field: po_date" in response.json()["validation_issues"]
     assert document.extracted_json == data
-    db.add.assert_not_called()
+    _assert_no_purchase_order_persisted(db)
 
 
 def test_parse_document_flags_duplicate_current_purchase_order(
@@ -926,7 +1013,7 @@ def test_parse_document_flags_duplicate_current_purchase_order(
         for issue in response.json()["validation_issues"]
     )
     assert document.status == "needs_vendor_review"
-    db.add.assert_not_called()
+    _assert_no_purchase_order_persisted(db)
 
 
 def test_parse_document_requires_known_vendor_for_purchase_order(
@@ -953,7 +1040,7 @@ def test_parse_document_requires_known_vendor_for_purchase_order(
         in response.json()["validation_issues"]
     )
     assert document.extracted_json == data
-    db.add.assert_not_called()
+    _assert_no_purchase_order_persisted(db)
 
 
 def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
@@ -983,7 +1070,7 @@ def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
         in response.json()["validation_issues"]
     )
     assert document.status == "needs_vendor_review"
-    db.add.assert_not_called()
+    _assert_no_purchase_order_persisted(db)
 
 
 def test_parse_document_not_found(monkeypatch):

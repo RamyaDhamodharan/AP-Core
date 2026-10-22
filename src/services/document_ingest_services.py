@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks
 from sqlalchemy.exc import IntegrityError
 
+from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.storage.minio_storage import delete_file, upload_file
 from src.worker.dispatch import dispatch_document_processing
@@ -41,6 +43,7 @@ def ingest_file(
     document_id: uuid.UUID | None = None,
 ) -> IngestResult:
     """Persist one file and enqueue document processing after its row commits."""
+    ingest_started = time.perf_counter()
     filename = Path(filename or "upload").name
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
@@ -91,6 +94,20 @@ def ingest_file(
             **(email_meta or {}),
         )
         db.add(document)
+        db.add(
+            AuditLog(
+                action="pipeline_step",
+                entity_type="document",
+                entity_id=document.id,
+                step_name="receive",
+                duration_ms=max(0, int((time.perf_counter() - ingest_started) * 1000)),
+                input_ref=storage_path,
+                output_summary={"filename": filename, "size_bytes": len(content_bytes)},
+                result="success",
+                message="Document received",
+                created_by=user_id,
+            )
+        )
         db.commit()
         db.refresh(document)
     except IntegrityError:

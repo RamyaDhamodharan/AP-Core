@@ -10,6 +10,7 @@ from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
 from src.db.session_db import get_db
+from src.models.document_models import Document
 from src.services import document_ingest_services
 
 client = TestClient(app)
@@ -62,7 +63,7 @@ def test_upload_valid_pdf(monkeypatch):
     assert body["status"] == "received"
     assert "id" in body
 
-    db.add.assert_called_once()
+    assert any(isinstance(call.args[0], Document) for call in db.add.call_args_list)
     db.commit.assert_called_once()
 
 
@@ -119,6 +120,17 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
             return max_query
         if model is Notification:
             return notification_query
+        from src.models.invoice_issue_models import InvoiceIssue
+        from src.models.invoice_models import Invoice
+        from src.models.user_models import User
+
+        if model in {
+            InvoiceIssue,
+            User,
+            InvoiceIssue.owner_user_id,
+            Invoice.owner_user_id,
+        }:
+            return empty_query
         raise AssertionError(f"Unexpected query model: {model}")
 
     db.query.side_effect = query
@@ -225,7 +237,7 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
     assert document.status == "extracted"
     assert len(routed_files) == 1
     assert routed_files[0][1].startswith("invoice/")
-    assert invoice.final_status == "approved"
+    assert invoice.final_status is None
     assert any(
         isinstance(call.args[0], MatchRun) and call.args[0].result == "match_ok"
         for call in db.add.call_args_list
@@ -454,7 +466,11 @@ def test_multi_upload_returns_success_duplicate_and_corrupt_results(monkeypatch)
     query = MagicMock()
     query.filter_by.side_effect = lambda **kwargs: SimpleNamespace(
         first=lambda: next(
-            (d for d in stored if all(getattr(d, k) == v for k, v in kwargs.items())),
+            (
+                d
+                for d in stored
+                if all(getattr(d, k, None) == v for k, v in kwargs.items())
+            ),
             None,
         )
     )
@@ -487,4 +503,32 @@ def test_multi_upload_returns_success_duplicate_and_corrupt_results(monkeypatch)
         "duplicate_blocked",
         "failed",
     ]
+    assert [row["result"] for row in results] == ["accepted", "duplicate", "failed"]
     assert results[0]["document_id"] == results[1]["document_id"]
+
+
+def test_multi_upload_marks_non_bill_result_as_ignored(monkeypatch):
+    from src.services.document_ingest_services import IngestResult
+
+    db = MagicMock()
+    setup_db(monkeypatch, db)
+    document_id = uuid.uuid4()
+    monkeypatch.setattr(
+        document_routers,
+        "ingest_file",
+        lambda *_args, **_kwargs: IngestResult(
+            "other", document_id, "No bill attachment found"
+        ),
+    )
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("notice.pdf", b"pdf bytes", "application/pdf")},
+        )
+    finally:
+        teardown_db()
+
+    result = response.json()["results"][0]
+    assert result["result"] == "ignored non-bill"
+    assert result["status"] == "other"
+    assert result["message"] == "No bill attachment found"

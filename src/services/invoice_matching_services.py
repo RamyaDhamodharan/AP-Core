@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import UTC, datetime
+import time
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -14,6 +14,8 @@ from src.models.match_run_models import MatchRun
 from src.models.notification_models import Notification
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.document_workflow_services import recommend_invoice_review
+from src.services.invoice_issue_services import sync_invoice_issues
+from src.services.invoice_state_services import transition_invoice
 
 
 def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
@@ -38,6 +40,7 @@ def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
                 "subtotal",
                 "tax_amount",
                 "total_amount",
+                "gl_code",
                 "invoice_date",
                 "due_date",
             )
@@ -65,6 +68,7 @@ def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
                 "currency",
                 "subtotal",
                 "tax_amount",
+                "tax_rate",
                 "total_amount",
             )
         }
@@ -95,6 +99,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     if invoice is None:
         return None
 
+    match_started = time.perf_counter()
     fingerprint = _invoice_state_fingerprint(db, invoice)
     previous = (
         db.query(MatchRun)
@@ -105,7 +110,22 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     if previous and (previous.rules_used or {}).get("state_fingerprint") == fingerprint:
         return previous
 
+    po_link_started = time.perf_counter()
     recommendation = recommend_invoice_review(db, invoice, owner_id=user_id)
+    db.add(
+        AuditLog(
+            action="pipeline_step",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            step_name="po_link",
+            duration_ms=max(0, int((time.perf_counter() - po_link_started) * 1000)),
+            input_ref=str(invoice.po_id or invoice.po_number_raw or invoice.id),
+            output_summary={"po_linked": bool(invoice.po_id)},
+            result="success" if invoice.po_id else "warning",
+            message="Purchase order link evaluated",
+            created_by=user_id,
+        )
+    )
     if not invoice.po_id:
         result = "no_match"
     elif any(
@@ -128,6 +148,13 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         for check in recommendation.checks
         if check.outcome in {"mismatch", "not_possible"}
     ]
+    sync_invoice_issues(
+        db,
+        invoice,
+        differences,
+        user_id,
+        getattr(recommendation, "missing_document_types", []),
+    )
     run = MatchRun(
         invoice_id=invoice.id,
         run_no=previous_no + 1,
@@ -143,28 +170,37 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     old = {
         "match_status": invoice.match_status,
         "final_status": invoice.final_status,
+        "workflow_status": getattr(invoice, "workflow_status", None),
         "final_run_id": str(invoice.final_run_id) if invoice.final_run_id else None,
     }
-    invoice.match_status = {
-        "match_ok": "ready_for_review",
+    current_workflow_status = getattr(invoice, "workflow_status", None)
+    workflow_status = {
+        "match_ok": "match_approved",
         "match_issues": "match_issues",
         "no_match": "no_match",
     }[result]
+    if current_workflow_status not in {
+        "approved",
+        "paid",
+        "rejected",
+        "on_hold",
+        workflow_status,
+    }:
+        transition_invoice(
+            db,
+            invoice,
+            workflow_status,
+            changed_by=user_id,
+            reason="Invoice match completed",
+        )
     new = {
         "match_status": invoice.match_status,
         "match_run_id": str(run.id),
         "result": result,
     }
+    invoice.final_run_id = run.id
     if result == "match_ok":
-        invoice.final_status = "approved"
-        invoice.final_run_id = run.id
-        invoice.final_by = user_id
-        invoice.final_at = datetime.now(UTC)
-        new.update(
-            final_status="approved",
-            final_by=str(user_id) if user_id else "system",
-            final_at=invoice.final_at.isoformat(),
-        )
+        new.update(workflow_status=workflow_status)
     db.add(
         AuditLog(
             action="invoice_match_run",
@@ -174,6 +210,20 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
             new_value=new,
             result="success" if result == "match_ok" else "warning",
             message=f"Invoice match completed: {result}",
+            created_by=user_id,
+        )
+    )
+    db.add(
+        AuditLog(
+            action="pipeline_step",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            step_name="match",
+            duration_ms=max(0, int((time.perf_counter() - match_started) * 1000)),
+            input_ref=str(invoice.id),
+            output_summary={"result": result, "differences": len(differences)},
+            result="success" if result == "match_ok" else "warning",
+            message="Invoice match evaluated",
             created_by=user_id,
         )
     )

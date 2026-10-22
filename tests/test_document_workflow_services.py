@@ -408,7 +408,7 @@ def test_invoice_and_po_without_receipt_are_a_partial_comparison():
 
     result = evaluate_document_workflow(session, invoice_doc.id)
 
-    assert result.status == "partial_match"
+    assert result.status == "review_required"
     assert result.missing_document_types == ["goods_receipt"]
     assert result.human_decision_required is True
     assert any(check.name == "unit_price" for check in result.checks)
@@ -613,7 +613,11 @@ def test_invoice_recommendation_reports_missing_receipt_as_partial():
 
     result = recommend_invoice_review(session, invoice, owner_id=owner)
 
-    assert result.matching_status == "partial_match"
+    assert result.matching_status == "review_required"
+    assert any(
+        check.name == "invoice_vs_accepted_quantity" and check.outcome == "mismatch"
+        for check in result.checks
+    )
     assert result.missing_document_types == ["goods_receipt"]
     assert result.human_review_required is True
     assert result.next_recommended_action == (

@@ -598,6 +598,7 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
                 assert "MinIO connection failed" in failure.technical_detail
                 assert "[REDACTED]" in failure.technical_detail
                 assert len(failure.technical_detail) <= 500
+                assert failure.reason == failure.technical_detail
 
     assert "Traceback (most recent call last)" in caplog.text
     assert "MinIO connection failed" in caplog.text

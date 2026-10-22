@@ -11,6 +11,7 @@ CREATE TYPE core.doc_status AS ENUM ('received', 'parsing', 'parsed', 'classifie
 CREATE TYPE core.match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'ready_for_review', 'match_issues', 'no_match');
 CREATE TYPE core.match_result AS ENUM ('match_ok', 'match_issues', 'no_match');
 CREATE TYPE core.review_decision AS ENUM ('approved', 'rejected', 'on_hold');
+CREATE TYPE core.invoice_workflow_status AS ENUM ('received', 'reading', 'verifying', 'matching', 'match_approved', 'match_issues', 'no_match', 'approved', 'rejected', 'on_hold', 'paid', 'overdue', 'resubmitted', 'failed');
 CREATE TYPE core.step_result AS ENUM ('success', 'warning', 'error');
 CREATE TYPE core.notify_status AS ENUM ('queued', 'sent', 'failed');
 CREATE TYPE core.invoice_supporting_document_category AS ENUM (
@@ -52,6 +53,7 @@ CREATE TABLE core.vendors (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name varchar(200) NOT NULL,
   tax_id varchar(30),
+  default_tax_rate numeric(7,4),
   is_active boolean NOT NULL DEFAULT true,
   contact_name varchar(120),
   contact_email varchar(200),
@@ -111,6 +113,7 @@ CREATE TABLE core.purchase_orders (
   currency char(3) NOT NULL,
   subtotal numeric(14,2),
   tax_amount numeric(14,2),
+  tax_rate numeric(7,4),
   total_amount numeric(14,2),
   payment_terms jsonb,
   delivery_details jsonb,
@@ -139,6 +142,7 @@ CREATE TABLE core.po_lines (
 
 CREATE TABLE core.invoices (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  resubmitted_from_id uuid REFERENCES core.invoices(id),
   source_document_id uuid REFERENCES core.documents(id),
   invoice_no varchar(60),
   version_no integer NOT NULL DEFAULT 1,
@@ -152,13 +156,19 @@ CREATE TABLE core.invoices (
   subtotal numeric(14,2),
   tax_amount numeric(14,2),
   total_amount numeric(14,2),
+  field_confidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  gl_code varchar(60),
   po_number_raw varchar(60),
   po_id uuid REFERENCES core.purchase_orders(id),
   match_status core.match_status NOT NULL DEFAULT 'pending',
   final_status core.review_decision,
+  workflow_status core.invoice_workflow_status NOT NULL DEFAULT 'received',
   final_run_id uuid,
   final_by uuid REFERENCES auth.users(id),
   final_at timestamptz,
+  paid_at timestamptz,
+  payment_method varchar(60),
+  payment_reference varchar(200),
   owner_user_id uuid REFERENCES auth.users(id),
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES auth.users(id),
@@ -169,9 +179,18 @@ CREATE TABLE core.invoices (
 CREATE UNIQUE INDEX uq_current_vendor_invoice ON core.invoices(vendor_id, invoice_no)
   WHERE is_current AND vendor_id IS NOT NULL AND invoice_no IS NOT NULL;
 CREATE INDEX ix_invoices_status_date ON core.invoices(match_status, final_status, invoice_date);
+CREATE TABLE core.invoice_state_history (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id uuid NOT NULL REFERENCES core.invoices(id) ON DELETE CASCADE,
+  from_status varchar(30), to_status varchar(30) NOT NULL,
+  changed_by uuid REFERENCES auth.users(id), reason text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_invoice_state_history_timeline ON core.invoice_state_history(invoice_id, created_at);
 CREATE INDEX ix_invoices_due_date ON core.invoices(due_date);
 CREATE INDEX ix_invoices_owner ON core.invoices(owner_user_id);
 CREATE INDEX ix_invoices_po_id ON core.invoices(po_id);
+CREATE INDEX ix_invoices_gl_code ON core.invoices(gl_code);
 
 CREATE TABLE core.invoice_lines (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -182,6 +201,7 @@ CREATE TABLE core.invoice_lines (
   qty numeric(14,3),
   unit_price numeric(14,4),
   line_amount numeric(14,2),
+  field_confidence jsonb NOT NULL DEFAULT '{}'::jsonb,
   po_line_id uuid REFERENCES core.po_lines(id),
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES auth.users(id),
@@ -262,6 +282,11 @@ CREATE TABLE core.audit_log (
   new_value jsonb,
   result core.step_result NOT NULL DEFAULT 'success',
   message varchar(500),
+  reason text,
+  step_name varchar(60),
+  duration_ms integer,
+  input_ref varchar(500),
+  output_summary jsonb,
   technical_detail text,
   request_id varchar(100),
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -338,6 +363,118 @@ CREATE TABLE core.notifications (
   updated_at timestamptz NOT NULL DEFAULT now(),
   updated_by uuid REFERENCES auth.users(id)
 );
+CREATE TABLE core.email_drafts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind varchar(50) NOT NULL,
+  invoice_id uuid REFERENCES core.invoices(id) ON DELETE CASCADE,
+  issue_id uuid,
+  document_id uuid REFERENCES core.documents(id),
+  to_addresses jsonb NOT NULL DEFAULT '[]'::jsonb,
+  cc_addresses jsonb NOT NULL DEFAULT '[]'::jsonb,
+  subject varchar(500) NOT NULL,
+  body text NOT NULL,
+  status varchar(20) NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft','approved','sent','failed','discarded')),
+  blocked_by_allowlist boolean NOT NULL DEFAULT false,
+  created_by uuid REFERENCES auth.users(id),
+  generated_by varchar(20) NOT NULL DEFAULT 'template',
+  edited_by uuid REFERENCES auth.users(id),
+  sent_by uuid REFERENCES auth.users(id),
+  sent_at timestamptz,
+  message_id varchar(500),
+  thread_key varchar(100),
+  last_error varchar(500),
+  attempts integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_email_drafts_invoice_created ON core.email_drafts(invoice_id, created_at);
+CREATE INDEX ix_email_drafts_thread_key ON core.email_drafts(thread_key);
+CREATE TABLE core.email_draft_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  draft_id uuid NOT NULL REFERENCES core.email_drafts(id) ON DELETE CASCADE,
+  event_type varchar(30) NOT NULL CHECK (event_type IN ('created','edited','sent','failed','discarded','vendor_replied')),
+  user_id uuid REFERENCES auth.users(id),
+  old_value jsonb,
+  new_value jsonb,
+  document_id uuid REFERENCES core.documents(id),
+  message_id varchar(500),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.invoice_issues (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id uuid NOT NULL REFERENCES core.invoices(id) ON DELETE CASCADE,
+  issue_type varchar(50) NOT NULL,
+  severity varchar(20) NOT NULL DEFAULT 'warning',
+  description text NOT NULL,
+  expected_value jsonb,
+  actual_value jsonb,
+  status varchar(30) NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','in_progress','waiting_vendor','escalated','resolved','dismissed')),
+  owner_user_id uuid REFERENCES auth.users(id),
+  due_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  resolution_note text
+);
+CREATE UNIQUE INDEX uq_invoice_issue_open_type
+  ON core.invoice_issues(invoice_id, issue_type)
+  WHERE status IN ('open','in_progress','waiting_vendor','escalated');
+CREATE INDEX ix_invoice_issues_status_due ON core.invoice_issues(status, due_at);
+CREATE INDEX ix_invoice_issues_owner_status ON core.invoice_issues(owner_user_id, status);
+ALTER TABLE core.email_drafts
+  ADD CONSTRAINT fk_email_drafts_issue_id
+  FOREIGN KEY (issue_id) REFERENCES core.invoice_issues(id) ON DELETE CASCADE;
+
+CREATE TABLE core.issue_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  issue_id uuid NOT NULL REFERENCES core.invoice_issues(id) ON DELETE CASCADE,
+  event_type varchar(30) NOT NULL CHECK (event_type IN
+    ('created','comment','assigned','reassigned','escalated','vendor_contacted','vendor_replied','status_changed','resolved','dismissed','reopened')),
+  user_id uuid REFERENCES auth.users(id),
+  note text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_issue_events_timeline ON core.issue_events(issue_id, created_at);
+
+CREATE TABLE core.payments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id uuid NOT NULL REFERENCES core.invoices(id) ON DELETE CASCADE,
+  amount numeric(14,2) NOT NULL CHECK (amount >= 0),
+  paid_date date NOT NULL,
+  method varchar(20) NOT NULL CHECK (method IN
+    ('bank_transfer','cheque','upi','cash','other')),
+  reference varchar(200) NOT NULL,
+  recorded_by uuid NOT NULL REFERENCES auth.users(id),
+  note text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  voided_at timestamptz,
+  voided_by uuid REFERENCES auth.users(id),
+  void_reason text
+);
+CREATE UNIQUE INDEX uq_payments_active_invoice
+  ON core.payments(invoice_id) WHERE voided_at IS NULL;
+
+CREATE TABLE core.follow_ups (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type varchar(20) NOT NULL CHECK (entity_type IN ('invoice','issue')),
+  entity_id uuid NOT NULL,
+  kind varchar(40) NOT NULL CHECK (kind IN (
+    'verify_pending','approval_pending','issue_unassigned','issue_waiting_vendor',
+    'overdue','rejected_not_resubmitted','due_soon','on_hold_stale')),
+  recipient varchar(200),
+  attempts integer NOT NULL DEFAULT 0,
+  last_sent_at timestamptz,
+  next_due_at timestamptz NOT NULL,
+  stopped_at timestamptz,
+  stop_reason text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX uq_followups_active_entity_kind
+  ON core.follow_ups(entity_type, entity_id, kind) WHERE stopped_at IS NULL;
+CREATE INDEX ix_follow_ups_due ON core.follow_ups(stopped_at, next_due_at);
+CREATE INDEX ix_email_draft_events_draft_created ON core.email_draft_events(draft_id, created_at);
 CREATE TABLE core.invoice_supporting_documents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   invoice_id uuid NOT NULL REFERENCES core.invoices(id),

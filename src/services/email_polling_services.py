@@ -93,7 +93,9 @@ def _friendly_imap_error(exc: Exception) -> str:
     return IMAP_REACHABILITY_ERROR
 
 
-def _audit(db, action, message, *, result="success", entity_id=None, detail=None):
+def _audit(
+    db, action, message, *, result="success", entity_id=None, detail=None, reason=None
+):
     db.add(
         AuditLog(
             action=action,
@@ -101,6 +103,7 @@ def _audit(db, action, message, *, result="success", entity_id=None, detail=None
             entity_id=entity_id,
             result=result,
             message=message,
+            reason=reason,
             technical_detail=detail,
         )
     )
@@ -267,6 +270,7 @@ def _record_email_failure(db, row, uid: int, counts: dict, exc: Exception) -> bo
         result="error",
         entity_id=row.id,
         detail=detail,
+        reason=detail,
     )
     db.commit()
     counts["failed"] += 1
@@ -862,6 +866,28 @@ def _process_uid(
         counts["filtered"] += 1
         return True
 
+    # Replies to a sent draft without a bill attachment are conversation events,
+    # not new bill documents. Attachments still use the regular intake path.
+    from src.services.email_draft_services import match_reply, record_vendor_reply
+
+    in_reply_to = str(msg.get("In-Reply-To", "")).strip() or None
+    reply_draft = match_reply(db, subject, in_reply_to)
+    if reply_draft is not None and not _has_valid_attachment(msg):
+        record_vendor_reply(
+            db, reply_draft, sender=sender, subject=subject, message_id=message_id
+        )
+        prior.status = "processed"
+        _audit(
+            db,
+            "vendor_replied",
+            "Vendor replied to an email draft",
+            entity_id=prior.id,
+            detail=hashlib.sha256(message_id.encode()).hexdigest()[:16],
+        )
+        db.commit()
+        counts["emails"] += 1
+        return True
+
     if not _has_valid_attachment(msg):
         prior.status = "ignored"
         prior.raw_object_key = None
@@ -921,6 +947,16 @@ def _process_uid(
             detail=hashlib.sha256(message_id.encode()).hexdigest()[:16],
         )
         db.commit()
+        if reply_draft is not None:
+            record_vendor_reply(
+                db,
+                reply_draft,
+                sender=sender,
+                subject=subject,
+                message_id=message_id,
+                document_id=root.id,
+            )
+            db.commit()
         valid = 0
         attachment_failure = False
         accepted_attachment_count = 0

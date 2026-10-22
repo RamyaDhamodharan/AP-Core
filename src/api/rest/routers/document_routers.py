@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -24,7 +25,7 @@ from fastapi import (
     UploadFile,
 )
 from minio.error import S3Error
-from sqlalchemy import func, or_, select
+from sqlalchemy import Float, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -48,8 +49,20 @@ from ....schemas.purchase_order_schemas import (
     PurchaseOrderVendorResolutionRequest,
 )
 from ....services.document_ingest_services import MAX_FILE_SIZE, ingest_file
+from ....services.document_retry_services import (
+    is_transient_document_error,
+    with_transient_retries,
+)
 from ....services.document_workflow_services import refresh_related_workflows
+from ....services.invoice_confidence_services import (
+    normalize_invoice_confidence,
+    requires_verification,
+)
 from ....services.invoice_matching_services import run_match_for_invoice
+from ....services.invoice_state_services import (
+    legacy_workflow_status,
+    transition_invoice,
+)
 from ....services.llm_pipeline_services import (
     _to_decimal,
     classify_document,
@@ -75,6 +88,80 @@ from ....worker.dispatch import (
 
 logger = logging.getLogger(__name__)
 
+
+def _record_pipeline_step(
+    db,
+    document: Document,
+    step_name: str,
+    started_at: float,
+    *,
+    input_ref: str | None = None,
+    output_summary: dict | None = None,
+    result: str = "success",
+) -> None:
+    """Write a compact, non-sensitive audit record for one pipeline step."""
+    db.add(
+        AuditLog(
+            action="pipeline_step",
+            entity_type="document",
+            entity_id=document.id,
+            step_name=step_name,
+            duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+            input_ref=(
+                input_ref or getattr(document, "storage_path", None) or str(document.id)
+            )[:500],
+            output_summary=output_summary or {},
+            result=result,
+            message=f"Document {step_name} step {result}",
+            created_by=getattr(document, "created_by", None),
+        )
+    )
+
+
+def _auto_reject_unmatched_invoice(db, invoice: Invoice, document: Document) -> None:
+    """Reject invoices with no vendor/PO and queue only test-allowlisted mail."""
+    reason = (
+        "No Match: invoice vendor could not be identified. Verify the vendor and "
+        "resubmit."
+        if invoice.vendor_id is None
+        else "No Match: no purchase order was found. Link a purchase order and reopen."
+    )
+    current = legacy_workflow_status(invoice)
+    if current == "rejected":
+        return
+    if current not in {"no_match", "rejected"}:
+        transition_invoice(db, invoice, "no_match", reason=reason)
+    if current != "rejected":
+        transition_invoice(db, invoice, "rejected", reason=reason)
+    db.add(
+        AuditLog(
+            action="invoice_no_match_rejected",
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={"workflow_status": current},
+            new_value={"workflow_status": "rejected", "reason": reason},
+            result="warning",
+            message=reason,
+        )
+    )
+    sender = (getattr(document, "email_sender", None) or "").strip()
+    allowed = {
+        email.strip().casefold()
+        for email in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
+        if email.strip()
+    }
+    if sender and sender.casefold() in allowed:
+        db.add(
+            Notification(
+                document_id=document.id,
+                recipient_email=sender,
+                subject="Invoice needs attention",
+                body=reason,
+                status="queued",
+            )
+        )
+
+
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
@@ -98,10 +185,7 @@ def reclassify_other_document(
         raise HTTPException(status_code=422, detail="Unsupported document type")
     user_id = _document_owner_id(current_user)
     document = (
-        db.query(Document)
-        .filter(Document.id == document_id)
-        .with_for_update()
-        .first()
+        db.query(Document).filter(Document.id == document_id).with_for_update().first()
     )
     if document is None or document.status != "other":
         raise HTTPException(status_code=404, detail="Other document not found")
@@ -173,6 +257,20 @@ def list_documents(
     source: Annotated[str | None, Query(max_length=40)] = None,
     parent_document_id: uuid.UUID | None = None,
     include_parents: bool = False,
+    vendor: Annotated[str | None, Query(max_length=200)] = None,
+    workflow_status: Annotated[str | None, Query(max_length=40)] = None,
+    bucket: Annotated[str | None, Query(max_length=40)] = None,
+    due_date_from: date | None = None,
+    due_date_to: date | None = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    gl_code: Annotated[str | None, Query(max_length=60)] = None,
+    owner_user_id: uuid.UUID | None = None,
+    confidence_min: Annotated[float | None, Query(ge=0, le=100)] = None,
+    sort_by: Annotated[
+        str,
+        Query(pattern="^(due_date|amount|days_overdue|confidence|date_received)$"),
+    ] = "date_received",
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentListResponse:
@@ -188,13 +286,83 @@ def list_documents(
     if parent_document_id:
         filters.append(Document.parent_document_id == parent_document_id)
     if not include_parents:
-        filters.append(Document.email_message_id.is_(None))
+        filters.append(
+            or_(
+                Document.email_message_id.is_(None),
+                Document.parent_document_id.is_not(None),
+            )
+        )
+    if vendor:
+        filters.append(
+            Document.extracted_json["vendor"].astext.ilike(f"%{vendor.strip()}%")
+        )
+    if workflow_status:
+        filters.append(Invoice.workflow_status == workflow_status)
+    if bucket:
+        filters.append(Document.doc_type == bucket)
+    if due_date_from:
+        filters.append(Invoice.due_date >= due_date_from)
+    if due_date_to:
+        filters.append(Invoice.due_date <= due_date_to)
+    if due_date_from and due_date_to and due_date_from > due_date_to:
+        raise HTTPException(
+            status_code=422, detail="due_date_from must not exceed due_date_to"
+        )
+    if amount_min is not None:
+        filters.append(Invoice.total_amount >= amount_min)
+    if amount_max is not None:
+        filters.append(Invoice.total_amount <= amount_max)
+    if amount_min is not None and amount_max is not None and amount_min > amount_max:
+        raise HTTPException(
+            status_code=422, detail="amount_min must not exceed amount_max"
+        )
+    if gl_code:
+        filters.append(Invoice.gl_code == gl_code)
+    if owner_user_id:
+        filters.append(Document.created_by == owner_user_id)
+    if confidence_min is not None:
+        filters.append(
+            cast(Invoice.field_confidence["total"]["confidence"].as_float(), Float)
+            >= confidence_min
+        )
 
-    total = db.query(func.count(Document.id)).filter(*filters).scalar() or 0
+    invoice_join = bool(
+        workflow_status
+        or due_date_from
+        or due_date_to
+        or amount_min is not None
+        or amount_max is not None
+        or gl_code
+        or confidence_min is not None
+        or sort_by != "date_received"
+    )
+    count_query = db.query(func.count(Document.id))
+    page_query = db.query(Document)
+    if invoice_join:
+        count_query = count_query.outerjoin(
+            Invoice, Invoice.source_document_id == Document.id
+        )
+        page_query = page_query.outerjoin(
+            Invoice, Invoice.source_document_id == Document.id
+        )
+    total = count_query.filter(*filters).scalar() or 0
     rows = (
-        db.query(Document)
-        .filter(*filters)
-        .order_by(Document.created_at.desc(), Document.id)
+        page_query.filter(*filters)
+        .order_by(
+            {
+                "due_date": Invoice.due_date.asc().nullslast(),
+                "amount": Invoice.total_amount.desc().nullslast(),
+                "days_overdue": Invoice.due_date.asc().nullslast(),
+                "confidence": cast(
+                    Invoice.field_confidence["total"]["confidence"].as_float(),
+                    Float,
+                )
+                .asc()
+                .nullslast(),
+                "date_received": Document.created_at.desc(),
+            }[sort_by],
+            Document.id,
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
         .all()
@@ -498,6 +666,13 @@ async def upload_document(
                 "filename": filename,
                 "document_id": str(result.document_id) if result.document_id else None,
                 "status": result.status,
+                "result": {
+                    "received": "accepted",
+                    "duplicate_blocked": "duplicate",
+                    "ignored": "ignored non-bill",
+                    "other": "ignored non-bill",
+                    "failed": "failed",
+                }.get(result.status, result.status),
                 "message": result.message,
             }
         )
@@ -529,7 +704,16 @@ def _save_invoice_from_extraction(
     )
 
     vendor_name = str(data.get("vendor") or "").strip() or None
+    vendor_resolution_started = time.perf_counter()
     vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
+    _record_pipeline_step(
+        db,
+        document,
+        "vendor_resolve",
+        vendor_resolution_started,
+        output_summary={"resolved": vendor is not None},
+        result="success" if vendor is not None else "warning",
+    )
 
     invoice_no = str(data.get("invoice_number") or "").strip() or None
 
@@ -589,6 +773,8 @@ def _save_invoice_from_extraction(
         "tax_amount": tax_amount,
         "total_amount": total_amount,
         "po_number_raw": po_number,
+        "gl_code": str(data.get("gl_code") or "").strip()[:60] or None,
+        "field_confidence": normalize_invoice_confidence(data),
         "po_id": po.id if po else None,
         "match_status": match_status,
     }
@@ -597,8 +783,9 @@ def _save_invoice_from_extraction(
         if not source_invoice.is_current:
             return source_invoice
         if not all(
-            getattr(source_invoice, field) == value
+            getattr(source_invoice, field, None) == value
             for field, value in invoice_values.items()
+            if field != "field_confidence"
         ):
             raise ValueError(
                 "Invoice extraction differs from the previously saved record; "
@@ -617,6 +804,7 @@ def _save_invoice_from_extraction(
                     "Invoice line extraction differs from the previously saved "
                     "record; review required"
                 )
+        source_invoice.field_confidence = invoice_values["field_confidence"]
         return source_invoice
 
     version_no = 1
@@ -642,7 +830,7 @@ def _save_invoice_from_extraction(
             if current_version is not None and all(
                 getattr(current_version, field, None) == value
                 for field, value in invoice_values.items()
-                if field != "match_status"
+                if field not in {"match_status", "field_confidence"}
             ):
                 if "line_items" not in data:
                     raise DuplicateInvoiceError(
@@ -670,9 +858,12 @@ def _save_invoice_from_extraction(
             if demoted_current:
                 db.flush()
 
+    from src.services.invoice_issue_services import _assignment
+
+    assigned_owner = _assignment(db)
     invoice = Invoice(
         source_document_id=document.id,
-        owner_user_id=getattr(document, "created_by", None),
+        owner_user_id=assigned_owner,
         created_by=getattr(document, "created_by", None),
         updated_by=getattr(document, "updated_by", None),
         version_no=version_no,
@@ -693,8 +884,17 @@ def _line_value(line: dict, *keys):
 
 def _document_failure_message(error: Exception) -> str:
     failure_text = str(error).casefold()
-    if "password" in failure_text or "encrypted" in failure_text:
+    if any(word in failure_text for word in ("password", "encrypted", "not decrypted")):
         return "This file is password-protected; ask the vendor for an unlocked copy."
+    if (
+        isinstance(error, S3Error)
+        or "storage" in failure_text
+        or "minio" in failure_text
+    ):
+        return (
+            "File storage is temporarily unavailable; retry document processing "
+            "after storage connectivity is restored."
+        )
     if any(
         word in failure_text
         for word in (
@@ -706,12 +906,61 @@ def _document_failure_message(error: Exception) -> str:
         )
     ):
         return "This file appears damaged; ask the vendor to resend it."
+    if "duplicate current invoice" in failure_text:
+        return (
+            "This invoice appears to be a duplicate; review the existing invoice "
+            "before retrying."
+        )
+    if "missing required field" in failure_text or "required field" in failure_text:
+        return (
+            "Required document details are missing; review the highlighted fields "
+            "and correct them."
+        )
+    if "line amounts do not reconcile" in failure_text:
+        return (
+            "Purchase order line amounts do not match its subtotal; correct the "
+            "line values and retry."
+        )
     if any(
         word in failure_text
         for word in ("unsupported", "not supported", "unknown format")
     ):
         return "This file type is unsupported; ask the vendor to send a PDF or image."
-    return f"File could not be processed: {str(error)[:400]}"
+    if any(
+        word in failure_text
+        for word in ("unreadable image", "image decode", "cannot identify image")
+    ):
+        return "This image could not be read; upload a clearer PNG or JPG image."
+    if "vendor" in failure_text and any(
+        word in failure_text for word in ("unknown", "not found", "unresolved")
+    ):
+        return (
+            "The vendor could not be identified; verify the vendor details and retry."
+        )
+    if "goods receipt" in failure_text or "goods_receipt" in failure_text:
+        return "The goods receipt could not be found; link a goods receipt and retry."
+    if "purchase order" in failure_text or "po not found" in failure_text:
+        return "The purchase order could not be found; link a purchase order and retry."
+    if "currency" in failure_text:
+        return (
+            "The invoice and purchase order currencies do not match; "
+            "correct the currency and retry."
+        )
+    if any(
+        word in failure_text
+        for word in (
+            "timeout",
+            "connection",
+            "temporarily unavailable",
+            "service unavailable",
+            "rate limit",
+        )
+    ):
+        return (
+            "A document processing service is temporarily unavailable; "
+            "retry processing shortly."
+        )
+    return "This file could not be processed; check the file and retry."
 
 
 def _line_fingerprints(lines: list, *, extracted: bool = False) -> list[tuple]:
@@ -788,6 +1037,9 @@ def _replace_invoice_lines(
                 unit_price=_to_decimal(_line_value(raw, "unit_price", "price")),
                 line_amount=_to_decimal(
                     _line_value(raw, "line_amount", "amount", "total")
+                ),
+                field_confidence=(
+                    normalize_invoice_confidence({"line_items": [raw]})["line_items"][0]
                 ),
                 po_line_id=candidates[0].id if len(candidates) == 1 else None,
             )
@@ -1070,7 +1322,21 @@ def _rematch_waiting_invoices_for_po(
         ):
             issues.append("Invoice total does not match purchase order")
 
-        invoice.match_status = "match_issues" if issues else "ready_for_review"
+        if legacy_workflow_status(invoice) not in {
+            "approved",
+            "rejected",
+            "on_hold",
+            "paid",
+        }:
+            transition_invoice(
+                db,
+                invoice,
+                "match_issues" if issues else "match_approved",
+                changed_by=getattr(invoice, "updated_by", None)
+                or getattr(invoice, "created_by", None),
+                reason="Purchase order arrived; invoice rematched",
+            )
+
         if getattr(invoice, "id", None):
             run_match_for_invoice(
                 db,
@@ -1167,6 +1433,7 @@ def _save_purchase_order_from_extraction(
             and existing.po_date == _parse_document_date(po_date)
             and str(existing.currency).strip().upper() == currency
             and existing.total_amount == total_amount
+            and existing.tax_rate == _to_decimal(data.get("tax_rate"))
             and existing.payment_terms == data.get("payment_terms")
             and existing.delivery_details == delivery_details
             and _line_fingerprints(existing_lines)
@@ -1189,10 +1456,11 @@ def _save_purchase_order_from_extraction(
         tax_amount=_to_decimal(
             data.get("tax") if data.get("tax") is not None else data.get("tax_amount")
         ),
+        tax_rate=_to_decimal(data.get("tax_rate")),
         total_amount=total_amount,
         payment_terms=data.get("payment_terms"),
         delivery_details=delivery_details,
-        created_by=document.created_by,
+        created_by=getattr(document, "created_by", None),
         updated_by=document.created_by,
     )
 
@@ -1471,9 +1739,8 @@ def parse_document(
         document.failure_message = (
             "This file type is unsupported; ask the vendor to send a PDF or image."
         )
-        if (
-            getattr(document, "doc_type", None) != "other"
-            and getattr(document, "email_sender", None)
+        if getattr(document, "doc_type", None) != "other" and getattr(
+            document, "email_sender", None
         ):
             db.add(
                 Notification(
@@ -1510,7 +1777,7 @@ def parse_document(
     db.commit()
 
     try:
-        content = download_file(document.storage_path)
+        content = with_transient_retries(lambda: download_file(document.storage_path))
 
     except S3Error as exc:
         if exc.code in {
@@ -1518,27 +1785,40 @@ def parse_document(
             "NoSuchObject",
             "NoSuchBucket",
         }:
+            document.status = "failed"
+            document.failure_message = (
+                "The stored file could not be found; upload it again."
+            )
+            db.commit()
             raise HTTPException(
                 status_code=404,
-                detail="Stored file not found",
+                detail=document.failure_message,
             ) from None
 
         logger.exception("MinIO download failed")
+        document.status = "failed"
+        document.failure_message = _document_failure_message(exc)
+        db.commit()
 
         raise HTTPException(
             status_code=503,
-            detail="File storage is unavailable",
+            detail=document.failure_message,
         ) from None
 
-    except Exception:
+    except Exception as exc:
         logger.exception("MinIO download failed")
+        document.status = "failed"
+        document.failure_message = _document_failure_message(exc)
+        db.commit()
 
         raise HTTPException(
             status_code=503,
-            detail="File storage is unavailable",
+            detail=document.failure_message,
         ) from None
 
     temp_path = None
+    active_pipeline_step = "parse"
+    active_step_started = time.perf_counter()
 
     try:
         # Step 1: Prepare the document.
@@ -1552,6 +1832,7 @@ def parse_document(
         document.failure_message = None
 
         # Step 2: Parse using Docling.
+        parse_started = time.perf_counter()
         if os.getenv("AP_E2E_MOCK_EXTRACTION") or is_e2e_stub_enabled():
             raw_text = extract_e2e_test_document_text(content)
         else:
@@ -1568,9 +1849,19 @@ def parse_document(
 
         document.raw_text = raw_text
         document.status = "parsed"
+        _record_pipeline_step(
+            db,
+            document,
+            "parse",
+            parse_started,
+            output_summary={"characters": len(raw_text)},
+        )
         db.commit()
 
         # Step 3: Classify using OpenRouter.
+        active_pipeline_step = "classify"
+        active_step_started = time.perf_counter()
+        classify_started = time.perf_counter()
         classify_override = getattr(document, "classify_override", None)
         if classify_override:
             doc_type, classify_confidence = classify_override, 1.0
@@ -1588,14 +1879,20 @@ def parse_document(
                         in inspect.signature(classify_document).parameters
                     )
                     if supports_confidence:
-                        classified = classify_document(raw_text, with_confidence=True)
+                        classified = with_transient_retries(
+                            lambda: classify_document(raw_text, with_confidence=True)
+                        )
                     else:
-                        classified = classify_document(raw_text)
+                        classified = with_transient_retries(
+                            lambda: classify_document(raw_text)
+                        )
                     if isinstance(classified, tuple):
                         doc_type, classify_confidence = classified
                     else:
                         doc_type, classify_confidence = classified, 1.0
                 except Exception as exc:
+                    if is_transient_document_error(exc):
+                        raise
                     logger.warning(
                         "Document classification failed for %s (%s)",
                         document.id,
@@ -1625,6 +1922,13 @@ def parse_document(
 
         document.doc_type = doc_type
         document.classify_confidence = classify_confidence
+        _record_pipeline_step(
+            db,
+            document,
+            "classify",
+            classify_started,
+            output_summary={"doc_type": doc_type, "confidence": classify_confidence},
+        )
         if doc_type == "other":
             try:
                 _route_document_to_other(db, document, doc_type, classify_confidence)
@@ -1683,12 +1987,25 @@ def parse_document(
         db.commit()
 
         # Step 4: Extract fields using the configured LLM pipeline.
-        extracted_data = extract_document(
-            raw_text,
-            doc_type,
+        active_pipeline_step = "extract"
+        active_step_started = time.perf_counter()
+        extract_started = time.perf_counter()
+        extracted_data = with_transient_retries(
+            lambda: extract_document(raw_text, doc_type)
         )
 
         validation_data = extracted_data
+        _record_pipeline_step(
+            db,
+            document,
+            "extract",
+            extract_started,
+            output_summary={
+                "field_count": len(extracted_data)
+                if isinstance(extracted_data, dict)
+                else 0
+            },
+        )
 
         if doc_type == "po" and isinstance(extracted_data, dict):
             validation_data = dict(extracted_data)
@@ -1745,6 +2062,7 @@ def parse_document(
 
         po_vendor = None
         goods_receipt_vendor = None
+        vendor_resolve_started = time.perf_counter()
 
         if doc_type == "po" and isinstance(extracted_data, dict):
             validation_issues.extend(_purchase_order_persistence_issues(extracted_data))
@@ -1773,6 +2091,14 @@ def parse_document(
                     validation_issues.append(
                         f"Vendor not found or inactive: {vendor_name}"
                     )
+        _record_pipeline_step(
+            db,
+            document,
+            "vendor_resolve",
+            vendor_resolve_started,
+            output_summary={"resolved": bool(po_vendor or goods_receipt_vendor)},
+            result="success" if po_vendor or goods_receipt_vendor else "warning",
+        )
 
         # Step 6: Check current purchase order duplicates.
         duplicate_purchase_order = None
@@ -1789,16 +2115,60 @@ def parse_document(
 
         # Save valid invoices as new versions when their vendor and number
         # identify an existing invoice.
-        if doc_type == "invoice" and not validation_issues:
+        invoice_issues = [
+            issue
+            for issue in validation_issues
+            if issue != "Missing required field: vendor"
+        ]
+        if doc_type == "invoice" and not invoice_issues:
             try:
+                if "Missing required field: vendor" in validation_issues:
+                    validation_issues.remove("Missing required field: vendor")
                 saved_invoice = _save_invoice_from_extraction(
                     db,
                     document,
                     extracted_data,
                 )
-                if saved_invoice is not None and saved_invoice.po_id:
+                if saved_invoice is not None and requires_verification(
+                    getattr(saved_invoice, "field_confidence", None) or {}
+                ):
+                    if legacy_workflow_status(saved_invoice) != "verifying":
+                        transition_invoice(
+                            db,
+                            saved_invoice,
+                            "verifying",
+                            reason=(
+                                "One or more extracted fields need associate "
+                                "verification"
+                            ),
+                        )
+                elif saved_invoice is not None and (
+                    saved_invoice.po_id is None
+                    or getattr(saved_invoice, "vendor_id", True) is None
+                ):
+                    _auto_reject_unmatched_invoice(db, saved_invoice, document)
+                    validation_issues.clear()
+                elif saved_invoice is not None:
                     run_match_for_invoice(
                         db, saved_invoice.id, getattr(document, "created_by", None)
+                    )
+                elif saved_invoice is not None:
+                    step_started = time.perf_counter()
+                    _record_pipeline_step(
+                        db,
+                        document,
+                        "po_link",
+                        step_started,
+                        output_summary={"po_linked": False},
+                        result="warning",
+                    )
+                    _record_pipeline_step(
+                        db,
+                        document,
+                        "match",
+                        step_started,
+                        output_summary={"result": "waiting_for_po"},
+                        result="warning",
                     )
 
             except IntegrityError as exc:
@@ -1888,16 +2258,17 @@ def parse_document(
             document.status = (
                 "duplicate_blocked" if duplicate_invoice else "needs_vendor_review"
             )
-            document.failure_message = "; ".join(validation_issues)[:500]
+            document.failure_message = _document_failure_message(
+                ValueError("; ".join(validation_issues))
+            )
 
             logger.warning(
                 "Document %s requires review: %s",
                 document_id,
                 validation_issues,
             )
-            if (
-                getattr(document, "doc_type", None) != "other"
-                and getattr(document, "email_sender", None)
+            if getattr(document, "doc_type", None) != "other" and getattr(
+                document, "email_sender", None
             ):
                 db.add(
                     Notification(
@@ -1925,7 +2296,16 @@ def parse_document(
                     "Workflow refresh failed after document %s was extracted",
                     document_id,
                 )
+        notify_started = time.perf_counter()
         dispatch_queued_notifications(db, document.id, background_tasks)
+        _record_pipeline_step(
+            db,
+            document,
+            "notify",
+            notify_started,
+            output_summary={"queued": True},
+        )
+        db.commit()
 
         # Step 8: Return extraction and duplicate-check results.
         return {
@@ -1948,16 +2328,38 @@ def parse_document(
         )
 
         db.rollback()
+        failure_detail = (
+            "The document could not be processed; check the file and retry."
+        )
 
         try:
             document = db.query(Document).filter_by(id=document_id).first()
 
             if document:
+                db.add(
+                    AuditLog(
+                        action="pipeline_step",
+                        entity_type="document",
+                        entity_id=document.id,
+                        step_name=active_pipeline_step,
+                        duration_ms=max(
+                            0,
+                            int((time.perf_counter() - active_step_started) * 1000),
+                        ),
+                        input_ref=(document.storage_path or str(document.id))[:500],
+                        output_summary={"error_type": type(exc).__name__},
+                        result="error",
+                        message=f"Document {active_pipeline_step} step failed",
+                        created_by=getattr(document, "created_by", None),
+                    )
+                )
                 document.status = "failed"
                 document.failure_message = _document_failure_message(exc)
-                if (
-                    getattr(document, "doc_type", None) != "other"
-                    and getattr(document, "email_sender", None)
+                failure_detail = (
+                    f"{document.original_filename}: {document.failure_message}"
+                )
+                if getattr(document, "doc_type", None) != "other" and getattr(
+                    document, "email_sender", None
                 ):
                     db.add(
                         Notification(
@@ -1977,7 +2379,7 @@ def parse_document(
 
         raise HTTPException(
             status_code=500,
-            detail=("Document processing failed. Check Core service logs."),
+            detail=failure_detail,
         ) from None
 
     finally:

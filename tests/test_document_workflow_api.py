@@ -289,6 +289,7 @@ def test_human_can_select_an_invoice_from_multiple_candidates(monkeypatch):
                 "action": "confirm_candidate",
                 "candidate_type": "invoice",
                 "candidate_id": str(invoice_id),
+                "reason": "Assign invoice to its purchase order",
             },
         )
     finally:
@@ -424,6 +425,7 @@ def test_rejected_candidate_is_audited_and_cannot_be_confirmed_again(monkeypatch
                 "action": "confirm_candidate",
                 "candidate_type": "purchase_order",
                 "candidate_id": str(candidate_id),
+                "reason": "Use the verified purchase order",
             },
         )
     finally:

@@ -125,6 +125,102 @@ enable authenticated IMAP or app passwords. Never use a production mailbox for
 testing. Configure the interval with `EMAIL_POLL_INTERVAL_SECONDS` (default
 120) and the folder with `IMAP_FOLDER` (default `INBOX`).
 
+## Invoice verification and tax checks
+
+Invoice extraction stores a 0–100 confidence score for header and line fields.
+Missing model confidence is marked as derived and conservatively scored; any
+field below `FIELD_CONFIDENCE_MIN` (default 85) sends the invoice to the
+associate verification queue before matching. Associates can confirm values or
+edit them with a reason through the invoice verification API. `GL_CODE_LIST` is
+an optional comma-separated code list; when configured, an unknown code is
+shown as a validation warning.
+
+Tax matching uses the purchase order's tax amount when present; otherwise it
+uses the purchase order tax rate against the PO subtotal, then the vendor's
+default tax rate against the invoice subtotal. A difference greater than
+`INVOICE_TAX_TOLERANCE` (default 0.01 in invoice currency) is a match issue.
+Tax rates are percentages (for example, `18` means 18%).
+Invoices without a matching PO or a resolved vendor become No Match and are
+rejected with a reason. Sender notifications are queued only for exact
+addresses in `TEST_MAILBOX_ALLOWLIST`.
+
+## Vendor email drafts
+
+Vendor-facing email is stored in the outbox as a draft for a user to review,
+edit, and send. Draft recipients and CC recipients must each exactly match an
+address in `TEST_MAILBOX_ALLOWLIST`; blocked drafts stay available for editing
+but cannot be sent. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+`SMTP_PASSWORD`, `SMTP_FROM`, and `SMTP_USE_SSL` for delivery. SMTP retries use
+`EMAIL_DRAFT_MAX_ATTEMPTS` (default 3). The two intake notices for a missing
+bill attachment and a No Match invoice can auto-send only to allowlisted test
+mailboxes; other vendor notifications are kept as drafts. Sent messages carry
+an `[AP-...]` reference so inbound replies can be attached to the invoice
+timeline. Issue contact-vendor actions use the same outbox. Issue reminders
+create drafts and do not auto-send.
+
+## Payments, command center, and follow-ups
+
+Use **Mark as paid** (`POST /api/invoices/{id}/pay`) to record an external
+payment. Provide `paid_date`, `method` (`bank_transfer`, `cheque`, `upi`,
+`cash`, or `other`), and `reference`. AP stores the record; it never contacts a
+bank or initiates a payment. A mistaken record can be corrected with
+`POST /api/invoices/{id}/pay/void` and a reason.
+
+`GET /api/command-center/summary` returns bucket totals, and
+`GET /api/command-center/bills?bucket=...` lists ready-to-pay, overdue,
+rejected, needs-attention, or all invoices. Due-date calculations use
+`APP_TIMEZONE` (default `Asia/Kolkata`). Hourly overdue checks and 15-minute
+follow-ups run through Celery beat on the email queue. Internal reminders are
+queued only for addresses in `TEST_MAILBOX_ALLOWLIST`; vendor reminders remain
+human-reviewed email drafts.
+
+Reminder timing can be configured with `VERIFY_PENDING_DAYS` (1),
+`APPROVAL_PENDING_DAYS` (2), `VENDOR_REPLY_REMINDER_DAYS` (3),
+`VENDOR_REPLY_ESCALATE_DAYS` (7), `OVERDUE_REMINDER_DAYS` (1),
+`REJECTED_REMINDER_DAYS` (7), `DUE_SOON_DAYS` (3), `HOLD_STALE_DAYS` (5), and
+`MAX_REMINDERS` (3). `ASSIGNMENT_STRATEGY` accepts `least_open` or `manual`;
+`ESCALATION_EMAIL` is used when it is allowlisted, otherwise escalations go to
+other allowlisted associates.
+
+Case 5: assert the sender notification is created through the email outbox and is only sent to allowlisted addresses.
+
+## Seed and evaluate sample data
+
+Import CSV or Excel files with explicit paths and formats, for example:
+
+```powershell
+uv run python scripts/seed_import.py --folder .\sample-data `
+  --vendors vendors.xlsx --vendors-format xlsx `
+  --purchase-orders purchase_orders.csv --purchase-orders-format csv `
+  --goods-receipts goods_receipts.xlsx --goods-receipts-format xlsx
+```
+
+The importer groups PO and receipt line rows, skips records already present, and
+prints created/skipped/error counts. Each source record is committed separately
+so one malformed row does not roll back earlier imports.
+
+Run sample PDFs/images through the API and score the result against a JSON
+answer key:
+
+```powershell
+uv run python scripts/evaluate.py --api-url http://localhost:8000 `
+  --token <access-token> --samples-dir .\sample-bills `
+  --answer-key .\sample-bills\answer-key.json --report-dir .\evaluation-report
+```
+
+The evaluator writes Markdown and JSON reports with per-field accuracy, match
+accuracy/confusion, missed duplicates/overbilling, terminal failures, and
+state/step-log coverage. EML samples are sent through SMTP and require
+`--smtp-host` (port defaults to 3025). Supply `--baseline-report` to include a
+before/after throughput comparison. For a measured 100-bill time, run exactly
+100 samples; smaller sets report a linear estimate.
+
+The documents worker uses `WORKER_CONCURRENCY` (default 2) with Celery's prefork
+pool. Docling's converter cache is process-local, so each worker process loads
+its models once and retains them for later documents. More processes increase
+memory use; benchmark before raising the value. No before/after 100-bill timing
+is checked into this repository because no sample corpus/answer key is present.
+
 ## Backend E2E check
 
 From the repository root on Windows, with Docker Desktop and `uv` installed, run `powershell -ExecutionPolicy Bypass -File .\scripts\run_e2e.ps1` (or `make e2e-backend` where Make is installed). It works whether the main stack is running or stopped: the E2E project has distinct container names, its own PostgreSQL and MinIO volumes, an internal project network, and separately configured host ports in `scripts/e2e-ports.env`. GreenMail provides local SMTP/IMAP and `LLM_PROVIDER=stub` is deterministic. The runner applies both migration sets, seeds an isolated admin account, runs the HTTP/IMAP checks, then removes only the E2E project and its volumes. It does not connect to Gmail or call a paid LLM provider.

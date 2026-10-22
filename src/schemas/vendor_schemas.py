@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -12,6 +13,7 @@ class VendorResponse(BaseModel):
     id: uuid.UUID
     name: str
     tax_id: str | None = None
+    default_tax_rate: Decimal | None = None
     is_active: bool
     contact_name: str | None = None
     contact_email: str | None = None
@@ -21,6 +23,7 @@ class VendorResponse(BaseModel):
 class VendorCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     tax_id: str | None = Field(default=None, max_length=30)
+    default_tax_rate: Decimal | None = Field(default=None, ge=0, le=100)
     contact_name: str | None = Field(default=None, max_length=120)
     contact_email: EmailStr | None = Field(default=None, max_length=200)
     contact_phone: str | None = Field(default=None, max_length=40)
@@ -46,6 +49,7 @@ class VendorCreate(BaseModel):
 class VendorUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     tax_id: str | None = Field(default=None, max_length=30)
+    default_tax_rate: Decimal | None = Field(default=None, ge=0, le=100)
     contact_name: str | None = Field(default=None, max_length=120)
     contact_email: EmailStr | None = Field(default=None, max_length=200)
     contact_phone: str | None = Field(default=None, max_length=40)

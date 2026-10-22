@@ -39,7 +39,12 @@ def test_e2e_stub_classifies_and_extracts_embedded_sample(monkeypatch):
     raw_text = f"GW_AP_E2E_JSON_BEGIN{encoded}GW_AP_E2E_JSON_END"
 
     assert classify_document(raw_text, with_confidence=True) == ("invoice", 1.0)
-    assert extract_document(raw_text, "invoice") == {"invoice_number": "E2E-INV-ONLY"}
+    extracted = extract_document(raw_text, "invoice")
+    assert extracted["invoice_number"] == "E2E-INV-ONLY"
+    assert extracted["field_confidence"]["invoice_number"] == {
+        "confidence": 100,
+        "derived": False,
+    }
 
 
 def test_classify_document_returns_invoice(monkeypatch):
