@@ -220,3 +220,17 @@ pool. Docling's converter cache is process-local, so each worker process loads
 its models once and retains them for later documents. More processes increase
 memory use; benchmark before raising the value. No before/after 100-bill timing
 is checked into this repository because no sample corpus/answer key is present.
+
+## Backend E2E check
+
+From the repository root on Windows, with Docker Desktop and `uv` installed, run `powershell -ExecutionPolicy Bypass -File .\scripts\run_e2e.ps1` (or `make e2e-backend` where Make is installed). It works whether the main stack is running or stopped: the E2E project has distinct container names, its own PostgreSQL and MinIO volumes, an internal project network, and separately configured host ports in `scripts/e2e-ports.env`. GreenMail provides local SMTP/IMAP and `LLM_PROVIDER=stub` is deterministic. The runner applies both migration sets, seeds an isolated admin account, runs the HTTP/IMAP checks, then removes only the E2E project and its volumes. It does not connect to Gmail or call a paid LLM provider.
+# Email polling retry and model cache
+
+Email processing uses the `email` Celery queue; document processing uses the
+`documents` queue. `EMAIL_MAX_ATTEMPTS` defaults to 5, and transient failures
+are scheduled with increasing delays. `EMAIL_SENDER_BLOCKLIST` accepts comma
+separated sender addresses, domains, or sender-name patterns.
+
+The Compose `worker` mounts the named `hf-cache` volume at
+`/root/.cache/huggingface`. The first document-processing run may download the
+configured Docling models; later worker recreates reuse the cached model files.

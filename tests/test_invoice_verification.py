@@ -287,7 +287,7 @@ def test_verification_migration_and_bootstrap_include_new_fields():
         root
         / "alembic"
         / "versions"
-        / "20261022_0012_invoice_verification_confidence.py"
+        / "20261022_0013_invoice_verification_confidence.py"
     ).read_text()
     assert "field_confidence jsonb" in bootstrap
     assert "gl_code varchar(60)" in bootstrap

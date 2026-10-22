@@ -1,13 +1,13 @@
 """invoice field confidence, GL and tax expectations
 
-Revision ID: 20261022_0012
-Revises: 20261022_0011
+Revision ID: 20261022_0013
+Revises: 20261022_0012
 """
 
 from alembic import op
 
-revision = "20261022_0012"
-down_revision = "20261022_0011"
+revision = "20261022_0013"
+down_revision = "20261022_0012"
 branch_labels = None
 depends_on = None
 

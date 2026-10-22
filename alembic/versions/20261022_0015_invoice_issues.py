@@ -1,19 +1,18 @@
 """invoice issue tracking and resolution
 
-Revision ID: 20261022_0014
-Revises: 20261022_0013
+Revision ID: 20261022_0015
+Revises: 20261022_0014
 """
 
 from alembic import op
 
-revision = "20261022_0014"
-down_revision = "20261022_0013"
+revision = "20261022_0015"
+down_revision = "20261022_0014"
 branch_labels = None
 depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS reason text")
     op.execute("""
       ALTER TABLE core.invoices
       ADD COLUMN IF NOT EXISTS resubmitted_from_id uuid
@@ -83,5 +82,4 @@ def downgrade() -> None:
     """)
     op.execute("DROP TABLE IF EXISTS core.issue_events")
     op.execute("DROP TABLE IF EXISTS core.invoice_issues")
-    op.execute("ALTER TABLE core.audit_log DROP COLUMN IF EXISTS reason")
     op.execute("ALTER TABLE core.invoices DROP COLUMN IF EXISTS resubmitted_from_id")

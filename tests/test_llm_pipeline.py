@@ -1,3 +1,6 @@
+import base64
+import json
+
 import httpx
 import pytest
 
@@ -5,7 +8,43 @@ from src.services.llm_pipeline_services import (
     classify_document,
     extract_document,
     validate_extracted_data,
+    validate_llm_provider_config,
 )
+
+
+def test_stub_provider_is_rejected_outside_e2e(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("LLM_PROVIDER", "stub")
+
+    with pytest.raises(RuntimeError, match="requires APP_ENV=e2e"):
+        validate_llm_provider_config()
+
+
+def test_e2e_environment_requires_stub_provider(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "e2e")
+    monkeypatch.setenv("LLM_PROVIDER", "")
+
+    with pytest.raises(RuntimeError, match="requires LLM_PROVIDER=stub"):
+        validate_llm_provider_config()
+
+
+def test_e2e_stub_classifies_and_extracts_embedded_sample(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "e2e")
+    monkeypatch.setenv("LLM_PROVIDER", "stub")
+    payload = {
+        "document_type": "invoice",
+        "invoice_number": "E2E-INV-ONLY",
+    }
+    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+    raw_text = f"GW_AP_E2E_JSON_BEGIN{encoded}GW_AP_E2E_JSON_END"
+
+    assert classify_document(raw_text, with_confidence=True) == ("invoice", 1.0)
+    extracted = extract_document(raw_text, "invoice")
+    assert extracted["invoice_number"] == "E2E-INV-ONLY"
+    assert extracted["field_confidence"]["invoice_number"] == {
+        "confidence": 100,
+        "derived": False,
+    }
 
 
 def test_classify_document_returns_invoice(monkeypatch):

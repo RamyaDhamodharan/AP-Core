@@ -33,11 +33,23 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261022_0015"]
+    assert script.get_heads() == ["20261022_0016"]
     alias_revision = script.get_revision(ALIAS_REVISION)
     assert alias_revision is not None
     assert alias_revision.down_revision == BASELINE_REVISION
     assert script.get_revision("0f7ca912d0e0").down_revision == ALIAS_REVISION
+    expected_chain = (
+        ("20261022_0011", "20261022_0010"),
+        ("20261022_0012", "20261022_0011"),
+        ("20261022_0013", "20261022_0012"),
+        ("20261022_0014", "20261022_0013"),
+        ("20261022_0015", "20261022_0014"),
+        ("20261022_0016", "20261022_0015"),
+    )
+    for revision_id, down_revision in expected_chain:
+        revision = script.get_revision(revision_id)
+        assert revision is not None
+        assert revision.down_revision == down_revision
 
 
 def test_sql_bootstrap_matches_pre_alias_migration_baseline():

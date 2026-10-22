@@ -2,8 +2,8 @@
 
 from alembic import op
 
-revision = "20261022_0011"
-down_revision = "20261022_0010"
+revision = "20261022_0012"
+down_revision = "20261022_0011"
 branch_labels = None
 depends_on = None
 
@@ -56,6 +56,7 @@ def upgrade() -> None:
         "ON core.invoice_state_history(invoice_id, created_at)"
     )
     for name, definition in (
+        ("reason", "text"),
         ("step_name", "varchar(60)"),
         ("duration_ms", "integer"),
         ("input_ref", "varchar(500)"),
@@ -74,6 +75,7 @@ def downgrade() -> None:
     op.execute("ALTER TABLE core.audit_log DROP COLUMN IF EXISTS input_ref")
     op.execute("ALTER TABLE core.audit_log DROP COLUMN IF EXISTS duration_ms")
     op.execute("ALTER TABLE core.audit_log DROP COLUMN IF EXISTS step_name")
+    op.execute("ALTER TABLE core.audit_log DROP COLUMN IF EXISTS reason")
     op.execute("DROP TABLE IF EXISTS core.invoice_state_history")
     op.execute("ALTER TABLE core.invoices DROP COLUMN IF EXISTS workflow_status")
     op.execute("DROP TYPE IF EXISTS core.invoice_workflow_status")
