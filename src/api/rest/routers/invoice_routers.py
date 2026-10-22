@@ -11,6 +11,7 @@ from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.invoice_models import Invoice
+from src.models.invoice_supporting_document_models import InvoiceSupportingDocument
 from src.models.match_run_models import MatchRun
 from src.models.purchase_order_models import PurchaseOrder
 from src.models.vendor_models import Vendor
@@ -379,6 +380,15 @@ def get_invoice_detail(
         "final_status": invoice.final_status,
         "confidence": normalized_confidence,
         "low_confidence_fields": low_confidence_fields,
+        "supporting_documents_count": (
+            db.query(func.count(InvoiceSupportingDocument.id))
+            .filter(
+                InvoiceSupportingDocument.invoice_id == invoice_id,
+                InvoiceSupportingDocument.deleted_at.is_(None),
+            )
+            .scalar()
+            or 0
+        ),
     }
 
 

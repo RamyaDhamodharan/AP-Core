@@ -13,6 +13,9 @@ CREATE TYPE core.match_result AS ENUM ('match_ok', 'match_issues', 'no_match');
 CREATE TYPE core.review_decision AS ENUM ('approved', 'rejected', 'on_hold');
 CREATE TYPE core.step_result AS ENUM ('success', 'warning', 'error');
 CREATE TYPE core.notify_status AS ENUM ('queued', 'sent', 'failed');
+CREATE TYPE core.invoice_supporting_document_category AS ENUM (
+  'delivery_note', 'contract', 'approval_email', 'tax_certificate', 'other'
+);
 
 CREATE TABLE auth.users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -330,6 +333,27 @@ CREATE TABLE core.notifications (
   updated_at timestamptz NOT NULL DEFAULT now(),
   updated_by uuid REFERENCES auth.users(id)
 );
+CREATE TABLE core.invoice_supporting_documents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id uuid NOT NULL REFERENCES core.invoices(id),
+  file_name varchar(300) NOT NULL,
+  content_type varchar(150) NOT NULL,
+  size_bytes integer NOT NULL CHECK (size_bytes > 0),
+  sha256 varchar(64) NOT NULL,
+  storage_key varchar(700) NOT NULL,
+  category core.invoice_supporting_document_category NOT NULL,
+  description text,
+  uploaded_by uuid NOT NULL REFERENCES auth.users(id),
+  uploaded_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  deleted_by uuid REFERENCES auth.users(id),
+  deleted_reason text
+);
+CREATE INDEX ix_invoice_supporting_documents_invoice
+  ON core.invoice_supporting_documents(invoice_id);
+CREATE UNIQUE INDEX uq_invoice_supporting_documents_active_sha256
+  ON core.invoice_supporting_documents(invoice_id, sha256)
+  WHERE deleted_at IS NULL;
 CREATE INDEX ix_documents_status ON core.documents(status);
 CREATE INDEX ix_vendor_alias_norm ON core.vendor_aliases(alias_norm);
 CREATE INDEX ix_refresh_user_revoked ON auth.refresh_sessions(user_id, is_revoked);
