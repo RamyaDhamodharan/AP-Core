@@ -1,3 +1,0 @@
-AP-Core uses the repository-level Alembic configuration and the single
-revision chain under versions/. See ../README.md for the safe baseline,
-fresh-database, and existing-database procedures.
