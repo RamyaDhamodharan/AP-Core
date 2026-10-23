@@ -111,6 +111,16 @@ def transition_invoice(
         raise HTTPException(status_code=409, detail=f"Invoice is already {to_status}")
 
     invoice.workflow_status = to_status
+    if to_status == "approved":
+        invoice.status = "ready_to_pay"
+    elif to_status == "rejected":
+        invoice.status = "rejected"
+    elif to_status == "on_hold":
+        invoice.status = "on_hold"
+    elif to_status in {"verifying", "match_issues", "no_match"}:
+        invoice.status = "needs_review"
+    else:
+        invoice.status = "processing"
     if to_status in {"approved", "paid", "overdue"}:
         invoice.final_status = "approved"
     elif to_status in {"rejected", "on_hold"}:
@@ -132,16 +142,16 @@ def transition_invoice(
         "reading": "pending",
         "verifying": "needs_vendor_review",
         "matching": "pending",
-        "match_approved": "ready_for_review",
+        "match_approved": "pending",
         "match_issues": "match_issues",
         "no_match": "no_match",
         "resubmitted": "pending",
         "failed": "pending",
-        "approved": "ready_for_review",
-        "rejected": "ready_for_review",
-        "on_hold": "ready_for_review",
-        "paid": "ready_for_review",
-        "overdue": "ready_for_review",
+        "approved": "pending",
+        "rejected": "pending",
+        "on_hold": "pending",
+        "paid": "pending",
+        "overdue": "pending",
     }[to_status]
     history = InvoiceStateHistory(
         invoice_id=invoice.id,
@@ -167,7 +177,6 @@ def legacy_workflow_status(invoice: Invoice) -> str:
         "needs_vendor_review": "verifying",
         "waiting_for_po": "matching",
         "needs_po_confirmation": "matching",
-        "ready_for_review": "match_approved",
         "match_issues": "match_issues",
         "no_match": "no_match",
     }.get(getattr(invoice, "match_status", "pending"), "received")

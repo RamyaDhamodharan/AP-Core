@@ -88,7 +88,7 @@ def test_exception_alerts_cover_each_attention_exception():
         ("match_issues", "match_issues"),
         ("waiting_for_po", "waiting_for_po"),
         ("needs_vendor_review", "needs_vendor_review"),
-        ("ready_for_review", "pending_review"),
+        ("pending", "pending_review"),
     )
 
     for match_status, exception_type in cases:
@@ -129,7 +129,7 @@ def test_decided_invoices_are_not_classified_as_pending_review():
     )
 
     for final_status in ("approved", "rejected", "on_hold"):
-        invoice = _invoice("ready_for_review", final_status)
+        invoice = _invoice("pending", final_status)
         assert _notification_exception_type(invoice) == "notification"
 
 

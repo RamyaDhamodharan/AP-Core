@@ -10,9 +10,11 @@ InvoiceMatchStatus = Literal[
     "needs_vendor_review",
     "waiting_for_po",
     "needs_po_confirmation",
-    "ready_for_review",
     "match_issues",
     "no_match",
+]
+InvoiceStatus = Literal[
+    "processing", "needs_review", "ready_to_pay", "on_hold", "rejected"
 ]
 InvoiceFinalStatus = Literal["approved", "rejected", "on_hold"]
 InvoiceWorkflowStatus = Literal[
@@ -63,6 +65,7 @@ class InvoiceDashboardItem(BaseModel):
     gl_code: str | None = None
     confidence: float | None = None
     can_resubmit: bool = False
+    status: InvoiceStatus = "processing"
 
 
 class InvoiceDashboardResponse(BaseModel):

@@ -28,7 +28,20 @@ DOCUMENT_TYPE_BY_MODEL = {
     GoodsReceipt: "goods_receipt",
 }
 
-MATCH_PRICE_TOLERANCE_PCT = Decimal("0.02")
+try:
+    MATCH_PRICE_TOLERANCE_PCT = max(
+        Decimal(0),
+        Decimal(os.getenv("INVOICE_UNIT_PRICE_TOLERANCE_PCT", "2")) / Decimal(100),
+    )
+except Exception:
+    MATCH_PRICE_TOLERANCE_PCT = Decimal("0.02")
+try:
+    MATCH_TOTAL_TOLERANCE_PCT = max(
+        Decimal(0),
+        Decimal(os.getenv("INVOICE_TOTAL_TOLERANCE_PCT", "1")) / Decimal(100),
+    )
+except Exception:
+    MATCH_TOTAL_TOLERANCE_PCT = Decimal("0.01")
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -123,18 +136,37 @@ def compare_available_records(
         )
 
     if invoice is not None and purchase_order is not None:
-        vendor_ok = bool(invoice.vendor_id and purchase_order.vendor_id)
-        if not vendor_ok:
+        invoice_vendor_id = getattr(invoice, "vendor_id", None)
+        po_vendor_id = getattr(purchase_order, "vendor_id", None)
+        invoice_vendor = (
+            db.get(Vendor, invoice_vendor_id)
+            if db is not None and invoice_vendor_id
+            else None
+        )
+        po_vendor = (
+            db.get(Vendor, po_vendor_id) if db is not None and po_vendor_id else None
+        )
+        invoice_tax_id = normalize_value(
+            getattr(invoice, "vendor_tax_id_raw", None)
+            or getattr(invoice_vendor, "tax_id", None)
+        ).casefold()
+        po_tax_id = normalize_value(getattr(po_vendor, "tax_id", None)).casefold()
+        vendor_ok = bool(invoice_vendor_id and po_vendor_id)
+        if not vendor_ok and not (invoice_tax_id and po_tax_id):
             check("vendor", "not_possible", "Invoice or PO vendor is unresolved")
-        elif invoice.vendor_id == purchase_order.vendor_id:
-            check("vendor", "passed", "Invoice and PO resolve to the same vendor")
+        elif invoice_vendor_id == po_vendor_id or (
+            invoice_tax_id and invoice_tax_id == po_tax_id
+        ):
+            check(
+                "vendor", "passed", "Invoice and PO vendor ID or tax ID match exactly"
+            )
         else:
             check(
                 "vendor",
                 "mismatch",
                 "Invoice and PO resolve to different vendors",
-                expected=str(purchase_order.vendor_id),
-                actual=str(invoice.vendor_id),
+                expected=str(po_vendor_id),
+                actual=str(invoice_vendor_id),
             )
 
         invoice_ref = normalize_value(invoice.po_number_raw)
@@ -235,7 +267,10 @@ def compare_available_records(
                 "not_possible",
                 "Invoice or PO total is missing or invalid",
             )
-        elif invoice_total > po_total:
+        elif (
+            invoice_total - po_total
+            > max(abs(po_total), Decimal("0.01")) * MATCH_TOTAL_TOLERANCE_PCT
+        ):
             check(
                 "document_total",
                 "mismatch",
@@ -405,7 +440,11 @@ def compare_available_records(
                     )
                 else:
                     difference = invoice_total - po_total
-                    if abs(difference) <= Decimal("0.01"):
+                    if (
+                        abs(difference)
+                        <= max(abs(po_total), Decimal("0.01"))
+                        * MATCH_TOTAL_TOLERANCE_PCT
+                    ):
                         check(
                             "document_total",
                             "passed",
@@ -516,7 +555,8 @@ def compare_available_records(
                     check(
                         "unit_price",
                         "passed",
-                        "Invoice unit price matches the PO within 2%",
+                        "Invoice unit price matches PO within "
+                        f"{MATCH_PRICE_TOLERANCE_PCT * 100}%",
                         expected=unit_price,
                         actual=invoice_unit_price,
                         difference=invoice_unit_price - unit_price,
@@ -525,7 +565,8 @@ def compare_available_records(
                     check(
                         "unit_price",
                         "mismatch",
-                        "Invoice unit price differs from the PO by more than 2%",
+                        "Invoice unit price differs from PO by more than "
+                        f"{MATCH_PRICE_TOLERANCE_PCT * 100}%",
                         expected=unit_price,
                         actual=invoice_unit_price,
                         difference=invoice_unit_price - unit_price,
@@ -539,11 +580,16 @@ def compare_available_records(
                 else:
                     expected_amount = unit_price * inv_qty
                     difference = line_amount - expected_amount
-                    if abs(difference) <= Decimal("0.01"):
+                    if (
+                        abs(difference)
+                        <= max(abs(expected_amount), Decimal("0.01"))
+                        * MATCH_TOTAL_TOLERANCE_PCT
+                    ):
                         check(
                             "line_price",
                             "passed",
-                            "Invoice line amount matches PO unit price within one cent",
+                            "Invoice line amount matches within "
+                            f"{MATCH_TOTAL_TOLERANCE_PCT * 100}%",
                             expected=expected_amount,
                             actual=line_amount,
                             difference=difference,
@@ -599,12 +645,16 @@ def compare_available_records(
                 else:
                     line_total = sum(line_total_values, Decimal(0))
                     difference = line_total - invoice_total
-                    if abs(difference) <= Decimal("0.01"):
+                    if (
+                        abs(difference)
+                        <= max(abs(invoice_total), Decimal("0.01"))
+                        * MATCH_TOTAL_TOLERANCE_PCT
+                    ):
                         check(
                             "invoice_line_total",
                             "passed",
                             "Invoice line amounts sum to the invoice total within "
-                            "one cent",
+                            f"{MATCH_TOTAL_TOLERANCE_PCT * 100}%",
                             expected=invoice_total,
                             actual=line_total,
                             difference=difference,

@@ -11,6 +11,7 @@ from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
 from src.db.session_db import get_db
 from src.models.document_models import Document
+from src.models.user_models import User
 from src.services import document_ingest_services
 
 client = TestClient(app)
@@ -69,6 +70,8 @@ def test_upload_valid_pdf(monkeypatch):
 
 def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monkeypatch):
     from src.models.document_models import Document
+    from src.models.goods_receipt_models import GoodsReceipt
+    from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
     from src.models.invoice_models import InvoiceLine
     from src.models.match_run_models import MatchRun
     from src.models.notification_models import Notification
@@ -126,6 +129,9 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
 
         if model in {
             InvoiceIssue,
+            InvoiceDiscrepancy,
+            InvoiceMatch,
+            GoodsReceipt,
             User,
             InvoiceIssue.owner_user_id,
             Invoice.owner_user_id,
@@ -375,13 +381,14 @@ def test_upload_triggers_auto_processing(monkeypatch):
     assert started == [uuid.UUID(response.json()["id"])]
 
 
-def test_uuid_subject_upload_enqueues_document(monkeypatch):
+def test_uuid_subject_upload_enqueues_document(monkeypatch, user_stub):
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = None
     setup_db(monkeypatch, db)
     app.dependency_overrides.pop(get_current_user, None)
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-for-authentication-tests")
-    owner_id = uuid.uuid4()
+    owner_id = user_stub.id
+    db.get.side_effect = lambda model, _id: user_stub if model is User else None
     token = jwt.encode(
         {"sub": str(owner_id), "type": "access"},
         "test-secret-for-authentication-tests",

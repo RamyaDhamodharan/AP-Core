@@ -55,9 +55,10 @@ def _invoice(**overrides):
         "due_date": date(2026, 10, 31),
         "total_amount": Decimal("125.50"),
         "currency": "USD",
-        "match_status": "ready_for_review",
+        "match_status": "pending",
         "final_status": None,
         "workflow_status": "received",
+        "status": "processing",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -94,12 +95,13 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "due_date": "2026-10-31",
             "total_amount": "125.50",
             "currency": "USD",
-            "match_status": "ready_for_review",
+            "match_status": "pending",
             "final_status": None,
             "workflow_status": "received",
             "gl_code": None,
             "confidence": None,
             "can_resubmit": False,
+            "status": "processing",
         }
     ]
     query.offset.assert_called_once_with(20)

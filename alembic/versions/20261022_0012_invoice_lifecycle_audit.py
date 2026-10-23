@@ -36,8 +36,6 @@ def upgrade() -> None:
         "'verifying'::core.invoice_workflow_status "
         "WHEN match_status IN ('waiting_for_po','needs_po_confirmation') THEN "
         "'matching'::core.invoice_workflow_status "
-        "WHEN match_status = 'ready_for_review' THEN "
-        "'match_approved'::core.invoice_workflow_status "
         "WHEN match_status = 'match_issues' THEN "
         "'match_issues'::core.invoice_workflow_status "
         "WHEN match_status = 'no_match' THEN 'no_match'::core.invoice_workflow_status "

@@ -28,6 +28,7 @@ class AuditLog(Base):
         server_default=text("gen_random_uuid()"),
     )
     action: Mapped[str] = mapped_column(String(60), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(120))
     entity_type: Mapped[str] = mapped_column(String(40), nullable=False)
     entity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     old_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

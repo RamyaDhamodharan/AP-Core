@@ -256,6 +256,9 @@ def test_parse_document_success(monkeypatch):
 
     # Mock database session
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        is_active=True, must_change_password=False, role="associate"
+    )
     query = db.query.return_value
     query.filter.return_value.first.return_value = document
     locked_query = query.filter.return_value.with_for_update.return_value
@@ -383,7 +386,7 @@ def test_invoice_matching_sets_po_and_ready_status():
     )
 
     assert invoice.po_id == po.id
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
     assert any(call.args[0] is invoice for call in db.add.call_args_list)
 
 
@@ -403,7 +406,7 @@ def test_invoice_matching_accepts_normalized_canonical_vendor_name():
     )
 
     assert invoice.vendor_id == vendor.id
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_resolves_vendor_alias():
@@ -424,7 +427,7 @@ def test_invoice_matching_resolves_vendor_alias():
 
     assert invoice.vendor_id == vendor.id
     assert invoice.po_id == po.id
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_waits_when_po_is_missing():
@@ -509,7 +512,7 @@ def test_invoice_matching_keeps_existing_one_cent_tolerance():
         extracted_data={"total": "1500.01"},
     )
 
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
 
 
 def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
@@ -539,7 +542,7 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
 
     def auto_match(_db, invoice_id, user_id):
         assert invoice_id == invoice.id
-        invoice.match_status = "ready_for_review"
+        invoice.match_status = "pending"
         invoice.final_status = "approved"
         return SimpleNamespace(result="match_ok")
 
@@ -552,7 +555,7 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
 
     assert count == 1
     assert invoice.po_id == po_id
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
     assert invoice.final_status == "approved"
     db.flush.assert_called_once()
 
@@ -651,7 +654,7 @@ def test_invoice_matching_rerun_rejects_changed_extraction_without_overwrite():
         total_amount=Decimal("1500.00"),
         po_number_raw="PO-101",
         po_id=po.id,
-        match_status="ready_for_review",
+        match_status="pending",
     )
 
     with pytest.raises(ValueError, match="differs from the previously saved record"):
@@ -663,7 +666,7 @@ def test_invoice_matching_rerun_rejects_changed_extraction_without_overwrite():
         )
 
     assert existing_invoice.po_id == po.id
-    assert existing_invoice.match_status == "ready_for_review"
+    assert existing_invoice.match_status == "pending"
     assert existing_invoice.total_amount == Decimal("1500.00")
 
 
