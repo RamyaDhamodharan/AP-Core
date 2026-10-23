@@ -19,6 +19,10 @@ from src.schemas.document_workflow_schemas import (
     WorkflowDocument,
     WorkflowResult,
 )
+from src.services.invoice_confidence_services import (
+    confidence_unavailable,
+    requires_verification,
+)
 from src.services.po_matching_services import normalize_value
 from src.services.vendor_resolution_services import resolve_vendor
 
@@ -42,6 +46,20 @@ try:
     )
 except Exception:
     MATCH_TOTAL_TOLERANCE_PCT = Decimal("0.01")
+
+
+def _tax_tolerances() -> tuple[Decimal, Decimal]:
+    try:
+        absolute = max(Decimal(0), Decimal(os.getenv("TAX_TOLERANCE_ABS", "0.01")))
+    except Exception:
+        absolute = Decimal("0.01")
+    try:
+        percent = max(
+            Decimal(0), Decimal(os.getenv("TAX_TOLERANCE_PERCENT", "0.5"))
+        ) / Decimal(100)
+    except Exception:
+        percent = Decimal("0.005")
+    return absolute, percent
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -226,7 +244,6 @@ def compare_available_records(
 
         invoice_tax = _decimal(getattr(invoice, "tax_amount", None))
         expected_tax = _decimal(getattr(purchase_order, "tax_amount", None))
-        tax_basis = "PO tax amount"
         if expected_tax is None:
             rate = _decimal(getattr(purchase_order, "tax_rate", None))
             subtotal = _decimal(getattr(purchase_order, "subtotal", None))
@@ -234,24 +251,41 @@ def compare_available_records(
                 vendor = db.get(Vendor, invoice.vendor_id)
                 rate = _decimal(getattr(vendor, "default_tax_rate", None))
                 subtotal = _decimal(getattr(invoice, "subtotal", None))
-                tax_basis = "vendor default tax rate"
-            else:
-                tax_basis = "PO tax rate"
             if rate is not None and subtotal is not None:
                 expected_tax = subtotal * rate / Decimal(100)
-        try:
-            tax_tolerance = max(
-                Decimal(0), Decimal(os.getenv("INVOICE_TAX_TOLERANCE", "0.01"))
+        if expected_tax is None or invoice_tax is None:
+            check(
+                "tax",
+                "not_possible",
+                "Tax could not be verified",
+                expected=expected_tax,
+                actual=invoice_tax,
+                severity="warning",
             )
-        except Exception:
-            tax_tolerance = Decimal("0.01")
-        if invoice_tax is not None and expected_tax is not None:
+        else:
+            currency = (invoice.currency or "").strip().upper()
+            exponent = (
+                0
+                if currency in {"JPY", "KRW", "CLP", "VND"}
+                else 3
+                if currency in {"BHD", "JOD", "KWD", "OMR", "TND"}
+                else 2
+            )
+            quantum = Decimal(1).scaleb(-exponent)
+            expected_tax = expected_tax.quantize(quantum)
+            invoice_tax = invoice_tax.quantize(quantum)
+            tax_tolerance_abs, tax_tolerance_percent = _tax_tolerances()
+            tax_tolerance = max(
+                tax_tolerance_abs,
+                abs(expected_tax) * tax_tolerance_percent,
+            )
             tax_difference = invoice_tax - expected_tax
             check(
                 "tax",
                 "passed" if abs(tax_difference) <= tax_tolerance else "mismatch",
-                f"Invoice tax compared with {tax_basis} within tolerance "
-                f"{tax_tolerance}",
+                "Invoice tax compared with expected tax within tolerance"
+                if abs(tax_difference) <= tax_tolerance
+                else "Tax does not match expected",
                 expected=expected_tax,
                 actual=invoice_tax,
                 difference=tax_difference,
@@ -1473,6 +1507,24 @@ def recommend_invoice_review(
     if source is not None:
         workflow = evaluate_document_workflow(db, source.id, owner_id=owner_id)
         checks = list(workflow.checks)
+        confidence = getattr(invoice, "field_confidence", None) or {}
+        if requires_verification(confidence):
+            missing = confidence_unavailable(confidence)
+            checks.append(
+                WorkflowCheck(
+                    name="confidence",
+                    reason_code="confidence_unavailable"
+                    if missing
+                    else "low_confidence",
+                    outcome="not_possible" if missing else "mismatch",
+                    severity="warning",
+                    reason=(
+                        "Confidence unavailable, please verify"
+                        if missing
+                        else "One or more extracted fields need verification"
+                    ),
+                )
+            )
         if source.status in {
             "needs_vendor_review",
             "needs_data_review",
@@ -1498,18 +1550,26 @@ def recommend_invoice_review(
                     reason=(source.failure_message or "Extraction needs review"),
                 )
             )
-        status = workflow.status
-        review_required = workflow.human_review_required or bool(
-            source.status
-            in {
-                "needs_vendor_review",
-                "needs_data_review",
-                "incomplete",
-                "failed",
-            }
+        status = (
+            "review_required" if requires_verification(confidence) else workflow.status
+        )
+        review_required = (
+            requires_verification(confidence)
+            or workflow.human_review_required
+            or bool(
+                source.status
+                in {
+                    "needs_vendor_review",
+                    "needs_data_review",
+                    "incomplete",
+                    "failed",
+                }
+            )
         )
         action = (
-            workflow.recommended_next_actions[0]
+            "Verify extracted invoice fields"
+            if requires_verification(confidence)
+            else workflow.recommended_next_actions[0]
             if workflow.recommended_next_actions
             else "Submit the invoice through the existing human approval workflow"
         )

@@ -37,7 +37,7 @@ def _confidence_entry(value: Any, present: bool) -> dict[str, Any]:
             score *= 100
         score = min(100.0, max(0.0, score))
     except (TypeError, ValueError):
-        score = 75.0 if present else 0.0
+        score = 0.0
         derived = True
     return {"confidence": score, "derived": derived}
 
@@ -67,13 +67,73 @@ def normalize_invoice_confidence(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def requires_verification(confidence: dict[str, Any]) -> bool:
+    if not confidence:
+        return True
     threshold = confidence_threshold()
-    return any(
-        entry["confidence"] < threshold
-        for field, entry in confidence.items()
-        if field != "line_items" and isinstance(entry, dict)
-    ) or any(
-        entry[field]["confidence"] < threshold
-        for entry in confidence.get("line_items", [])
-        for field in LINE_CONFIDENCE_FIELDS
+    present_fields = {
+        field for field in INVOICE_CONFIDENCE_FIELDS if field in confidence
+    }
+    return (
+        len(present_fields) != len(INVOICE_CONFIDENCE_FIELDS)
+        or any(
+            entry["confidence"] < threshold
+            for field, entry in confidence.items()
+            if field != "line_items" and isinstance(entry, dict)
+        )
+        or any(
+            entry[field]["confidence"] < threshold
+            for entry in confidence.get("line_items", [])
+            for field in LINE_CONFIDENCE_FIELDS
+        )
     )
+
+
+def confidence_unavailable(confidence: dict[str, Any] | None) -> bool:
+    if not confidence or any(
+        field not in confidence for field in INVOICE_CONFIDENCE_FIELDS
+    ):
+        return True
+    if any(
+        not isinstance(confidence.get(field), dict)
+        or confidence[field].get("confidence") is None
+        or confidence[field].get("derived", False)
+        for field in INVOICE_CONFIDENCE_FIELDS
+    ):
+        return True
+    for line in confidence.get("line_items", []):
+        if any(
+            field not in line
+            or not isinstance(line[field], dict)
+            or line[field].get("confidence") is None
+            or line[field].get("derived", False)
+            for field in LINE_CONFIDENCE_FIELDS
+        ):
+            return True
+    return False
+
+
+def confidence_level(confidence: dict[str, Any] | None) -> str:
+    """Return a display-safe confidence label without exposing a score."""
+    if not confidence:
+        return "unknown"
+    if any(field not in confidence for field in INVOICE_CONFIDENCE_FIELDS):
+        return "unknown"
+    entries = [confidence[field] for field in INVOICE_CONFIDENCE_FIELDS]
+    for line in confidence.get("line_items", []):
+        if any(field not in line for field in LINE_CONFIDENCE_FIELDS):
+            return "unknown"
+        entries.extend(line[field] for field in LINE_CONFIDENCE_FIELDS)
+    if any(
+        not isinstance(entry, dict)
+        or entry.get("confidence") is None
+        or entry.get("derived", False)
+        for entry in entries
+    ):
+        return "unknown"
+    scores = [float(entry["confidence"]) for entry in entries]
+    lowest = min(scores)
+    if lowest >= 90:
+        return "high"
+    if lowest >= 75:
+        return "medium"
+    return "low"

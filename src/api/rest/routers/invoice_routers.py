@@ -42,6 +42,7 @@ from src.services.document_workflow_services import (
     recommend_invoice_review,
 )
 from src.services.invoice_confidence_services import (
+    confidence_level,
     confidence_threshold,
     requires_verification,
 )
@@ -539,6 +540,7 @@ def get_invoice_verification(
             for line in lines
         ],
         "needs_verification": requires_verification(confidence),
+        "confidence_level": confidence_level(confidence),
         "threshold": confidence_threshold(),
         "gl_code_warning": (
             f"Unknown GL code: {invoice.gl_code}"
@@ -882,6 +884,9 @@ def get_invoice_detail(
         "field_confidence": getattr(invoice, "field_confidence", None)
         or normalized_confidence,
         "needs_verification": requires_verification(
+            getattr(invoice, "field_confidence", None) or {}
+        ),
+        "confidence_level": confidence_level(
             getattr(invoice, "field_confidence", None) or {}
         ),
         "low_confidence_fields": low_confidence_fields,

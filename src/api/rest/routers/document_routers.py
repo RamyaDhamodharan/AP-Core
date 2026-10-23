@@ -61,6 +61,7 @@ from ....services.document_retry_services import (
 from ....services.document_workflow_services import refresh_related_workflows
 from ....services.email_sender_services import may_send_automatic_reply
 from ....services.invoice_confidence_services import (
+    confidence_unavailable,
     normalize_invoice_confidence,
     requires_verification,
 )
@@ -148,32 +149,40 @@ def _record_pipeline_step(
     )
 
 
-def _auto_reject_unmatched_invoice(db, invoice: Invoice, document: Document) -> None:
-    """Reject invoices with no vendor/PO and queue only test-allowlisted mail."""
-    reason = (
-        "No Match: invoice vendor could not be identified. Verify the vendor and "
-        "resubmit."
-        if invoice.vendor_id is None
-        else "No Match: no purchase order was found. Link a purchase order and reopen."
-    )
+def _auto_reject_unmatched_invoice(
+    db, invoice: Invoice, document: Document | None
+) -> None:
+    """Reject a completed no-match and best-effort queue allowlisted email."""
+    if os.getenv("EMAIL_NO_MATCH_AUTO_REJECT", "true").casefold() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    reason = "No purchase order / unknown vendor"
     current = legacy_workflow_status(invoice)
-    if current == "rejected":
+    if current in {"approved", "paid", "rejected"}:
         return
     if current not in {"no_match", "rejected"}:
-        transition_invoice(db, invoice, "no_match", reason=reason)
-    if current != "rejected":
-        transition_invoice(db, invoice, "rejected", reason=reason)
+        transition_invoice(db, invoice, "no_match", changed_by=None, reason=reason)
+    transition_invoice(db, invoice, "rejected", changed_by=None, reason=reason)
     db.add(
         AuditLog(
             action="invoice_no_match_rejected",
+            actor="system",
             entity_type="invoice",
             entity_id=invoice.id,
             old_value={"workflow_status": current},
             new_value={"workflow_status": "rejected", "reason": reason},
             result="warning",
             message=reason,
+            reason=reason,
+            created_by=None,
         )
     )
+    if document is None:
+        return
     sender = (getattr(document, "email_sender", None) or "").strip()
     allowed = {
         email.strip().casefold()
@@ -181,15 +190,22 @@ def _auto_reject_unmatched_invoice(db, invoice: Invoice, document: Document) -> 
         if email.strip()
     }
     if sender and sender.casefold() in allowed and may_send_automatic_reply(document):
-        db.add(
-            Notification(
-                document_id=document.id,
-                recipient_email=sender,
-                subject="Invoice needs attention",
-                body=reason,
-                status="queued",
+        try:
+            with db.begin_nested():
+                db.add(
+                    Notification(
+                        document_id=document.id,
+                        recipient_email=sender,
+                        subject="Invoice needs attention",
+                        body=reason,
+                        status="queued",
+                    )
+                )
+                db.flush()
+        except Exception as exc:
+            logger.warning(
+                "No-match notification could not be queued (%s)", type(exc).__name__
             )
-        )
 
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
@@ -2437,8 +2453,15 @@ def parse_document(
                             saved_invoice,
                             "verifying",
                             reason=(
-                                "One or more extracted fields need associate "
-                                "verification"
+                                "Confidence unavailable, please verify"
+                                if confidence_unavailable(
+                                    getattr(saved_invoice, "field_confidence", None)
+                                    or {}
+                                )
+                                else (
+                                    "One or more extracted fields need associate "
+                                    "verification"
+                                )
                             ),
                         )
                 elif saved_invoice is not None:

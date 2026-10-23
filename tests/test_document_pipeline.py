@@ -723,7 +723,7 @@ def test_invoice_persists_gl_and_field_confidence_for_header_and_lines():
         for call in db.add.call_args_list
         if isinstance(call.args[0], InvoiceLine)
     )
-    assert line.field_confidence["qty"]["confidence"] == 75
+    assert line.field_confidence["qty"]["confidence"] == 0
 
 
 def test_historical_invoice_versions_do_not_block_resubmission():

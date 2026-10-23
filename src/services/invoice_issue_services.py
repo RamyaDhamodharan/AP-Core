@@ -169,9 +169,17 @@ def sync_invoice_issues(
         if isinstance(value, (int, float)) and value < threshold
     ]
     if low_fields:
+        confidence_unavailable = any(
+            isinstance(confidence.get(key), dict)
+            and confidence[key].get("derived", False)
+            for key in low_fields
+        )
         findings["low_confidence"] = {
-            "description": "Fields below confidence threshold: "
-            + ", ".join(low_fields),
+            "description": (
+                "Confidence unavailable, please verify"
+                if confidence_unavailable
+                else "Fields below confidence threshold: " + ", ".join(low_fields)
+            ),
             "expected": threshold,
             "actual": {key: confidence[key] for key in low_fields},
             "severity": "warning",

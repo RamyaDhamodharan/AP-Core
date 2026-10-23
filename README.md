@@ -205,8 +205,13 @@ answer key:
 ```powershell
 uv run python scripts/evaluate.py --api-url http://localhost:8000 `
   --token <access-token> --samples-dir .\sample-bills `
-  --answer-key .\sample-bills\answer-key.json --report-dir .\evaluation-report
+  --answer-key .\sample-bills\answer-key.json --report-dir .\evaluation-report `
+  --confirm
 ```
+
+Evaluation requires `--confirm` and the exact database name in the comma-separated
+`EVAL_ALLOWED_DATABASES` environment variable. See `docs/evaluation.md` for the
+guarded local-pipeline mode and report details.
 
 The evaluator writes Markdown and JSON reports with per-field accuracy, match
 accuracy/confusion, missed duplicates/overbilling, terminal failures, and
