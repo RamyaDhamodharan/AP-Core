@@ -11,7 +11,7 @@ from src.api.rest.routers import document_routers
 from src.api.rest.routers.invoice_routers import _invoice_dashboard_filters
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
-from src.models.notification_models import Notification
+from src.models.email_draft_models import EmailDraft
 from src.services.document_workflow_services import compare_available_records
 from src.services.invoice_confidence_services import (
     confidence_level,
@@ -185,7 +185,7 @@ def test_get_verification_returns_values_confidence_and_gl_warning(monkeypatch):
     assert result["gl_code_warning"] == "Unknown GL code: 9999"
 
 
-def test_unmatched_invoice_is_rejected_with_reason_and_allowlisted_notice(monkeypatch):
+def test_unmatched_invoice_is_rejected_with_reason_and_reply_draft(monkeypatch):
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         workflow_status="received",
@@ -200,9 +200,10 @@ def test_unmatched_invoice_is_rejected_with_reason_and_allowlisted_notice(monkey
     assert invoice.workflow_status == "rejected"
     objects = [obj for call in db.add.call_args_list for obj in call.args]
     assert any(isinstance(obj, AuditLog) for obj in objects)
-    notice = next(obj for obj in objects if isinstance(obj, Notification))
-    assert notice.recipient_email == "test@example.com"
-    assert notice.body == "No purchase order / unknown vendor"
+    draft = next(obj for obj in objects if isinstance(obj, EmailDraft))
+    assert draft.to_addresses == ["test@example.com"]
+    assert draft.status == "draft"
+    assert draft.blocked_by_allowlist is False
 
 
 def test_verification_edit_requires_reason():

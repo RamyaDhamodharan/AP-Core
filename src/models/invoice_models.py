@@ -40,12 +40,13 @@ class Invoice(Base):
             name="uq_invoice_version",
         ),
         Index(
-            "uq_current_vendor_invoice",
+            "uq_current_vendor_invoice_normalized",
             "vendor_id",
-            "invoice_no",
+            "invoice_no_normalized",
             unique=True,
             postgresql_where=text(
-                "is_current AND vendor_id IS NOT NULL AND invoice_no IS NOT NULL"
+                "is_current AND vendor_id IS NOT NULL "
+                "AND invoice_no_normalized IS NOT NULL"
             ),
         ),
     )
@@ -77,6 +78,7 @@ class Invoice(Base):
         UUID(as_uuid=True), ForeignKey("invoices.id")
     )
     invoice_no: Mapped[str | None] = mapped_column(String(60))
+    invoice_no_normalized: Mapped[str | None] = mapped_column(String(180))
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_current: Mapped[bool] = mapped_column(
         Boolean,

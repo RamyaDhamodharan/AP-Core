@@ -8,6 +8,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    event,
     func,
     text,
 )
@@ -72,3 +73,10 @@ class AuditLog(Base):
         UUID(as_uuid=True),
         ForeignKey("auth.users.id"),
     )
+
+
+@event.listens_for(AuditLog, "before_insert")
+def assign_audit_actor(_mapper, _connection, target: AuditLog) -> None:
+    """Make system and user actors explicit on every newly written audit row."""
+    if target.actor is None:
+        target.actor = str(target.created_by) if target.created_by else "system"

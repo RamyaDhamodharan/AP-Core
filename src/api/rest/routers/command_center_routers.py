@@ -3,7 +3,7 @@
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Float, cast, exists, func, or_, select
@@ -113,6 +113,7 @@ def command_center_bills(
     sort_by: Annotated[
         str, Query(pattern="^(due_date|amount|days_overdue|confidence|date_received)$")
     ] = "date_received",
+    sort_dir: Literal["asc", "desc"] | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -159,17 +160,23 @@ def command_center_bills(
         .filter(*filters)
         .scalar()
     )
-    ordering = {
-        "due_date": Invoice.due_date.asc().nullslast(),
-        "days_overdue": Invoice.due_date.asc().nullslast(),
-        "amount": Invoice.total_amount.desc().nullslast(),
+    sort_column = {
+        "due_date": Invoice.due_date,
+        "days_overdue": Invoice.due_date,
+        "amount": Invoice.total_amount,
         "confidence": cast(
             Invoice.field_confidence["total"]["confidence"].as_float(), Float
-        )
-        .asc()
-        .nullslast(),
-        "date_received": Invoice.created_at.desc(),
+        ),
+        "date_received": Invoice.created_at,
     }[sort_by]
+    descending = (
+        (sort_dir == "desc")
+        if sort_dir
+        else sort_by in {"amount", "date_received"}
+    )
+    ordering = sort_column.desc() if descending else sort_column.asc()
+    if sort_by != "date_received":
+        ordering = ordering.nullslast()
     rows = (
         db.query(Invoice, Vendor.name.label("vendor_name"), Document.status)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)

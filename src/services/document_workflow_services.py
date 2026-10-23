@@ -23,7 +23,12 @@ from src.services.invoice_confidence_services import (
     confidence_unavailable,
     requires_verification,
 )
+from src.services.invoice_number_services import normalize_invoice_no
 from src.services.po_matching_services import normalize_value
+from src.services.tolerance_config_services import (
+    read_nonnegative_decimal,
+    tolerance_fraction,
+)
 from src.services.vendor_resolution_services import resolve_vendor
 
 DOCUMENT_TYPE_BY_MODEL = {
@@ -32,33 +37,13 @@ DOCUMENT_TYPE_BY_MODEL = {
     GoodsReceipt: "goods_receipt",
 }
 
-try:
-    MATCH_PRICE_TOLERANCE_PCT = max(
-        Decimal(0),
-        Decimal(os.getenv("INVOICE_UNIT_PRICE_TOLERANCE_PCT", "2")) / Decimal(100),
-    )
-except Exception:
-    MATCH_PRICE_TOLERANCE_PCT = Decimal("0.02")
-try:
-    MATCH_TOTAL_TOLERANCE_PCT = max(
-        Decimal(0),
-        Decimal(os.getenv("INVOICE_TOTAL_TOLERANCE_PCT", "1")) / Decimal(100),
-    )
-except Exception:
-    MATCH_TOTAL_TOLERANCE_PCT = Decimal("0.01")
+MATCH_PRICE_TOLERANCE_PCT = tolerance_fraction("INVOICE_UNIT_PRICE_TOLERANCE_PCT", "2")
+MATCH_TOTAL_TOLERANCE_PCT = tolerance_fraction("INVOICE_TOTAL_TOLERANCE_PCT", "1")
 
 
 def _tax_tolerances() -> tuple[Decimal, Decimal]:
-    try:
-        absolute = max(Decimal(0), Decimal(os.getenv("TAX_TOLERANCE_ABS", "0.01")))
-    except Exception:
-        absolute = Decimal("0.01")
-    try:
-        percent = max(
-            Decimal(0), Decimal(os.getenv("TAX_TOLERANCE_PERCENT", "0.5"))
-        ) / Decimal(100)
-    except Exception:
-        percent = Decimal("0.005")
+    absolute = read_nonnegative_decimal("TAX_TOLERANCE_ABS", "0.01")
+    percent = tolerance_fraction("TAX_TOLERANCE_PERCENT", "0.5")
     return absolute, percent
 
 
@@ -873,11 +858,14 @@ def evaluate_document_workflow(
     )
     duplicate_invoices: list[Invoice] = []
     if invoice is not None and invoice.vendor_id and invoice.invoice_no:
+        normalized_no = getattr(invoice, "invoice_no_normalized", None) or (
+            normalize_invoice_no(invoice.invoice_no)
+        )
         duplicate_invoices = (
             db.query(Invoice)
             .filter(
                 Invoice.vendor_id == invoice.vendor_id,
-                Invoice.invoice_no == invoice.invoice_no,
+                Invoice.invoice_no_normalized == normalized_no,
                 Invoice.is_current.is_(True),
                 Invoice.id != invoice.id,
                 *_owner_scope(Invoice, owner_id),

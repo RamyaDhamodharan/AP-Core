@@ -13,12 +13,14 @@ from src.services.runtime_config_services import (
     warn_if_container_minio_endpoint_is_localhost,
     warn_if_container_redis_url_is_localhost,
 )
+from src.services.tolerance_config_services import validate_tolerance_config
 
 logger = logging.getLogger(__name__)
 
 warn_if_container_redis_url_is_localhost()
 warn_if_container_minio_endpoint_is_localhost()
 validate_llm_provider_config()
+validate_tolerance_config()
 
 
 @worker_init.connect

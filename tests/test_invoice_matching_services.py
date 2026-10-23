@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 from src.models.audit_models import AuditLog
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.match_run_models import MatchRun
-from src.models.notification_models import Notification
+from src.models.email_draft_models import EmailDraft
 from src.services import invoice_matching_services as matching
 
 
@@ -134,7 +134,9 @@ def _no_match_fixture(monkeypatch, *, candidates=None, source="upload"):
     return db, invoice, document, invoice_id
 
 
-def test_completed_no_match_rejects_audits_history_notifies_allowed_email(monkeypatch):
+def test_completed_no_match_rejects_audits_history_and_creates_allowlisted_draft(
+    monkeypatch,
+):
     monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
@@ -157,8 +159,16 @@ def test_completed_no_match_rejects_audits_history_notifies_allowed_email(monkey
         and row.reason == "No purchase order / unknown vendor"
         for row in added
     )
-    notice = next(row for row in added if isinstance(row, Notification))
-    assert notice.recipient_email == "allowed@example.test"
+    draft = next(row for row in added if isinstance(row, EmailDraft))
+    assert draft.to_addresses == ["allowed@example.test"]
+    assert draft.status == "draft"
+    assert draft.blocked_by_allowlist is False
+    assert any(
+        isinstance(row, AuditLog)
+        and row.action == "draft_created"
+        and row.actor == "system"
+        for row in added
+    )
 
 
 def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
@@ -168,9 +178,13 @@ def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
     matching.run_match_for_invoice(db, invoice_id)
     assert invoice.status == "rejected"
-    assert not any(
-        isinstance(call.args[0], Notification) for call in db.add.call_args_list
+    draft = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], EmailDraft)
     )
+    assert draft.status == "draft"
+    assert draft.blocked_by_allowlist is True
 
     monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "false")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
@@ -190,7 +204,7 @@ def test_upload_no_match_auto_rejects_without_sender_notification(monkeypatch):
     assert run.result == "no_match"
     assert invoice.status == "rejected"
     assert not any(
-        isinstance(call.args[0], Notification) for call in db.add.call_args_list
+        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
     )
 
 
@@ -248,7 +262,7 @@ def test_suggested_candidate_is_review_not_no_match(monkeypatch):
     assert invoice.workflow_status == "match_issues"
     assert invoice.status == "needs_review"
     assert not any(
-        isinstance(call.args[0], Notification) for call in db.add.call_args_list
+        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
     )
 
 
@@ -269,11 +283,14 @@ def test_rerun_does_not_rewrite_approved_or_paid_invoice(monkeypatch):
         assert invoice.status == legacy_status
 
 
-def test_notification_queue_failure_does_not_block_auto_reject(monkeypatch):
+def test_no_match_draft_failure_does_not_block_auto_reject(monkeypatch):
     monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
-    db.begin_nested.side_effect = RuntimeError("mail queue unavailable")
+    monkeypatch.setattr(
+        "src.services.email_draft_services.create_no_match_draft",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("draft store unavailable")),
+    )
 
     run = matching.run_match_for_invoice(db, invoice_id)
 

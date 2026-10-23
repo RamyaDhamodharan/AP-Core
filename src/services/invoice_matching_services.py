@@ -519,6 +519,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     db.add(
         AuditLog(
             action="invoice_match_run",
+            actor=str(user_id) if user_id else "system",
             entity_type="invoice",
             entity_id=invoice.id,
             old_value=old,
@@ -531,6 +532,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     db.add(
         AuditLog(
             action="pipeline_step",
+            actor=str(user_id) if user_id else "system",
             entity_type="invoice",
             entity_id=invoice.id,
             step_name="match",

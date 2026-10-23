@@ -2,7 +2,6 @@
 
 import base64
 import json
-import os
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -18,7 +17,7 @@ from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
 from src.models.invoice_models import Invoice
 from src.models.invoice_state_history_models import InvoiceStateHistory
-from src.models.notification_models import Notification
+from src.models.email_draft_models import EmailDraft
 from src.services.document_ingest_services import IngestResult
 from src.services.llm_pipeline_services import classify_document, extract_document
 
@@ -199,8 +198,8 @@ def test_case_4_duplicate_invoice_upload_is_skipped(monkeypatch):
     assert response.json()["results"][0]["result"] == "duplicate"
 
 
-def test_case_5_unknown_vendor_rejected_and_sender_notification_queued(monkeypatch):
-    """Case 5 verifies the allowlisted sender notification outbox record."""
+def test_case_5_unknown_vendor_rejected_and_sender_draft_created(monkeypatch):
+    """Case 5 verifies a reviewable draft is created for the sender."""
     from src.api.rest.routers.document_routers import _auto_reject_unmatched_invoice
 
     sender = "ap-test@example.invalid"
@@ -215,19 +214,16 @@ def test_case_5_unknown_vendor_rejected_and_sender_notification_queued(monkeypat
     document = SimpleNamespace(id=uuid.uuid4(), email_sender=sender)
     db = MagicMock()
     _auto_reject_unmatched_invoice(db, invoice, document)
-    queued = [
+    drafts = [
         call.args[0]
         for call in db.add.call_args_list
-        if isinstance(call.args[0], Notification)
+        if isinstance(call.args[0], EmailDraft)
     ]
     assert invoice.workflow_status == "rejected"
-    assert len(queued) == 1
-    assert queued[0].status == "queued"
-    assert queued[0].recipient_email == sender
-    assert queued[0].recipient_email in {
-        address.strip()
-        for address in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
-    }
+    assert len(drafts) == 1
+    assert drafts[0].status == "draft"
+    assert drafts[0].to_addresses == [sender]
+    assert drafts[0].blocked_by_allowlist is False
 
 
 def test_case_6_low_confidence_verification_edit_is_audited(monkeypatch):

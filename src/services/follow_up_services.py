@@ -83,6 +83,7 @@ def _audit(db, row, action, old, new, message):
     db.add(
         AuditLog(
             action=action,
+            actor="system",
             entity_type="follow_up",
             entity_id=row.id,
             old_value=old,
@@ -414,6 +415,7 @@ def mark_overdue(db: Session, now: datetime | None = None) -> int:
         db.add(
             AuditLog(
                 action="invoice_overdue",
+                actor="system",
                 entity_type="invoice",
                 entity_id=invoice.id,
                 old_value={"workflow_status": "approved"},

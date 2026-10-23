@@ -239,6 +239,11 @@ def test_edit_then_send_is_audited_and_second_send_conflicts(monkeypatch):
     db.commit = lambda: None
     db.refresh = lambda _row: None
 
+    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "vendor@example.invalid")
+    monkeypatch.setenv("SMTP_HOST", "smtp.invalid")
+    smtp = FakeSMTP()
+    monkeypatch.setattr(drafts.smtplib, "SMTP", lambda *_args, **_kwargs: smtp)
+
     edited = router.edit_email_draft(
         draft.id,
         router.EditDraft(subject="Updated subject", body="Updated body"),
@@ -252,15 +257,15 @@ def test_edit_then_send_is_audited_and_second_send_conflicts(monkeypatch):
     assert edited_event.user_id == user_id
     assert edited_event.old_value == {"subject": "Old subject", "body": "Old body"}
 
-    def marked_sent(_db, row, actor):
-        row.status = "sent"
-        row.sent_by = actor
-        return True
-
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "vendor@example.invalid")
-    monkeypatch.setattr(router, "send_draft", marked_sent)
     result = router.send_email_draft(draft.id, db, {"sub": str(user_id)})
     assert result["sent"] is True
+    assert smtp.calls == 1
+    sent_audit = next(
+        row for row in db.rows if getattr(row, "action", None) == "draft_sent"
+    )
+    assert sent_audit.actor == str(user_id)
+    assert sent_audit.created_by == user_id
+    assert sent_audit.reason
     with pytest.raises(HTTPException) as exc:
         router.send_email_draft(draft.id, db, {"sub": str(user_id)})
     assert exc.value.status_code == 409
