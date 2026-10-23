@@ -1,0 +1,83 @@
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from src.api.rest.routers import (
+    audit_routers,
+    command_center_routers,
+    document_routers,
+    document_workflow_routers,
+    email_draft_routers,
+    email_polling_routers,
+    follow_up_routers,
+    goods_receipt_routers,
+    invoice_routers,
+    invoice_supporting_document_routers,
+    issue_routers,
+    notification_routers,
+    purchase_order_routers,
+    user_routers,
+    vendor_routers,
+)
+from src.services.llm_pipeline_services import validate_llm_provider_config
+from src.services.runtime_config_services import (
+    warn_if_container_minio_endpoint_is_localhost,
+    warn_if_container_redis_url_is_localhost,
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    warn_if_container_redis_url_is_localhost()
+    warn_if_container_minio_endpoint_is_localhost()
+    validate_llm_provider_config()
+    yield
+
+
+app = FastAPI(
+    title="GenWorx AP Core Service",
+    version="0.1.0",
+    description="Core API for GenWorx AP Assistant",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "ap-core"}
+
+
+app.include_router(vendor_routers.router)
+app.include_router(document_routers.router)
+app.include_router(email_polling_routers.router)
+app.include_router(email_draft_routers.router)
+app.include_router(document_workflow_routers.router)
+app.include_router(invoice_routers.router)
+app.include_router(command_center_routers.router)
+app.include_router(follow_up_routers.router)
+app.include_router(user_routers.router)
+app.include_router(issue_routers.router)
+app.include_router(audit_routers.router)
+app.include_router(invoice_supporting_document_routers.router)
+app.include_router(purchase_order_routers.router)
+if os.getenv("ENABLE_GOODS_RECEIPT", "true").casefold() in {"1", "true", "yes", "on"}:
+    app.include_router(goods_receipt_routers.router)
+app.include_router(notification_routers.router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ALLOWED_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
