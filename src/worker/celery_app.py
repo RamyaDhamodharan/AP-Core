@@ -1,19 +1,32 @@
 """Celery application for background document processing."""
 
+import logging
 import os
 
 from celery import Celery
 from celery.schedules import schedule
+from celery.signals import worker_init
 
+from src.services.docling_model_services import docling_models_available
 from src.services.llm_pipeline_services import validate_llm_provider_config
 from src.services.runtime_config_services import (
     warn_if_container_minio_endpoint_is_localhost,
     warn_if_container_redis_url_is_localhost,
 )
 
+logger = logging.getLogger(__name__)
+
 warn_if_container_redis_url_is_localhost()
 warn_if_container_minio_endpoint_is_localhost()
 validate_llm_provider_config()
+
+
+@worker_init.connect
+def log_docling_model_availability(**_kwargs) -> None:
+    logger.info(
+        "Docling OCR/layout models available: %s",
+        "yes" if docling_models_available() else "no",
+    )
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 

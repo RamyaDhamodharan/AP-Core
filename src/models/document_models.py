@@ -41,6 +41,7 @@ class Document(Base):
             "classified",
             "extracted",
             "needs_vendor_review",
+            "needs_data_review",
             "processed",
             "ignored",
             "other",

@@ -19,6 +19,8 @@ class DocumentSummary(BaseModel):
     email_subject: str | None = None
     email_received_at: datetime | None = None
     email_message_id: str | None = None
+    linked_invoice_id: uuid.UUID | None = None
+    linked_invoice_status: str | None = None
     created_at: datetime
     updated_at: datetime
 

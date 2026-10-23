@@ -34,6 +34,7 @@ from ....db.session_db import SessionLocal, get_db
 from ....models.audit_models import AuditLog
 from ....models.document_models import Document
 from ....models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
+from ....models.invoice_match_models import InvoiceDiscrepancy
 from ....models.invoice_models import Invoice, InvoiceLine
 from ....models.notification_models import Notification
 from ....models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
@@ -47,6 +48,10 @@ from ....schemas.document_schemas import (
 from ....schemas.purchase_order_schemas import (
     PurchaseOrderResponse,
     PurchaseOrderVendorResolutionRequest,
+)
+from ....services.docling_model_services import (
+    OCR_MODELS_UNAVAILABLE_MESSAGE,
+    docling_models_available,
 )
 from ....services.document_ingest_services import MAX_FILE_SIZE, ingest_file
 from ....services.document_retry_services import (
@@ -85,9 +90,33 @@ from ....storage.minio_storage import (
 from ....worker.dispatch import (
     dispatch_document_processing,
     dispatch_queued_notifications,
+    dispatch_raw_email_recovery,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_exception_detail(error: Exception) -> str:
+    """Return technical context with credential-like values removed for logs."""
+    detail = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|"
+        r"(?:password|passwd|token|access_token|refresh_token|secret|api[_-]?key)"
+        r"\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[REDACTED]",
+        str(error),
+    )
+    detail = re.sub(r"(?i)(://[^:/\s]+:)[^@/\s]+(@)", r"\1[REDACTED]\2", detail)
+    for name in (
+        "IMAP_PASSWORD",
+        "MINIO_SECRET_KEY",
+        "JWT_SECRET_KEY",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY",
+    ):
+        secret = os.getenv(name, "")
+        if secret and len(secret) >= 4:
+            detail = detail.replace(secret, "[REDACTED]")
+    return detail[:500]
 
 
 def _record_pipeline_step(
@@ -285,7 +314,10 @@ def list_documents(
     if doc_type:
         filters.append(Document.doc_type == doc_type)
     if source:
-        filters.append(Document.source == source)
+        if source == "email":
+            filters.append(Document.source.in_(["email", "email_poll"]))
+        else:
+            filters.append(Document.source == source)
     if parent_document_id:
         filters.append(Document.parent_document_id == parent_document_id)
     if not include_parents:
@@ -370,8 +402,39 @@ def list_documents(
         .limit(page_size)
         .all()
     )
+    linked_invoices = (
+        {
+            invoice.source_document_id: invoice
+            for invoice in db.query(Invoice)
+            .filter(Invoice.source_document_id.in_([row.id for row in rows]))
+            .all()
+        }
+        if rows
+        else {}
+    )
     return DocumentListResponse(
-        items=[DocumentSummary.model_validate(row) for row in rows],
+        items=[
+            DocumentSummary.model_validate(row).model_copy(
+                update={
+                    "source": (
+                        "email"
+                        if row.source in {"email", "email_poll"}
+                        else row.source
+                    ),
+                    "linked_invoice_id": (
+                        linked_invoices[row.id].id
+                        if row.id in linked_invoices
+                        else None
+                    ),
+                    "linked_invoice_status": (
+                        linked_invoices[row.id].status
+                        if row.id in linked_invoices
+                        else None
+                    ),
+                }
+            )
+            for row in rows
+        ],
         total=total,
         page=page,
         page_size=page_size,
@@ -407,9 +470,19 @@ def get_document_detail(
         .limit(100)
         .all()
     )
+    linked_invoice = (
+        db.query(Invoice).filter(Invoice.source_document_id == document.id).first()
+    )
     return DocumentReviewDetail.model_validate(
         {
             **DocumentSummary.model_validate(document).model_dump(),
+            "source": (
+                "email"
+                if document.source in {"email", "email_poll"}
+                else document.source
+            ),
+            "linked_invoice_id": linked_invoice.id if linked_invoice else None,
+            "linked_invoice_status": linked_invoice.status if linked_invoice else None,
             "raw_text": document.raw_text,
             "extracted_json": document.extracted_json,
             "audit_history": [
@@ -424,6 +497,46 @@ def _get_converter(converter_cls):
     if converter_cls not in _converters:
         _converters[converter_cls] = converter_cls()
     return _converters[converter_cls]
+
+
+def _docling_models_missing() -> bool:
+    return not docling_models_available()
+
+
+def _is_extraction_model_error(error: Exception) -> bool:
+    """Identify missing local model artifacts without masking parser failures."""
+    current: BaseException | None = error
+    while current is not None:
+        error_text = str(current).casefold()
+        if type(current).__name__ == "LocalEntryNotFoundError" or any(
+            marker in error_text
+            for marker in (
+                "localentrynotfound",
+                "huggingface",
+                "model artifact",
+                "model repository",
+                "could not load model",
+                "snapshot_download",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _extract_pdf_text_layer(path: str) -> str:
+    """Read embedded PDF text when Docling's layout/OCR model is unavailable."""
+    import pypdfium2
+
+    pdf = pypdfium2.PdfDocument(path)
+    pages = []
+    for page in pdf:
+        text_page = page.get_textpage()
+        pages.append(text_page.get_text_range())
+        text_page.close()
+        page.close()
+    pdf.close()
+    return "\n\n".join(page_text for page_text in pages if page_text.strip())
 
 
 def _route_document_to_other(
@@ -442,6 +555,7 @@ def _route_document_to_other(
         move_file(old_key, new_key)
     document.storage_path = new_key
     document.status = "other"
+    document.failure_message = "Not an invoice."
     db.add(
         AuditLog(
             action="document_routed_other",
@@ -632,10 +746,12 @@ def _process_in_background(document_id: uuid.UUID) -> None:
                 exc.detail,
             )
 
-        except Exception:
-            logger.exception(
-                "Auto processing crashed for %s",
+        except Exception as exc:
+            logger.error(
+                "Auto processing crashed for %s (%s): %s",
                 document_id,
+                type(exc).__name__,
+                _safe_exception_detail(exc),
             )
 
         finally:
@@ -830,6 +946,15 @@ def _save_invoice_from_extraction(
                 (item for item in prior_versions if getattr(item, "is_current", False)),
                 None,
             )
+            if (
+                current_version is not None
+                and total_amount is not None
+                    and getattr(current_version, "total_amount", None) == total_amount
+            ):
+                raise DuplicateInvoiceError(
+                    "Duplicate current invoice: same vendor, number, and total",
+                    original_invoice_id=current_version.id,
+                )
             if current_version is not None and all(
                 getattr(current_version, field, None) == value
                 for field, value in invoice_values.items()
@@ -885,8 +1010,63 @@ def _line_value(line: dict, *keys):
     return next((line.get(key) for key in keys if line.get(key) is not None), None)
 
 
+def _apply_email_po_hint(document: Document, data: dict) -> None:
+    """Fill a missing PO reference from email text without replacing extraction."""
+    if data.get("order_number") or data.get("po_number"):
+        return
+    email_text = "\n".join(
+        value
+        for value in (
+            getattr(document, "email_subject", None),
+            getattr(document, "email_body_preview", None),
+        )
+        if value
+    )
+    match = re.search(
+        r"\b(?:purchase\s+order|p\.?\s*o\.?)(?:\s*(?:number|no\.?|#))?\s*[:#-]?\s*"
+        r"([A-Z0-9][A-Z0-9/_-]{2,})\b",
+        email_text,
+        re.IGNORECASE,
+    )
+    if match:
+        data["order_number"] = match.group(1)
+        data["order_number_source"] = "email"
+
+
 def _document_failure_message(error: Exception) -> str:
     failure_text = str(error).casefold()
+    if OCR_MODELS_UNAVAILABLE_MESSAGE.casefold() in failure_text:
+        return OCR_MODELS_UNAVAILABLE_MESSAGE
+    if any(
+        phrase in failure_text
+        for phrase in (
+            "no text could be extracted",
+            "no readable text",
+            "empty document",
+            "no text found",
+        )
+    ):
+        return (
+            "Scanned or image-only document with no readable text; "
+            "upload an OCR-readable copy."
+        )
+    if any(
+        phrase in failure_text
+        for phrase in (
+            "localentrynotfound",
+            "huggingface",
+            "model artifact",
+            "model repository",
+            "could not load model",
+            "snapshot_download",
+        )
+    ):
+        return OCR_MODELS_UNAVAILABLE_MESSAGE
+    if any(
+        phrase in failure_text
+        for phrase in ("not an invoice", "not a bill", "document is not an invoice")
+    ):
+        return "This file does not appear to be an invoice; upload a bill to continue."
     if any(word in failure_text for word in ("password", "encrypted", "not decrypted")):
         return "This file is password-protected; ask the vendor for an unlocked copy."
     if (
@@ -925,15 +1105,20 @@ def _document_failure_message(error: Exception) -> str:
             "line values and retry."
         )
     if any(
-        word in failure_text
-        for word in ("unsupported", "not supported", "unknown format")
+        phrase in failure_text
+        for phrase in ("unsupported image", "unsupported image format", "image format")
     ):
-        return "This file type is unsupported; ask the vendor to send a PDF or image."
+        return "This image format is unsupported; upload a PNG or JPG image."
     if any(
         word in failure_text
         for word in ("unreadable image", "image decode", "cannot identify image")
     ):
         return "This image could not be read; upload a clearer PNG or JPG image."
+    if any(
+        word in failure_text
+        for word in ("unsupported", "not supported", "unknown format")
+    ):
+        return "This file type is unsupported; ask the vendor to send a PDF or image."
     if "vendor" in failure_text and any(
         word in failure_text for word in ("unknown", "not found", "unresolved")
     ):
@@ -963,7 +1148,10 @@ def _document_failure_message(error: Exception) -> str:
             "A document processing service is temporarily unavailable; "
             "retry processing shortly."
         )
-    return "This file could not be processed; check the file and retry."
+    return (
+        "Document extraction failed; retry processing. "
+        "If it fails again, contact support."
+    )
 
 
 def _line_fingerprints(lines: list, *, extracted: bool = False) -> list[tuple]:
@@ -1059,6 +1247,56 @@ class AwaitingHumanDecisionError(ValueError):
 
 class DuplicateInvoiceError(ValueError):
     """The same current invoice content has already been processed."""
+
+    def __init__(self, message: str, original_invoice_id=None):
+        super().__init__(message)
+        self.original_invoice_id = original_invoice_id
+
+
+def _record_invoice_extraction_issues(db, invoice: Invoice, issues: list[str]) -> None:
+    """Keep extraction validation findings visible beside the saved invoice."""
+    active_fields = set()
+    for issue in issues:
+        normalized = issue.casefold()
+        field = (
+            issue.split(":", 1)[1].strip()
+            if issue.startswith("Missing required field:")
+            else "amounts"
+            if "amount mismatch" in normalized or "monetary" in normalized
+            else "extraction"
+        )[:80]
+        field_key = f"extraction_{field}"[:80]
+        active_fields.add(field_key)
+        discrepancy = (
+            db.query(InvoiceDiscrepancy)
+            .filter(
+                InvoiceDiscrepancy.invoice_id == invoice.id,
+                InvoiceDiscrepancy.field == field_key,
+                InvoiceDiscrepancy.resolved.is_(False),
+            )
+            .first()
+        )
+        if discrepancy is None:
+            discrepancy = InvoiceDiscrepancy(
+                invoice_id=invoice.id,
+                field=field_key,
+                severity="error",
+                resolved=False,
+            )
+            db.add(discrepancy)
+        discrepancy.reason = issue
+        discrepancy.invoice_value = {"extracted": True}
+    for discrepancy in (
+        db.query(InvoiceDiscrepancy)
+        .filter(
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+            InvoiceDiscrepancy.field.like("extraction_%"),
+            InvoiceDiscrepancy.resolved.is_(False),
+        )
+        .all()
+    ):
+        if discrepancy.field not in active_fields:
+            discrepancy.resolved = True
 
 
 def _save_goods_receipt_from_extraction(
@@ -1551,7 +1789,7 @@ def resolve_purchase_order_vendor(
             ),
         }
 
-    if document.status not in {"needs_vendor_review", "extracted"}:
+    if document.status not in {"needs_data_review", "needs_vendor_review", "extracted"}:
         raise HTTPException(
             status_code=409,
             detail="The document is not ready for purchase order vendor review",
@@ -1696,10 +1934,13 @@ def resolve_purchase_order_vendor(
     try:
         refresh_related_workflows(db, document.id)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
-        logger.exception(
-            "Workflow refresh failed after vendor resolution for %s", document.id
+        logger.error(
+            "Workflow refresh failed after vendor resolution for %s (%s): %s",
+            document.id,
+            type(exc).__name__,
+            _safe_exception_detail(exc),
         )
 
     return {
@@ -1823,7 +2064,11 @@ def parse_document(
                 detail=document.failure_message,
             ) from None
 
-        logger.exception("MinIO download failed")
+        logger.error(
+            "MinIO download failed (%s): %s",
+            type(exc).__name__,
+            _safe_exception_detail(exc),
+        )
         document.status = "failed"
         document.failure_message = _document_failure_message(exc)
         db.commit()
@@ -1834,7 +2079,11 @@ def parse_document(
         ) from None
 
     except Exception as exc:
-        logger.exception("MinIO download failed")
+        logger.error(
+            "MinIO download failed (%s): %s",
+            type(exc).__name__,
+            _safe_exception_detail(exc),
+        )
         document.status = "failed"
         document.failure_message = _document_failure_message(exc)
         db.commit()
@@ -1869,8 +2118,29 @@ def parse_document(
             ).DocumentConverter
 
             converter = _get_converter(document_converter)
-            result = converter.convert(temp_path)
-            raw_text = result.document.export_to_markdown()
+            try:
+                result = converter.convert(temp_path)
+                raw_text = result.document.export_to_markdown()
+            except Exception as exc:
+                models_missing = _docling_models_missing()
+                if (
+                    Path(temp_path).suffix.casefold() == ".pdf"
+                    and (_is_extraction_model_error(exc) or models_missing)
+                ):
+                    raw_text = _extract_pdf_text_layer(temp_path)
+                    if not raw_text.strip():
+                        if models_missing:
+                            raise RuntimeError(OCR_MODELS_UNAVAILABLE_MESSAGE) from exc
+                        raise
+                    logger.warning(
+                        "Used the embedded PDF text layer because extraction models "
+                        "were unavailable (%s)",
+                        _safe_exception_detail(exc),
+                    )
+                else:
+                    if models_missing:
+                        raise RuntimeError(OCR_MODELS_UNAVAILABLE_MESSAGE) from exc
+                    raise
 
         if not raw_text or not raw_text.strip():
             raise ValueError("No text could be extracted from the document")
@@ -2021,6 +2291,8 @@ def parse_document(
         extracted_data = with_transient_retries(
             lambda: extract_document(raw_text, doc_type)
         )
+        if doc_type == "invoice" and isinstance(extracted_data, dict):
+            _apply_email_po_hint(document, extracted_data)
 
         validation_data = extracted_data
         _record_pipeline_step(
@@ -2141,22 +2413,21 @@ def parse_document(
         # Preserve extracted data for review.
         document.extracted_json = extracted_data
 
-        # Save valid invoices as new versions when their vendor and number
-        # identify an existing invoice.
-        invoice_issues = [
-            issue
-            for issue in validation_issues
-            if issue != "Missing required field: vendor"
-        ]
-        if doc_type == "invoice" and not invoice_issues:
+        # Persist extracted invoices even when fields need human correction.
+        duplicate_invoice_id = None
+        saved_invoice = None
+        if doc_type == "invoice" and isinstance(extracted_data, dict):
             try:
-                if "Missing required field: vendor" in validation_issues:
-                    validation_issues.remove("Missing required field: vendor")
                 saved_invoice = _save_invoice_from_extraction(
                     db,
                     document,
                     extracted_data,
                 )
+                if saved_invoice is not None and validation_issues:
+                    _record_invoice_extraction_issues(
+                        db, saved_invoice, validation_issues
+                    )
+                    saved_invoice.status = "needs_review"
                 if saved_invoice is not None and requires_verification(
                     getattr(saved_invoice, "field_confidence", None) or {}
                 ):
@@ -2170,33 +2441,9 @@ def parse_document(
                                 "verification"
                             ),
                         )
-                elif saved_invoice is not None and (
-                    saved_invoice.po_id is None
-                    or getattr(saved_invoice, "vendor_id", True) is None
-                ):
-                    _auto_reject_unmatched_invoice(db, saved_invoice, document)
-                    validation_issues.clear()
                 elif saved_invoice is not None:
                     run_match_for_invoice(
                         db, saved_invoice.id, getattr(document, "created_by", None)
-                    )
-                elif saved_invoice is not None:
-                    step_started = time.perf_counter()
-                    _record_pipeline_step(
-                        db,
-                        document,
-                        "po_link",
-                        step_started,
-                        output_summary={"po_linked": False},
-                        result="warning",
-                    )
-                    _record_pipeline_step(
-                        db,
-                        document,
-                        "match",
-                        step_started,
-                        output_summary={"result": "waiting_for_po"},
-                        result="warning",
                     )
 
             except IntegrityError as exc:
@@ -2218,6 +2465,15 @@ def parse_document(
                 )
             except DuplicateInvoiceError as exc:
                 validation_issues.append(str(exc))
+                duplicate_invoice_id = exc.original_invoice_id
+                document.extracted_json = {
+                    **extracted_data,
+                    **(
+                        {"duplicate_of_invoice_id": str(duplicate_invoice_id)}
+                        if duplicate_invoice_id
+                        else {}
+                    ),
+                }
             except ValueError as exc:
                 validation_issues.append(str(exc))
         if doc_type == "po" and not validation_issues:
@@ -2284,11 +2540,16 @@ def parse_document(
                 for issue in validation_issues
             )
             document.status = (
-                "duplicate_blocked" if duplicate_invoice else "needs_vendor_review"
+                "duplicate_blocked" if duplicate_invoice else "needs_data_review"
             )
             document.failure_message = _document_failure_message(
                 ValueError("; ".join(validation_issues))
             )
+            if duplicate_invoice_id:
+                document.extracted_json = {
+                    **(document.extracted_json or {}),
+                    "duplicate_of_invoice_id": str(duplicate_invoice_id),
+                }
 
             logger.warning(
                 "Document %s requires review: %s",
@@ -2320,11 +2581,13 @@ def parse_document(
             try:
                 refresh_related_workflows(db, document.id)
                 db.commit()
-            except Exception:
+            except Exception as exc:
                 db.rollback()
-                logger.exception(
-                    "Workflow refresh failed after document %s was extracted",
+                logger.error(
+                    "Workflow refresh failed after document %s was extracted (%s): %s",
                     document_id,
+                    type(exc).__name__,
+                    _safe_exception_detail(exc),
                 )
         notify_started = time.perf_counter()
         dispatch_queued_notifications(db, document.id, background_tasks)
@@ -2345,22 +2608,24 @@ def parse_document(
             "extracted_json": document.extracted_json,
             "validation_issues": validation_issues,
             "duplicate_of": (
-                str(duplicate_purchase_order.id)
+                str(duplicate_invoice_id)
+                if duplicate_invoice_id
+                else str(duplicate_purchase_order.id)
                 if duplicate_purchase_order is not None
                 else None
             ),
         }
 
     except Exception as exc:
-        logger.exception(
-            "Document parse/classification/extraction failed for %s",
+        logger.error(
+            "Document parse/classification/extraction failed for %s (%s): %s",
             document_id,
+            type(exc).__name__,
+            _safe_exception_detail(exc),
         )
 
         db.rollback()
-        failure_detail = (
-            "The document could not be processed; check the file and retry."
-        )
+        failure_detail = _document_failure_message(exc)
 
         try:
             document = db.query(Document).filter_by(id=document_id).first()
@@ -2405,9 +2670,13 @@ def parse_document(
                 db.commit()
                 dispatch_queued_notifications(db, document.id)
 
-        except Exception:
+        except Exception as status_error:
             db.rollback()
-            logger.exception("Failed to update document failure status")
+            logger.error(
+                "Failed to update document failure status (%s): %s",
+                type(status_error).__name__,
+                _safe_exception_detail(status_error),
+            )
 
         raise HTTPException(
             status_code=500,
@@ -2440,7 +2709,11 @@ def get_document_file(
     try:
         content = download_file(document.storage_path)
     except Exception as exc:
-        logger.exception("MinIO file download failed")
+        logger.error(
+            "MinIO file download failed (%s): %s",
+            type(exc).__name__,
+            _safe_exception_detail(exc),
+        )
         raise HTTPException(
             status_code=502, detail="Original file could not be retrieved"
         ) from exc
@@ -2482,7 +2755,8 @@ def retry_document_processing(
         and document.updated_at <= datetime.now(UTC) - STALE_PARSE_TIMEOUT
     )
     if (
-        document.status not in {"failed", "needs_vendor_review", "incomplete"}
+        document.status
+        not in {"failed", "needs_data_review", "needs_vendor_review", "incomplete"}
         and not stale_parse
     ):
         raise HTTPException(
@@ -2493,7 +2767,17 @@ def retry_document_processing(
             ),
         )
     old_status = document.status
-    document.status = "received"
+    is_raw_email = (
+        getattr(document, "source", None) == "email"
+        and getattr(document, "parent_document_id", None) is None
+        and (
+            getattr(document, "original_filename", "").casefold().endswith(".eml")
+            or (getattr(document, "mime", None) or "").casefold()
+            == "message/rfc822"
+        )
+    )
+    retry_status = "parsing" if is_raw_email else "received"
+    document.status = retry_status
     document.failure_message = None
     actor_id = owner_id
     document.updated_by = actor_id
@@ -2503,15 +2787,18 @@ def retry_document_processing(
             entity_type="document",
             entity_id=document.id,
             old_value={"status": old_status},
-            new_value={"status": "received"},
+            new_value={"status": retry_status},
             message="Document processing retry requested",
             created_by=actor_id,
         )
     )
     db.commit()
-    dispatch_document_processing(
-        background_tasks,
-        document.id,
-        _process_in_background,
-    )
+    if is_raw_email:
+        dispatch_raw_email_recovery(background_tasks, document.id)
+    else:
+        dispatch_document_processing(
+            background_tasks,
+            document.id,
+            _process_in_background,
+        )
     return {"id": str(document.id), "status": document.status}

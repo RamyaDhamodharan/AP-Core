@@ -42,12 +42,15 @@ def ingest_file(
     object_key: str | None = None,
     document_id: uuid.UUID | None = None,
     source_flag: str | None = None,
+    internal_email_body: bool = False,
 ) -> IngestResult:
     """Persist one file and enqueue document processing after its row commits."""
     ingest_started = time.perf_counter()
     filename = Path(filename or "upload").name
     extension = Path(filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
+    if extension not in ALLOWED_EXTENSIONS and not (
+        internal_email_body and source == "email" and extension == ".txt"
+    ):
         return IngestResult("failed", None, "Unsupported file type")
     if not content_bytes:
         return IngestResult("failed", None, "Uploaded file is empty")
@@ -124,7 +127,10 @@ def ingest_file(
                     type(cleanup_exc).__name__,
                 )
             else:
-                logger.exception("MinIO cleanup failed after duplicate ingestion")
+                logger.error(
+                    "MinIO cleanup failed after duplicate ingestion (%s)",
+                    type(cleanup_exc).__name__,
+                )
         existing = db.query(Document).filter_by(file_hash=file_hash).first()
         if existing is None and source in {"email", "email_poll"}:
             email_message_id = document_meta.get("email_message_id")
@@ -150,14 +156,17 @@ def ingest_file(
             if source in {"email", "email_poll"}:
                 logger.warning("Email MinIO cleanup failed (%s)", type(exc).__name__)
             else:
-                logger.exception("MinIO cleanup failed after ingestion error")
+                logger.error(
+                    "MinIO cleanup failed after ingestion error (%s)",
+                    type(exc).__name__,
+                )
         if source in {"email", "email_poll"}:
             logger.warning("Email file ingestion failed (%s)", type(exc).__name__)
             raise RuntimeError(
                 "Email file persistence failed while saving to storage/database: "
                 f"{type(exc).__name__}: {exc}"
             ) from None
-        logger.exception("File ingestion failed for %s", filename)
+        logger.error("File ingestion failed for %s (%s)", filename, type(exc).__name__)
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 
     if extension != ".eml":

@@ -2,7 +2,7 @@ import os
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -79,7 +79,7 @@ def _invoice_owner_filter(owner_id: uuid.UUID):
         Invoice.owner_user_id == owner_id,
         Invoice.created_by == owner_id,
         Document.created_by == owner_id,
-        Document.source == "email",
+        Document.source.in_(["email", "email_poll"]),
     )
 
 
@@ -266,10 +266,18 @@ def _invoice_dashboard_response(
             InvoiceDashboardItem(
                 invoice_id=invoice.id,
                 source_document_id=invoice.source_document_id,
+                received_at=(
+                    getattr(document, "email_received_at", None)
+                    or getattr(document, "created_at", None)
+                ),
                 processing_status=(
                     document.status if isinstance(document, Document) else document
                 ),
-                source=getattr(document, "source", None),
+                source=(
+                    "email"
+                    if getattr(document, "source", None) == "email_poll"
+                    else getattr(document, "source", None)
+                ),
                 email_sender=getattr(document, "email_sender", None),
                 email_subject=getattr(document, "email_subject", None),
                 invoice_no=invoice.invoice_no,
@@ -404,6 +412,7 @@ def list_invoices(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     match_status: InvoiceMatchStatus | None = None,
     status: InvoiceStatus | None = None,
+    source: Literal["email", "upload"] | None = None,
     final_status: InvoiceFinalStatus | None = None,
     vendor_id: uuid.UUID | None = None,
     invoice_date_from: date | None = None,
@@ -452,6 +461,11 @@ def list_invoices(
         filters.append(Invoice.owner_user_id == owner_user_id)
     if status:
         filters.append(Invoice.status == status)
+    if source:
+        if source == "email":
+            filters.append(Document.source.in_(["email", "email_poll"]))
+        else:
+            filters.append(Document.source == source)
     if overdue:
         filters.extend(
             [

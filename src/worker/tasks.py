@@ -20,6 +20,14 @@ def process_document(self, document_id: str) -> None:
     _process_in_background(uuid.UUID(document_id))
 
 
+@celery_app.task(name="ap.recover_raw_email", bind=True, max_retries=0)
+def recover_raw_email(self, document_id: str) -> None:
+    """Recover supported attachments from a persisted raw EML document."""
+    from src.services.document_recovery_services import recover_raw_email_document
+
+    recover_raw_email_document(uuid.UUID(document_id))
+
+
 @celery_app.task(name="ap.send_notification", bind=True, max_retries=2)
 def send_notification(self, notification_id: str) -> None:
     """Process one queued notification through the shared email outbox."""

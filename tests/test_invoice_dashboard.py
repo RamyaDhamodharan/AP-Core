@@ -88,6 +88,7 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
         {
             "invoice_id": str(invoice.id),
             "source_document_id": str(invoice.source_document_id),
+            "received_at": None,
             "processing_status": "extracted",
             "source": None,
             "email_sender": None,
@@ -213,7 +214,12 @@ def test_invoice_list_applies_filters_and_search():
         expression.compile(dialect=postgresql.dialect()) for expression in expressions
     ]
     sql = " ".join(str(statement) for statement in compiled)
-    params = {value for statement in compiled for value in statement.params.values()}
+    params = {
+        item
+        for statement in compiled
+        for value in statement.params.values()
+        for item in (value if isinstance(value, (list, tuple)) else [value])
+    }
     assert "invoices.match_status" in sql
     assert "invoices.final_status" in sql
     assert "invoices.vendor_id" in sql

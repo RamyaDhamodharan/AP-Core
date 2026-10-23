@@ -21,13 +21,38 @@ def dispatch_document_processing(
 
             process_document.delay(str(document_id))
             return "celery"
-        except Exception:
-            logger.exception(
-                "Celery dispatch failed for %s; using in-process fallback",
+        except Exception as exc:
+            logger.error(
+                "Celery dispatch failed for %s (%s); using in-process fallback",
                 document_id,
+                type(exc).__name__,
             )
 
     background_tasks.add_task(fallback, document_id)
+    return "background"
+
+
+def dispatch_raw_email_recovery(
+    background_tasks: BackgroundTasks,
+    document_id: uuid.UUID,
+) -> str:
+    """Recover persisted attachments instead of parsing an email container."""
+    if os.getenv("USE_CELERY", "false").lower() == "true":
+        try:
+            from src.worker.tasks import recover_raw_email
+
+            recover_raw_email.delay(str(document_id))
+            return "celery"
+        except Exception as exc:
+            logger.error(
+                "Celery raw email recovery dispatch failed for %s (%s)",
+                document_id,
+                type(exc).__name__,
+            )
+
+    from src.services.document_recovery_services import recover_raw_email_document
+
+    background_tasks.add_task(recover_raw_email_document, document_id)
     return "background"
 
 
@@ -41,9 +66,11 @@ def dispatch_notification(
 
             send_notification.delay(str(notification_id))
             return "celery"
-        except Exception:
-            logger.exception(
-                "Celery notification dispatch failed for %s", notification_id
+        except Exception as exc:
+            logger.error(
+                "Celery notification dispatch failed for %s (%s)",
+                notification_id,
+                type(exc).__name__,
             )
     if background_tasks is not None:
         background_tasks.add_task(_send_notification_in_process, notification_id)
@@ -91,9 +118,13 @@ def _send_notification_in_process(notification_id: uuid.UUID) -> None:
             notification.last_error = draft.last_error
             notification.status = "sent" if draft.status == "sent" else "failed"
             db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
-        logger.exception("Notification dispatch failed for %s", notification_id)
+        logger.error(
+            "Notification dispatch failed for %s (%s)",
+            notification_id,
+            type(exc).__name__,
+        )
     finally:
         db.close()
 
@@ -110,8 +141,12 @@ def dispatch_queued_notifications(db, document_id, background_tasks=None) -> int
             )
             .all()
         )
-    except Exception:
-        logger.exception("Could not load queued notifications for %s", document_id)
+    except Exception as exc:
+        logger.error(
+            "Could not load queued notifications for %s (%s)",
+            document_id,
+            type(exc).__name__,
+        )
         return 0
     for row in rows:
         dispatch_notification(background_tasks, row.id)

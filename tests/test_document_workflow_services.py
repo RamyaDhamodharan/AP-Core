@@ -629,7 +629,7 @@ def test_invoice_recommendation_includes_extraction_validation_issue():
     session, _rows, _sources, invoice_doc, _po, _gr, invoice, owner = (
         _workflow_session()
     )
-    invoice_doc.status = "needs_vendor_review"
+    invoice_doc.status = "needs_data_review"
     invoice_doc.failure_message = "Invoice total is invalid"
 
     result = recommend_invoice_review(session, invoice, owner_id=owner)

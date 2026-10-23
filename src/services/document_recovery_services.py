@@ -16,6 +16,100 @@ from src.models.email_models import EmailMessage
 logger = logging.getLogger(__name__)
 
 
+def recover_raw_email_document(document_id: uuid.UUID) -> None:
+    """Recover attachments for one raw email document after an explicit retry."""
+    from src.db.session_db import SessionLocal
+    from src.services.email_polling_services import _sanitize_exception_message
+
+    db = SessionLocal()
+    try:
+        document = (
+            db.query(Document)
+            .filter_by(id=document_id)
+            .with_for_update()
+            .first()
+        )
+        if document is None:
+            return
+        try:
+            outcome = _recover_raw_email(db, document)
+        except Exception as exc:
+            detail = _sanitize_exception_message(str(exc))
+            logger.error(
+                "Raw email recovery failed for %s (%s): %s",
+                document_id,
+                type(exc).__name__,
+                detail or "No exception message",
+            )
+            outcome = "Raw email recovery failed"
+
+        email_message = (
+            db.query(EmailMessage)
+            .filter(EmailMessage.message_id == document.email_message_id)
+            .first()
+            if document.email_message_id
+            else None
+        )
+        if outcome == "attachments recovered":
+            document.status = "processed"
+            document.failure_message = None
+            if email_message:
+                email_message.status = "processed"
+                email_message.failure_reason = None
+                email_message.filter_reason = None
+                email_message.next_retry_at = None
+        elif outcome in {
+            "No attachment found",
+            "Only an inline image found, send a PDF",
+            "Unsupported attachment type",
+        }:
+            document.status = "ignored"
+            document.failure_message = outcome
+            if email_message:
+                email_message.status = "needs_attention"
+                email_message.failure_reason = outcome
+                email_message.filter_reason = outcome
+                email_message.next_retry_at = None
+        else:
+            document.status = "failed"
+            document.failure_message = (
+                "Email attachments could not be recovered; retry or upload "
+                "them directly."
+            )
+            if email_message:
+                email_message.status = "failed_final"
+                email_message.failure_reason = document.failure_message
+                email_message.next_retry_at = None
+        db.add(
+            AuditLog(
+                action="document_raw_email_recovered",
+                entity_type="document",
+                entity_id=document.id,
+                result="success" if outcome == "attachments recovered" else "error",
+                message="Raw email attachment recovery completed",
+                reason=outcome,
+                new_value={"outcome": outcome},
+            )
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            "Raw email retry failed for %s (%s): %s",
+            document_id,
+            type(exc).__name__,
+            _safe_recovery_error(exc),
+        )
+    finally:
+        db.close()
+
+
+def _safe_recovery_error(error: Exception) -> str:
+    from src.services.email_polling_services import _sanitize_exception_message
+
+    return _sanitize_exception_message(str(error)) or "No exception message"
+
+
 def _document_attempts(db, document_id) -> int:
     return (
         db.query(AuditLog)

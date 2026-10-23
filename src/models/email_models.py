@@ -51,6 +51,9 @@ class EmailMessage(Base):
     )
     message_id: Mapped[str] = mapped_column(String(500), nullable=False)
     uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    uidvalidity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     mailbox: Mapped[str] = mapped_column(String(300), nullable=False)
     folder: Mapped[str] = mapped_column(String(300), nullable=False, default="INBOX")
     sender: Mapped[str | None] = mapped_column(String(300))

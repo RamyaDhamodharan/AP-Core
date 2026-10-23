@@ -290,7 +290,7 @@ def _seed_processed(db, uid, message_id):
     )
 
 
-def test_uid_checkpoint_only_processes_uids_after_checkpoint_and_overlap_dedupes(
+def test_uid_checkpoint_only_processes_uids_after_checkpoint(
     polling_setup,
 ):
     db, _, _ = polling_setup
@@ -307,14 +307,11 @@ def test_uid_checkpoint_only_processes_uids_after_checkpoint_and_overlap_dedupes
     result, client = _poll(db, messages)
 
     assert result["attachments"] == 1
-    assert result["skipped_known"] == 2
+    assert result["skipped_known"] == 0
     assert result["duplicates"] == 0
     assert state.last_uid == 3
-    assert [uid for uid, _ in client.fetch_queries] == [1, 2, 3]
-    assert "HEADER.FIELDS" in client.fetch_queries[0][1]
-    assert "HEADER.FIELDS" in client.fetch_queries[1][1]
+    assert [uid for uid, _ in client.fetch_queries] == [3]
     assert "UID 3:*" in client.search_queries
-    assert "UID 1:2" in client.search_queries
     assert client.selected_readonly
 
 
@@ -734,12 +731,11 @@ def test_sender_blocklist_matches_configured_domain_or_pattern(
             )
         },
     )
-    assert result["attachments"] == 1
+    assert result["attachments"] == 0
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert row.status == "processed"
-    assert row.raw_object_key
-    child = next(doc for doc in _documents(db) if doc.parent_document_id)
-    assert child.source_flag == "bulk_sender"
+    assert row.status == "ignored"
+    assert row.filter_reason == "Sender is blocked by mailbox filters"
+    assert not _documents(db)
 
 
 def test_bounce_subject_and_auto_submitted_no_filter(polling_setup):
@@ -769,12 +765,45 @@ def test_bad_magic_attachment_is_rejected(polling_setup):
         db, {1: _mail(attachments=[("bill.pdf", b"x" * 500, "application", "pdf")])}
     )
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "failed_final"
+    assert email_row.status == "ignored"
     assert email_row.failure_reason == "Unsupported attachment type or file signature"
     assert result["attachments"] == 0
-    assert result["failed"] == 1
-    assert any(document.status == "failed" for document in _documents(db))
+    assert result["failed"] == 0
+    assert result["filtered"] == 1
+    assert not _documents(db)
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
+
+
+@pytest.mark.parametrize("header_offset", [0, 16, 1023])
+def test_pdf_header_within_allowed_preamble_is_accepted(header_offset):
+    part = MIMEMessage()
+    part["Content-Type"] = "application/pdf"
+    payload = b" " * header_offset + b"%PDF-1.7\nbody"
+
+    assert email_polling_services._attachment_format(part, payload) is not None
+
+
+def test_pdf_header_after_allowed_preamble_is_rejected():
+    part = MIMEMessage()
+    part["Content-Type"] = "application/pdf"
+    payload = b" " * 1024 + b"%PDF-1.7\nbody"
+
+    assert email_polling_services._attachment_format(part, payload) is None
+
+
+@pytest.mark.parametrize(
+    ("content_type", "payload"),
+    [
+        ("image/webp", b"RIFF\x00\x00\x00\x00WEBP"),
+        ("text/csv", b"employee_id,name\n1,Example"),
+    ],
+)
+def test_misnamed_pdf_with_unsupported_content_is_rejected(content_type, payload):
+    part = MIMEMessage()
+    part["Content-Type"] = content_type
+    part["Content-Disposition"] = 'attachment; filename="invoice.pdf"'
+
+    assert email_polling_services._attachment_format(part, payload) is None
 
 
 def test_oversized_attachment_is_failed_without_storage(polling_setup, monkeypatch):
@@ -785,12 +814,10 @@ def test_oversized_attachment_is_failed_without_storage(polling_setup, monkeypat
         db, {1: _mail(attachments=[("big.pdf", content, "application", "pdf")])}
     )
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "failed_final"
-    assert "exceeds the 1 MB limit" in email_row.failure_reason
-    assert result["failed"] >= 1
-    failed_attachment = next(doc for doc in _documents(db) if doc.parent_document_id)
-    assert failed_attachment.status == "failed"
-    assert failed_attachment.source == "email"
+    assert email_row.status == "needs_attention"
+    assert email_row.failure_reason == "Attachment exceeds the configured size limit"
+    assert result["filtered"] == 1
+    assert not _documents(db)
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
@@ -801,9 +828,9 @@ def test_inline_image_under_twenty_kb_is_skipped(polling_setup):
     )
     assert result["attachments"] == 0
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "needs_attention"
+    assert email_row.status == "ignored"
     assert email_row.raw_object_key is None
-    assert email_row.failure_reason == "No attachment found"
+    assert email_row.failure_reason == "Only tiny inline images found"
 
 
 def test_large_invoice_inline_image_is_ingested_as_email_document(polling_setup):
@@ -1000,7 +1027,7 @@ def test_failed_retry_records_fresh_reason_instead_of_backfill_placeholder(
         attachments=[("bill.pdf", b"not a pdf", "application", "pdf")],
     )
     _poll(db, {12: raw})
-    assert row.status == "failed_final"
+    assert row.status == "ignored"
     assert row.failure_reason != "Unknown (before reason tracking)"
     assert "Unsupported attachment" in row.failure_reason
 
@@ -1304,7 +1331,7 @@ def test_status_endpoint_returns_persisted_uid_state(polling_setup):
     assert payload["filtered_by_reason"] == {"bulk_marketing": 1}
 
 
-def test_unknown_no_reply_pdf_is_ingested_as_bulk_other(polling_setup, monkeypatch):
+def test_unknown_no_reply_pdf_is_skipped(polling_setup, monkeypatch):
     db, _, _ = polling_setup
     result, _ = _poll(
         db,
@@ -1315,26 +1342,11 @@ def test_unknown_no_reply_pdf_is_ingested_as_bulk_other(polling_setup, monkeypat
             )
         },
     )
-    assert result["attachments"] == 1
-    child = next(doc for doc in _documents(db) if doc.parent_document_id)
-    assert child.source_flag == "bulk_sender"
-    from fastapi import BackgroundTasks
-
-    from src.api.rest.routers import document_routers
-
-    parent = next(doc for doc in _documents(db) if doc.parent_document_id is None)
-    db.rows.remove(parent)
-    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
-    response = document_routers.parse_document(
-        document_id=child.id,
-        background_tasks=BackgroundTasks(),
-        db=db,
-        current_user={"worker": True},
-    )
-    assert response["status"] == "other"
-    assert response["failure_message"] == "bulk sender, not a bill"
-    assert child.status == "other"
-    assert child.doc_type == "other"
+    assert result["attachments"] == 0
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert row.status == "ignored"
+    assert row.filter_reason == "Sender is blocked by mailbox filters"
+    assert not _documents(db)
 
 
 def test_unknown_bulk_without_pdf_is_ignored_with_reason(polling_setup):
@@ -1355,7 +1367,7 @@ def test_unknown_bulk_without_pdf_is_ignored_with_reason(polling_setup):
     assert not uploads and not _documents(db)
 
 
-def test_known_vendor_sender_bypasses_blocklist_and_bulk_filters(
+def test_known_vendor_does_not_bypass_blocklist_or_bulk_filters(
     polling_setup, monkeypatch
 ):
     db, _, _ = polling_setup
@@ -1382,13 +1394,12 @@ def test_known_vendor_sender_bypasses_blocklist_and_bulk_filters(
         },
     )
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert row.status == "processed"
-    child = next(doc for doc in _documents(db) if doc.parent_document_id)
-    assert child.source_flag == "auto_reply"
-    assert result["attachments"] == 1
+    assert row.status == "ignored"
+    assert row.filter_reason == "Sender is blocked by mailbox filters"
+    assert result["attachments"] == 0
 
 
-def test_vendor_alias_display_name_is_trusted(polling_setup, monkeypatch):
+def test_vendor_alias_cannot_bypass_noreply_filter(polling_setup, monkeypatch):
     db, _, _ = polling_setup
     vendor = Vendor(
         name="Trusted", contact_email="billing@trusted.test", is_active=True
@@ -1412,10 +1423,9 @@ def test_vendor_alias_display_name_is_trusted(polling_setup, monkeypatch):
         },
     )
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    child = next(doc for doc in _documents(db) if doc.parent_document_id)
-    assert row.status == "processed"
-    assert child.source_flag == "auto_reply"
-    assert result["attachments"] == 1
+    assert row.status == "ignored"
+    assert row.filter_reason == "Sender is blocked by mailbox filters"
+    assert result["attachments"] == 0
 
 
 def test_no_reply_never_gets_no_attachment_notification(polling_setup, monkeypatch):
@@ -1443,11 +1453,12 @@ def test_bulk_image_only_is_ignored_but_vendor_image_is_accepted(polling_setup):
     assert not _documents(db)
 
 
-def test_attachment_minimum_size_skips_non_inline_images(polling_setup):
+def test_small_regular_attached_invoice_image_is_accepted(polling_setup):
     db, _, _ = polling_setup
     _poll(db, {1: _mail(attachments=[("tiny.png", PNG, "image", "png", "attachment")])})
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert row.filter_reason == "No attachment found"
+    assert row.status == "processed"
+    assert row.raw_object_key
 
 
 def test_cid_and_tracking_pixel_images_are_skipped():
@@ -1519,10 +1530,39 @@ def test_email_message_list_exposes_filter_reason(polling_setup):
     )
     db.add(row)
     result = email_poll_messages(db=db, _user={"role": "admin"})
-    assert result[0]["filter_reason"] == "bulk_marketing"
+    assert result["items"][0]["filter_reason"] == "bulk_marketing"
 
 
-def test_manual_poll_endpoint_requires_admin(monkeypatch, user_stub_factory):
+@pytest.mark.parametrize(
+    ("ui_status", "stored_statuses"),
+    [("skipped", ["ignored"]), ("failed", ["failed", "failed_final"])],
+)
+def test_email_message_ui_status_filters_cover_stored_statuses(
+    ui_status, stored_statuses
+):
+    from src.api.rest.routers.email_polling_routers import email_poll_messages
+
+    query = MagicMock()
+    query.filter.return_value = query
+    query.count.return_value = 0
+    page = query.order_by.return_value.offset.return_value.limit.return_value
+    page.all.return_value = []
+    db = MagicMock()
+    db.query.return_value = query
+
+    result = email_poll_messages(
+        status=ui_status, db=db, _user={"role": "associate"}
+    )
+
+    assert result["total"] == 0
+    expression = query.filter.call_args.args[0]
+    for stored_status in stored_statuses:
+        assert stored_status in str(expression.compile().params.values())
+
+
+def test_manual_poll_endpoint_allows_admin_and_associate(
+    monkeypatch, user_stub_factory
+):
     secret = "email-poll-test-secret-with-32-bytes"
     monkeypatch.setenv("JWT_SECRET_KEY", secret)
     db = MagicMock()
@@ -1550,13 +1590,11 @@ def test_manual_poll_endpoint_requires_admin(monkeypatch, user_stub_factory):
             secret,
             algorithm="HS256",
         )
-        assert (
-            client.post(
-                "/api/email-polling/run",
-                headers={"Authorization": f"Bearer {associate}"},
-            ).status_code
-            == 403
+        associate_response = client.post(
+            "/api/email-polling/run",
+            headers={"Authorization": f"Bearer {associate}"},
         )
+        assert associate_response.status_code == 200
         response = client.post(
             "/api/email-polling/run",
             headers={"Authorization": f"Bearer {admin}"},
@@ -1567,7 +1605,7 @@ def test_manual_poll_endpoint_requires_admin(monkeypatch, user_stub_factory):
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_status_endpoint_requires_admin(monkeypatch, user_stub_factory):
+def test_status_endpoint_allows_admin_and_associate(monkeypatch, user_stub_factory):
     secret = "email-poll-status-secret-with-32-bytes"
     monkeypatch.setenv("JWT_SECRET_KEY", secret)
     db = MagicMock()
@@ -1591,13 +1629,11 @@ def test_status_endpoint_requires_admin(monkeypatch, user_stub_factory):
             secret,
             algorithm="HS256",
         )
-        assert (
-            client.get(
-                "/api/email-polling/status",
-                headers={"Authorization": f"Bearer {associate}"},
-            ).status_code
-            == 403
+        associate_response = client.get(
+            "/api/email-polling/status",
+            headers={"Authorization": f"Bearer {associate}"},
         )
+        assert associate_response.status_code == 200
         response = client.get(
             "/api/email-polling/status",
             headers={"Authorization": f"Bearer {admin}"},

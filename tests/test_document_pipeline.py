@@ -982,7 +982,7 @@ def test_parse_document_does_not_persist_incomplete_purchase_order(
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "needs_vendor_review"
+    assert response.json()["status"] == "needs_data_review"
     assert "Missing required field: po_date" in response.json()["validation_issues"]
     assert document.extracted_json == data
     _assert_no_purchase_order_persisted(db)
@@ -1009,13 +1009,13 @@ def test_parse_document_flags_duplicate_current_purchase_order(
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "needs_vendor_review"
+    assert response.json()["status"] == "needs_data_review"
     assert response.json()["duplicate_of"] == str(duplicate_id)
     assert any(
         "Duplicate current purchase order number" in issue
         for issue in response.json()["validation_issues"]
     )
-    assert document.status == "needs_vendor_review"
+    assert document.status == "needs_data_review"
     _assert_no_purchase_order_persisted(db)
 
 
@@ -1037,7 +1037,7 @@ def test_parse_document_requires_known_vendor_for_purchase_order(
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "needs_vendor_review"
+    assert response.json()["status"] == "needs_data_review"
     assert (
         "Vendor not found or inactive: Unknown Supplies"
         in response.json()["validation_issues"]
@@ -1067,12 +1067,12 @@ def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "needs_vendor_review"
+    assert response.json()["status"] == "needs_data_review"
     assert (
         "PO line amounts do not reconcile to subtotal"
         in response.json()["validation_issues"]
     )
-    assert document.status == "needs_vendor_review"
+    assert document.status == "needs_data_review"
     _assert_no_purchase_order_persisted(db)
 
 
@@ -1226,11 +1226,90 @@ def test_parse_document_classification_failure(monkeypatch, classification_resul
         ("Password required to open PDF", "password-protected"),
         ("Corrupt PDF: unexpected EOF", "appears damaged"),
         ("Unsupported input format", "unsupported"),
+        ("No text could be extracted from the document", "no readable text"),
+        ("Unsupported image format", "image format is unsupported"),
+        ("Not an invoice", "does not appear to be an invoice"),
     ],
 )
 def test_parse_failure_has_plain_language_reason(error, expected):
     message = document_routers._document_failure_message(RuntimeError(error))
     assert expected in message
+
+
+def test_parse_failure_fallback_names_extraction_failure():
+    message = document_routers._document_failure_message(
+        RuntimeError("unexpected OCR error")
+    )
+    assert message == (
+        "Document extraction failed; retry processing. "
+        "If it fails again, contact support."
+    )
+
+
+def test_exception_log_detail_redacts_credentials(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "provider-secret-value")
+    error = RuntimeError(
+        "request failed password=hunter2 api_key=provider-secret-value"
+    )
+
+    detail = document_routers._safe_exception_detail(error)
+
+    assert "hunter2" not in detail
+    assert "provider-secret-value" not in detail
+    assert detail.count("[REDACTED]") == 2
+
+
+def test_docling_missing_model_errors_are_recognized():
+    assert document_routers._is_extraction_model_error(
+        RuntimeError("LocalEntryNotFoundError: model snapshot is unavailable")
+    )
+    assert not document_routers._is_extraction_model_error(
+        RuntimeError("Corrupt PDF: invalid cross-reference table")
+    )
+
+
+def test_missing_ocr_models_have_actionable_failure_message(monkeypatch):
+    monkeypatch.setattr(document_routers, "docling_models_available", lambda: False)
+    assert document_routers._docling_models_missing()
+
+    message = document_routers._document_failure_message(
+        RuntimeError(document_routers.OCR_MODELS_UNAVAILABLE_MESSAGE)
+    )
+
+    assert message == (
+        "OCR models are not installed. Ask an admin to run the model download."
+    )
+
+
+def test_pdfium_text_layer_fallback_reads_each_page(monkeypatch):
+    class FakeTextPage:
+        def get_text_range(self):
+            return "Invoice total $25.00"
+
+        def close(self):
+            pass
+
+    class FakePage:
+        def get_textpage(self):
+            return FakeTextPage()
+
+        def close(self):
+            pass
+
+    class FakePdf:
+        def __iter__(self):
+            return iter([FakePage(), FakePage()])
+
+        def close(self):
+            pass
+
+    fake_pdfium = ModuleType("pypdfium2")
+    fake_pdfium.PdfDocument = lambda _path: FakePdf()
+    monkeypatch.setitem(sys.modules, "pypdfium2", fake_pdfium)
+
+    assert document_routers._extract_pdf_text_layer("invoice.pdf") == (
+        "Invoice total $25.00\n\nInvoice total $25.00"
+    )
 
 
 def test_parse_marks_unsupported_stored_file_failed(monkeypatch):
