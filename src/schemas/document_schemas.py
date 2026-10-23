@@ -18,6 +18,7 @@ class DocumentSummary(BaseModel):
     email_sender: str | None = None
     email_subject: str | None = None
     email_received_at: datetime | None = None
+    email_message_id: str | None = None
     created_at: datetime
     updated_at: datetime
 

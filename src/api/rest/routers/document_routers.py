@@ -245,10 +245,10 @@ def _document_owner_filters(owner_id: uuid.UUID) -> list:
 
 
 def _document_scope_filters(owner_id: uuid.UUID, current_user: dict) -> list:
-    """Admins can review mailbox documents; other users see their own uploads."""
+    """Mailbox documents are shared with finance staff; uploads remain user scoped."""
     if current_user.get("role") == "admin":
         return []
-    return _document_owner_filters(owner_id)
+    return [or_(Document.source == "email", *_document_owner_filters(owner_id))]
 
 
 @router.get("", response_model=DocumentListResponse)
@@ -1509,7 +1509,10 @@ def resolve_purchase_order_vendor(
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)
-        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .filter(
+            Document.id == document_id,
+            *_document_scope_filters(owner_id, current_user),
+        )
         .with_for_update()
         .first()
     )
@@ -2426,7 +2429,7 @@ def get_document_file(
         db.query(Document)
         .filter(
             Document.id == document_id,
-            *_document_owner_filters(_document_owner_id(current_user)),
+            *_document_scope_filters(_document_owner_id(current_user), current_user),
         )
         .first()
     )
@@ -2463,7 +2466,10 @@ def retry_document_processing(
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)
-        .filter(Document.id == document_id, *_document_owner_filters(owner_id))
+        .filter(
+            Document.id == document_id,
+            *_document_scope_filters(owner_id, current_user),
+        )
         .with_for_update()
         .first()
     )

@@ -45,7 +45,7 @@ class FakeQuery:
     def limit(self, *_):
         return self
 
-    def with_for_update(self):
+    def with_for_update(self, **_kwargs):
         return self
 
     def first(self):
@@ -619,6 +619,7 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
     )
     assert failed.attempts == 5
     assert failed.status == "failed_final"
+    assert failed.failure_reason
     assert state.last_uid == 2
     assert any(
         row.action == "email_failed_final"
@@ -743,12 +744,11 @@ def test_bad_magic_attachment_is_rejected(polling_setup):
         db, {1: _mail(attachments=[("bill.pdf", b"x" * 500, "application", "pdf")])}
     )
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "ignored"
-    assert email_row.raw_object_key is None
-    assert email_row.failure_reason == "invalid_attachment"
+    assert email_row.status == "failed_final"
+    assert email_row.failure_reason == "Unsupported attachment type or file signature"
     assert result["attachments"] == 0
-    assert result["filtered"] == 1
-    assert not _documents(db)
+    assert result["failed"] == 1
+    assert any(document.status == "failed" for document in _documents(db))
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
@@ -760,11 +760,12 @@ def test_oversized_attachment_is_failed_without_storage(polling_setup, monkeypat
         db, {1: _mail(attachments=[("big.pdf", content, "application", "pdf")])}
     )
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "ignored"
-    assert email_row.raw_object_key is None
-    assert email_row.failure_reason == "attachment_too_large"
-    assert result["filtered"] == 1
-    assert not _documents(db)
+    assert email_row.status == "failed_final"
+    assert "exceeds the 1 MB limit" in email_row.failure_reason
+    assert result["failed"] >= 1
+    failed_attachment = next(doc for doc in _documents(db) if doc.parent_document_id)
+    assert failed_attachment.status == "failed"
+    assert failed_attachment.source == "email"
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
@@ -775,9 +776,9 @@ def test_inline_image_under_five_kb_is_skipped(polling_setup):
     )
     assert result["attachments"] == 0
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "ignored"
+    assert email_row.status == "needs_attention"
     assert email_row.raw_object_key is None
-    assert email_row.failure_reason == "inline_image_below_min_size"
+    assert email_row.failure_reason == "No attachment found"
 
 
 def test_at_most_ten_attachments_are_ingested(polling_setup):
@@ -815,8 +816,110 @@ def test_email_and_attachment_objects_use_safe_keys_and_db_metadata(polling_setu
         f"incoming/{parent.email_received_at:%Y/%m}/{child.id}/invoice_weird_.pdf"
     )
     assert child.parent_document_id == parent.id
+    assert child.source == "email"
+    assert child.email_message_id == parent.email_message_id
+    assert child.email_sender == parent.email_sender
+    assert child.email_subject == parent.email_subject
     assert any(key == eml_key and body == raw for key, body, _ in uploads)
     assert any(key == child.storage_path for key, _, _ in uploads)
+
+
+def test_retried_email_reuses_existing_documents_without_duplicates(polling_setup):
+    db, _, _ = polling_setup
+    message = _mail(attachments=[("bill.pdf", PDF, "application", "pdf")])
+    _poll(db, {1: message})
+    initial_documents = len(_documents(db))
+    email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    email_row.status = "failed"
+    email_row.attempts = 0
+    email_row.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+    result, _ = _poll(db, {1: message})
+    assert len(_documents(db)) == initial_documents
+    assert result["duplicates"] == 1
+    assert email_row.status == "processed"
+
+
+def test_admin_email_retry_resets_attempts_and_audits(polling_setup, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from src.api.rest.routers.email_polling_routers import retry_email_message
+    from src.worker.tasks import poll_email
+
+    db, _, _ = polling_setup
+    row = EmailMessageRecord(
+        id=uuid.uuid4(),
+        message_id="<retry@vendor.test>",
+        uid=9,
+        mailbox="ap@test-mail.test",
+        sender="billing@vendor.test",
+        status="failed_final",
+        failure_reason="Connection failed",
+        attempts=5,
+    )
+    db.add(row)
+    dispatched = []
+    monkeypatch.setattr(poll_email, "delay", lambda: dispatched.append(True))
+    monkeypatch.setenv("USE_CELERY", "true")
+    result = retry_email_message(
+        message_id=row.id,
+        background_tasks=BackgroundTasks(),
+        db=db,
+        current_user={"role": "admin", "sub": str(uuid.uuid4())},
+    )
+    assert result["status"] == "failed"
+    assert row.attempts == 0
+    assert row.failure_reason is None
+    assert dispatched == [True]
+    assert any(
+        audit.action == "email_retry_requested"
+        for audit in db.rows
+        if isinstance(audit, AuditLog)
+    )
+
+
+def test_stuck_document_sweep_marks_failed_and_propagates_reason(
+    polling_setup, monkeypatch
+):
+    from src.services.document_recovery_services import sweep_stuck_documents
+
+    db, _, _ = polling_setup
+    old = datetime.now(UTC) - timedelta(minutes=90)
+    document = Document(
+        id=uuid.uuid4(),
+        original_filename="stuck.pdf",
+        file_hash="b" * 64,
+        status="parsing",
+        source="email",
+        email_message_id="<stuck@vendor.test>",
+        updated_at=old,
+    )
+    message = EmailMessageRecord(
+        message_id="<stuck@vendor.test>",
+        uid=4,
+        mailbox="ap@test-mail.test",
+        sender="billing@vendor.test",
+        status="processed",
+        attempts=1,
+    )
+    db.add(document)
+    db.add(message)
+    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "60")
+    assert sweep_stuck_documents(db) == 2
+    assert document.status == "failed"
+    assert "stopped unexpectedly" in document.failure_message
+    assert message.status == "failed_final"
+    assert message.failure_reason == document.failure_message
+
+
+def test_celery_task_routes_match_compose_worker_queues():
+    from src.worker.celery_app import celery_app
+
+    routes = celery_app.conf.task_routes
+    assert routes["ap.poll_email"]["queue"] == "email"
+    assert routes["ap.send_notification"]["queue"] == "email"
+    assert routes["ap.run_follow_ups"]["queue"] == "email"
+    assert routes["ap.process_document"]["queue"] == "documents"
+    assert routes["ap.sweep_stuck_documents"]["queue"] == "documents"
 
 
 def test_html_body_is_stripped_when_no_plain_text(polling_setup):
@@ -841,9 +944,10 @@ def test_no_attachment_queues_allowlist_protected_notification(polling_setup):
     db, _, notifications = polling_setup
     result, _ = _poll(db, {1: _mail()})
     email_row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert email_row.status == "ignored"
+    assert email_row.status == "needs_attention"
     assert email_row.raw_object_key is None
-    assert email_row.failure_reason == "no_valid_attachment"
+    assert email_row.failure_reason == "No attachment found"
+    assert email_row.filter_reason == "No attachment found"
     assert not _documents(db)
     assert not any(isinstance(row, Notification) for row in db.rows)
     assert notifications == []
@@ -961,7 +1065,7 @@ def test_unknown_bulk_without_pdf_is_ignored_with_reason(polling_setup):
     )
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
     assert row.status == "ignored"
-    assert row.filter_reason == "bulk_marketing"
+    assert row.filter_reason == "Bulk or marketing email was skipped"
     assert result["filtered_by_reason"] == {"bulk_marketing": 1}
     assert not uploads and not _documents(db)
 
@@ -1058,7 +1162,7 @@ def test_attachment_minimum_size_skips_non_inline_images(polling_setup):
     db, _, _ = polling_setup
     _poll(db, {1: _mail(attachments=[("tiny.png", PNG, "image", "png", "attachment")])})
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert row.filter_reason == "no_attachment"
+    assert row.filter_reason == "No attachment found"
 
 
 def test_cid_and_tracking_pixel_images_are_skipped():

@@ -53,7 +53,7 @@ def ingest_file(
         return IngestResult("failed", None, "Uploaded file is empty")
     max_size = (
         int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20")) * 1024 * 1024
-        if source == "email_poll" and extension != ".eml"
+        if source in {"email", "email_poll"} and extension != ".eml"
         else MAX_FILE_SIZE
     )
     if len(content_bytes) > max_size:
@@ -130,11 +130,11 @@ def ingest_file(
         try:
             delete_file(storage_path)
         except Exception:
-            if source == "email_poll":
+            if source in {"email", "email_poll"}:
                 logger.warning("Email MinIO cleanup failed (%s)", type(exc).__name__)
             else:
                 logger.exception("MinIO cleanup failed after ingestion error")
-        if source == "email_poll":
+        if source in {"email", "email_poll"}:
             logger.warning("Email file ingestion failed (%s)", type(exc).__name__)
             raise RuntimeError(
                 "Email file persistence failed while saving to storage/database: "

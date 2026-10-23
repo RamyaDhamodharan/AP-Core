@@ -33,6 +33,7 @@ celery_app.conf.update(
     task_default_queue="documents",
     task_routes={
         "ap.process_document": {"queue": "documents"},
+        "ap.sweep_stuck_documents": {"queue": "documents"},
         "ap.poll_email": {"queue": "email"},
         "ap.send_notification": {"queue": "email"},
         "ap.mark_overdue": {"queue": "email"},
@@ -52,6 +53,10 @@ celery_app.conf.beat_schedule = {
     "run-follow-ups-every-15-minutes": {
         "task": "ap.run_follow_ups",
         "schedule": schedule(900),
+    },
+    "sweep-stuck-documents-every-five-minutes": {
+        "task": "ap.sweep_stuck_documents",
+        "schedule": schedule(300),
     },
 }
 

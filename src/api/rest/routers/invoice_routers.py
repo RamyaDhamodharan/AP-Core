@@ -79,6 +79,7 @@ def _invoice_owner_filter(owner_id: uuid.UUID):
         Invoice.owner_user_id == owner_id,
         Invoice.created_by == owner_id,
         Document.created_by == owner_id,
+        Document.source == "email",
     )
 
 
@@ -235,7 +236,7 @@ def _invoice_dashboard_response(
         .scalar()
     )
     rows = (
-        db.query(Invoice, Vendor.name.label("vendor_name"), Document.status)
+        db.query(Invoice, Vendor.name.label("vendor_name"), Document)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
         .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
@@ -265,7 +266,12 @@ def _invoice_dashboard_response(
             InvoiceDashboardItem(
                 invoice_id=invoice.id,
                 source_document_id=invoice.source_document_id,
-                processing_status=document_status,
+                processing_status=(
+                    document.status if isinstance(document, Document) else document
+                ),
+                source=getattr(document, "source", None),
+                email_sender=getattr(document, "email_sender", None),
+                email_subject=getattr(document, "email_subject", None),
                 invoice_no=invoice.invoice_no,
                 vendor_name=vendor_name or invoice.vendor_name_raw,
                 invoice_date=invoice.invoice_date,
@@ -284,7 +290,7 @@ def _invoice_dashboard_response(
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
             )
-            for invoice, vendor_name, document_status in rows
+            for invoice, vendor_name, document in rows
         ],
         total=total or 0,
         page=page,
@@ -800,6 +806,12 @@ def get_invoice_detail(
             low_confidence_fields.append(field)
     return {
         "invoice_id": str(invoice.id),
+        "source_document_id": str(invoice.source_document_id)
+        if invoice.source_document_id
+        else None,
+        "source": getattr(document, "source", None),
+        "email_sender": getattr(document, "email_sender", None),
+        "email_subject": getattr(document, "email_subject", None),
         "invoice_no": invoice.invoice_no,
         "vendor_id": str(invoice.vendor_id) if invoice.vendor_id else None,
         "vendor_name": invoice.vendor_name_raw,

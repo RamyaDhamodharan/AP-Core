@@ -65,3 +65,16 @@ def run_follow_ups(self) -> dict:
         return run_follow_ups_service(db)
     finally:
         db.close()
+
+
+@celery_app.task(name="ap.sweep_stuck_documents", bind=True, max_retries=0)
+def sweep_stuck_documents(self) -> int:
+    """Mark abandoned document work as failed so users can retry it."""
+    from src.db.session_db import SessionLocal
+    from src.services.document_recovery_services import sweep_stuck_documents as sweep
+
+    db = SessionLocal()
+    try:
+        return sweep(db)
+    finally:
+        db.close()

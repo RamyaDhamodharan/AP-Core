@@ -6,6 +6,7 @@ import email.utils
 import hashlib
 import html.parser
 import imaplib
+import json
 import logging
 import os
 import re
@@ -36,12 +37,16 @@ IMAP_REACHABILITY_ERROR = "Cannot reach IMAP host"
 IMAP_CONFIG_ERROR = "IMAP_USER / IMAP_PASSWORD not set"
 EMPTY_COUNTS = {
     "emails": 0,
+    "new": 0,
     "attachments": 0,
+    "documents_created": 0,
     "duplicates": 0,
     "filtered": 0,
     "failed": 0,
     "skipped_known": 0,
     "filtered_by_reason": {},
+    "skipped_by_reason": {},
+    "failed_by_reason": {},
 }
 ATTACHMENT_FORMATS = {
     "application/pdf": (".pdf", lambda data: data.startswith(b"%PDF-")),
@@ -272,6 +277,12 @@ def _record_email_failure(db, row, uid: int, counts: dict, exc: Exception) -> bo
     transient = _is_transient_email_error(exc)
     final = not transient or attempt_no >= _max_attempts()
     row.status = "failed_final" if final else "failed"
+    reason = _sanitize_exception_message(str(exc)) or type(exc).__name__
+    if final and attempt_no >= _max_attempts():
+        reason = f"Maximum retry attempts reached ({_max_attempts()}): {reason}"
+    row.failure_reason = reason[:200]
+    failed_by_reason = counts.setdefault("failed_by_reason", {})
+    failed_by_reason[reason[:200]] = failed_by_reason.get(reason[:200], 0) + 1
     row.next_retry_at = None if final else _retry_at(attempt_no)
     retry_text = row.next_retry_at.isoformat() if row.next_retry_at else "none"
     detail = (
@@ -292,7 +303,8 @@ def _record_email_failure(db, row, uid: int, counts: dict, exc: Exception) -> bo
         reason=detail,
     )
     db.commit()
-    counts["failed"] += 1
+    if counts.get("failed", 0) == 0:
+        counts["failed"] = 1
     return final
 
 
@@ -326,7 +338,7 @@ def _count_result(counts: dict) -> dict:
     return {
         key: (
             dict(counts.get(key, {}))
-            if key == "filtered_by_reason"
+            if key in {"filtered_by_reason", "skipped_by_reason", "failed_by_reason"}
             else int(counts.get(key, 0))
         )
         for key in EMPTY_COUNTS
@@ -334,13 +346,20 @@ def _count_result(counts: dict) -> dict:
 
 
 def _empty_counts() -> dict:
-    return {**EMPTY_COUNTS, "filtered_by_reason": {}}
+    return {
+        **EMPTY_COUNTS,
+        "filtered_by_reason": {},
+        "skipped_by_reason": {},
+        "failed_by_reason": {},
+    }
 
 
 def _count_filtered(counts: dict, reason: str) -> None:
     counts["filtered"] += 1
     by_reason = counts.setdefault("filtered_by_reason", {})
     by_reason[reason] = by_reason.get(reason, 0) + 1
+    skipped = counts.setdefault("skipped_by_reason", {})
+    skipped[reason] = skipped.get(reason, 0) + 1
 
 
 def _record_run(
@@ -373,6 +392,7 @@ def poll_email_with_lock(db) -> dict:
     """Run the poll under the existing shared Redis lock."""
     from redis import Redis
 
+    started_at = time.monotonic()
     lock = None
     try:
         lock = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0")).lock(
@@ -380,9 +400,33 @@ def poll_email_with_lock(db) -> dict:
         )
         if not lock.acquire(blocking=False):
             return {**_empty_counts(), "skipped": "lock"}
-        return poll_email_messages(db)
+        result = poll_email_messages(db)
+        logger.info(
+            "email_poll_run %s",
+            json.dumps(
+                {
+                    **_count_result(result),
+                    "mails_found": result.get("emails", 0),
+                    "duration_ms": int((time.monotonic() - started_at) * 1000),
+                    "outcome": "failed" if result.get("failed") else "completed",
+                },
+                sort_keys=True,
+            ),
+        )
+        return result
     except Exception:
         logger.warning("Email polling Redis lock is unavailable")
+        logger.info(
+            "email_poll_run %s",
+            json.dumps(
+                {
+                    "duration_ms": int((time.monotonic() - started_at) * 1000),
+                    "failed": 1,
+                    "failure_reason": "Redis lock unavailable",
+                },
+                sort_keys=True,
+            ),
+        )
         _audit(
             db,
             "email_failed",
@@ -560,8 +604,15 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                     if message_id
                     else None
                 )
-                if known and known.status in {"processed", "ignored", "failed_final"}:
+                if known and known.status in {
+                    "processed",
+                    "ignored",
+                    "needs_attention",
+                    "failed_final",
+                }:
                     counts["skipped_known"] += 1
+                    skipped = counts.setdefault("skipped_by_reason", {})
+                    skipped["duplicate"] = skipped.get("duplicate", 0) + 1
                     continue
                 # The overlap is a reconciliation window, never a reason to
                 # download an unknown message body or repeat a non-due retry.
@@ -596,6 +647,30 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                 state.last_uid = uid
                 state.updated_at = datetime.now(UTC)
                 db.commit()
+            message_row = (
+                db.query(EmailMessage)
+                .filter_by(mailbox=mailbox, folder=folder, uid=uid)
+                .first()
+            )
+            if message_row is not None:
+                logger.debug(
+                    "email_message %s",
+                    json.dumps(
+                        {
+                            "message_id": message_row.message_id,
+                            "sender": _sanitize_exception_message(
+                                message_row.sender or ""
+                            ),
+                            "subject": _sanitize_exception_message(
+                                message_row.subject or ""
+                            ),
+                            "outcome": message_row.status,
+                            "reason": message_row.failure_reason
+                            or message_row.filter_reason,
+                        },
+                        sort_keys=True,
+                    ),
+                )
 
         return _record_run(db, state, counts)
     except Exception as exc:
@@ -839,7 +914,14 @@ def _record_failed_attachment(
             status="failed",
             failure_message=message[:500],
             parent_document_id=parent.id,
-            source="email_poll",
+            source="email",
+            email_sender=parent.email_sender,
+            email_subject=parent.email_subject,
+            email_received_at=parent.email_received_at,
+            email_message_id=parent.email_message_id,
+            email_uid=parent.email_uid,
+            email_body_preview=parent.email_body_preview,
+            email_eml_key=parent.email_eml_key,
         )
     )
     db.commit()
@@ -883,9 +965,16 @@ def _process_uid(
         .first()
     )
     prior = prior_by_id or prior_by_uid
-    if prior and prior.status in {"processed", "ignored", "failed_final"}:
+    if prior and prior.status in {
+        "processed",
+        "ignored",
+        "needs_attention",
+        "failed_final",
+    }:
         if prior.status != "failed_final":
             counts["duplicates"] += 1
+            if not prior.filter_reason:
+                prior.filter_reason = "Duplicate message ID"
             _audit(
                 db,
                 "email_skipped_duplicate",
@@ -896,6 +985,8 @@ def _process_uid(
         return True
 
     attempt_no = (prior.attempts if prior else 0) + 1
+    if prior is None:
+        counts["new"] += 1
     date_for_key = received or datetime.now(UTC)
     message_hash = hashlib.sha1(message_id.encode()).hexdigest()
     eml_key = f"emails/{date_for_key:%Y/%m}/{message_hash}.eml"
@@ -926,11 +1017,14 @@ def _process_uid(
         prior.status = "processing"
         prior.attempts = attempt_no
         prior.next_retry_at = None
+        prior.failure_reason = None
+        prior.filter_reason = None
     db.commit()
 
     if received_after and (received is None or received < received_after):
         prior.status = "ignored"
         prior.failure_reason = "outside_initial_lookback"
+        prior.filter_reason = "Outside configured initial lookback window"
         _audit(
             db,
             "email_skipped_filtered",
@@ -970,8 +1064,8 @@ def _process_uid(
         prior.filter_reason = filter_reason
     if filter_reason and source_flag != "bulk_sender":
         prior.status = "ignored"
-        prior.failure_reason = filter_reason
-        prior.filter_reason = filter_reason
+        prior.failure_reason = _friendly_filter_reason(filter_reason)
+        prior.filter_reason = _friendly_filter_reason(filter_reason)
         _audit(
             db,
             "email_skipped_filtered",
@@ -1005,17 +1099,17 @@ def _process_uid(
         counts["emails"] += 1
         return True
 
-    if not _has_valid_attachment(msg, pdf_only=bool(source_flag)):
-        prior.status = "ignored"
+    if not _has_attachment_candidate(msg):
+        prior.status = "needs_attention"
         prior.raw_object_key = None
-        prior.filter_reason = "no_attachment"
-        prior.failure_reason = _invalid_attachment_reason(msg)
+        prior.filter_reason = "No attachment found"
+        prior.failure_reason = "No attachment found"
         _audit(
             db,
             "email_skipped_filtered",
             "Email has no valid supported attachment",
             entity_id=prior.id,
-            detail=prior.filter_reason,
+            detail="No attachment found",
         )
         db.commit()
         _count_filtered(counts, "no_attachment")
@@ -1034,7 +1128,7 @@ def _process_uid(
                 raw,
                 "message/rfc822",
                 None,
-                "email_poll",
+                "email",
                 email_meta={
                     "email_sender": sender or None,
                     "email_subject": subject or None,
@@ -1079,6 +1173,7 @@ def _process_uid(
         valid = 0
         attachment_failure = False
         accepted_attachment_count = 0
+        attachment_reasons = []
         max_bytes = (
             max(1, int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20"))) * 1024 * 1024
         )
@@ -1098,9 +1193,19 @@ def _process_uid(
             if _skip_image_part(part, payload, referenced_cids):
                 continue
             if source_flag and content_type != "application/pdf":
+                attachment_failure = True
+                attachment_reasons.append(
+                    "Unsupported attachment type for filtered sender"
+                )
+                prior.failure_reason = attachment_reasons[-1]
                 continue
             if accepted_attachment_count >= MAX_ATTACHMENTS_PER_EMAIL:
                 counts["failed"] += 1
+                attachment_failure = True
+                attachment_reasons.append(
+                    "Maximum of 10 attachments per email exceeded"
+                )
+                prior.failure_reason = attachment_reasons[-1]
                 _audit(
                     db,
                     "email_failed",
@@ -1120,33 +1225,38 @@ def _process_uid(
                     db, root, original_name, content_type, payload, message
                 )
                 counts["failed"] += 1
+                attachment_failure = True
+                attachment_reasons.append(message)
                 _audit(
                     db,
                     "email_failed",
                     "Email attachment exceeded the configured size limit",
                     result="error",
                     entity_id=prior.id,
-                    detail="attachment_too_large",
+                    detail=message,
                 )
                 continue
             detected = _attachment_format(part, payload)
             if detected is None:
+                message = "Unsupported attachment type or file signature"
                 _record_failed_attachment(
                     db,
                     root,
                     original_name,
                     content_type,
                     payload,
-                    "Attachment type or file signature is not an allowed bill format",
+                    message,
                 )
                 counts["failed"] += 1
+                attachment_failure = True
+                attachment_reasons.append(message)
                 _audit(
                     db,
                     "email_failed",
                     "Email attachment type or content did not match",
                     result="error",
                     entity_id=prior.id,
-                    detail="attachment_type_or_magic_mismatch",
+                    detail=message,
                 )
                 continue
 
@@ -1170,8 +1280,17 @@ def _process_uid(
                 payload,
                 content_type,
                 None,
-                "email_poll",
+                "email",
                 parent_document_id=root.id,
+                email_meta={
+                    "email_sender": sender or None,
+                    "email_subject": subject or None,
+                    "email_received_at": received,
+                    "email_message_id": message_id,
+                    "email_uid": uid,
+                    "email_body_preview": preview,
+                    "email_eml_key": eml_key,
+                },
                 object_key=object_key,
                 document_id=document_id,
                 source_flag=source_flag,
@@ -1179,6 +1298,7 @@ def _process_uid(
             if result.status == "received":
                 valid += 1
                 counts["attachments"] += 1
+                counts["documents_created"] += 1
                 _audit(
                     db,
                     "attachment_ingested",
@@ -1190,12 +1310,15 @@ def _process_uid(
             elif result.status == "duplicate_blocked":
                 counts["duplicates"] += 1
                 valid += 1
+                prior.filter_reason = "Duplicate attachment content"
             else:
                 attachment_failure = True
 
         if not valid:
             root.status = "ignored"
             root.failure_message = "No bill attachment found"
+            prior.failure_reason = "No supported bill attachment found"
+            prior.filter_reason = "No supported bill attachment found"
             _audit(
                 db,
                 "email_ignored",
@@ -1218,7 +1341,8 @@ def _process_uid(
                 uid,
                 counts,
                 RuntimeError(
-                    "Email attachment ingestion returned an unsuccessful result"
+                    "; ".join(attachment_reasons)
+                    or "Email attachment ingestion returned an unsuccessful result"
                 ),
             )
         return True
@@ -1259,6 +1383,33 @@ def _has_valid_attachment(msg: Message, *, pdf_only: bool = False) -> bool:
         if len(payload) <= max_bytes and _attachment_format(part, payload):
             return True
     return False
+
+
+def _has_attachment_candidate(msg: Message) -> bool:
+    referenced_cids = _referenced_content_ids(msg)
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if not (
+            part.get_filename()
+            or part.get_content_disposition() in {"attachment", "inline"}
+        ):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if not _skip_image_part(part, payload, referenced_cids):
+            return True
+    return False
+
+
+def _friendly_filter_reason(reason: str) -> str:
+    labels = {
+        "blocked_sender": "Sender is blocked by mailbox filters",
+        "bulk_marketing": "Bulk or marketing email was skipped",
+        "bounce": "Mail delivery failure message was skipped",
+        "sender_not_allowlisted": "Sender is not on the allowed sender list",
+        "outside_initial_lookback": "Outside configured initial lookback",
+    }
+    return labels.get(reason, reason.replace("_", " ").capitalize())
 
 
 def _has_valid_pdf_attachment(msg: Message) -> bool:

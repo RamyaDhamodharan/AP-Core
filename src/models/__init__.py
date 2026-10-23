@@ -7,8 +7,8 @@ from src.models import exchange_rate_models as exchange_rate_models
 from src.models import follow_up_models as follow_up_models
 from src.models import goods_receipt_models as goods_receipt_models
 from src.models import invoice_issue_models as invoice_issue_models
-from src.models import invoice_models as invoice_models
 from src.models import invoice_match_models as invoice_match_models
+from src.models import invoice_models as invoice_models
 from src.models import (
     invoice_supporting_document_models as invoice_supporting_document_models,
 )
