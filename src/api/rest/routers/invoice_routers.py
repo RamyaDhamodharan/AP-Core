@@ -2,7 +2,7 @@ import os
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -79,6 +79,7 @@ def _invoice_owner_filter(owner_id: uuid.UUID):
         Invoice.owner_user_id == owner_id,
         Invoice.created_by == owner_id,
         Document.created_by == owner_id,
+        Document.source.in_(["email", "email_poll"]),
     )
 
 
@@ -235,7 +236,7 @@ def _invoice_dashboard_response(
         .scalar()
     )
     rows = (
-        db.query(Invoice, Vendor.name.label("vendor_name"), Document.status)
+        db.query(Invoice, Vendor.name.label("vendor_name"), Document)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
         .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
@@ -265,7 +266,20 @@ def _invoice_dashboard_response(
             InvoiceDashboardItem(
                 invoice_id=invoice.id,
                 source_document_id=invoice.source_document_id,
-                processing_status=document_status,
+                received_at=(
+                    getattr(document, "email_received_at", None)
+                    or getattr(document, "created_at", None)
+                ),
+                processing_status=(
+                    document.status if isinstance(document, Document) else document
+                ),
+                source=(
+                    "email"
+                    if getattr(document, "source", None) == "email_poll"
+                    else getattr(document, "source", None)
+                ),
+                email_sender=getattr(document, "email_sender", None),
+                email_subject=getattr(document, "email_subject", None),
                 invoice_no=invoice.invoice_no,
                 vendor_name=vendor_name or invoice.vendor_name_raw,
                 invoice_date=invoice.invoice_date,
@@ -284,7 +298,7 @@ def _invoice_dashboard_response(
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
             )
-            for invoice, vendor_name, document_status in rows
+            for invoice, vendor_name, document in rows
         ],
         total=total or 0,
         page=page,
@@ -398,6 +412,7 @@ def list_invoices(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     match_status: InvoiceMatchStatus | None = None,
     status: InvoiceStatus | None = None,
+    source: Literal["email", "upload"] | None = None,
     final_status: InvoiceFinalStatus | None = None,
     vendor_id: uuid.UUID | None = None,
     invoice_date_from: date | None = None,
@@ -446,6 +461,11 @@ def list_invoices(
         filters.append(Invoice.owner_user_id == owner_user_id)
     if status:
         filters.append(Invoice.status == status)
+    if source:
+        if source == "email":
+            filters.append(Document.source.in_(["email", "email_poll"]))
+        else:
+            filters.append(Document.source == source)
     if overdue:
         filters.extend(
             [
@@ -800,6 +820,12 @@ def get_invoice_detail(
             low_confidence_fields.append(field)
     return {
         "invoice_id": str(invoice.id),
+        "source_document_id": str(invoice.source_document_id)
+        if invoice.source_document_id
+        else None,
+        "source": getattr(document, "source", None),
+        "email_sender": getattr(document, "email_sender", None),
+        "email_subject": getattr(document, "email_subject", None),
         "invoice_no": invoice.invoice_no,
         "vendor_id": str(invoice.vendor_id) if invoice.vendor_id else None,
         "vendor_name": invoice.vendor_name_raw,

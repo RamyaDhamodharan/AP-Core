@@ -307,7 +307,7 @@ def test_document_retry_is_audited_and_authenticated(monkeypatch):
     actor_id = uuid.uuid4()
     document = SimpleNamespace(
         id=document_id,
-        status="needs_vendor_review",
+        status="needs_data_review",
         failure_message="Vendor needs review",
         updated_by=None,
         created_by=actor_id,
@@ -333,7 +333,43 @@ def test_document_retry_is_audited_and_authenticated(monkeypatch):
     assert document.status == "received"
     assert document.updated_by == actor_id
     assert db.add.call_args.args[0].action == "document_processing_retry_requested"
-    assert db.add.call_args.args[0].old_value == {"status": "needs_vendor_review"}
+    assert db.add.call_args.args[0].old_value == {"status": "needs_data_review"}
+
+
+def test_raw_email_retry_uses_attachment_recovery(monkeypatch):
+    document_id = uuid.uuid4()
+    actor_id = uuid.uuid4()
+    document = SimpleNamespace(
+        id=document_id,
+        status="failed",
+        failure_message="Processing stopped unexpectedly after 60 minutes.",
+        updated_by=None,
+        created_by=actor_id,
+        source="email",
+        parent_document_id=None,
+        original_filename="email.eml",
+        mime="message/rfc822",
+    )
+    db = MagicMock()
+    (
+        db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value
+    ) = document
+    recovery = MagicMock()
+    processing = MagicMock()
+    monkeypatch.setattr(document_routers, "dispatch_raw_email_recovery", recovery)
+    monkeypatch.setattr(document_routers, "dispatch_document_processing", processing)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(actor_id)}
+    try:
+        response = client.post(f"/api/documents/{document_id}/retry")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "parsing"
+    recovery.assert_called_once()
+    processing.assert_not_called()
 
 
 def test_stale_document_processing_can_be_retried(monkeypatch):

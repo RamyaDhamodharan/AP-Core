@@ -1,3 +1,4 @@
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,11 +23,14 @@ from src.api.rest.routers import (
     user_routers,
     vendor_routers,
 )
+from src.services.docling_model_services import docling_models_available
 from src.services.llm_pipeline_services import validate_llm_provider_config
 from src.services.runtime_config_services import (
     warn_if_container_minio_endpoint_is_localhost,
     warn_if_container_redis_url_is_localhost,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -34,6 +38,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     warn_if_container_redis_url_is_localhost()
     warn_if_container_minio_endpoint_is_localhost()
     validate_llm_provider_config()
+    logger.info(
+        "Docling OCR/layout models available: %s",
+        "yes" if docling_models_available() else "no",
+    )
     yield
 
 
@@ -53,6 +61,7 @@ def health_check():
 app.include_router(vendor_routers.router)
 app.include_router(document_routers.router)
 app.include_router(email_polling_routers.router)
+app.include_router(email_polling_routers.email_router)
 app.include_router(email_draft_routers.router)
 app.include_router(document_workflow_routers.router)
 app.include_router(invoice_routers.router)

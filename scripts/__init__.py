@@ -1,1 +1,1 @@
-"""Operational and evaluation scripts for AP-Core."""
+"""Operational scripts for the AP core service."""

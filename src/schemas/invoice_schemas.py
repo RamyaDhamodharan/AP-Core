@@ -52,7 +52,11 @@ class InvoiceReviewResponse(BaseModel):
 class InvoiceDashboardItem(BaseModel):
     invoice_id: UUID
     source_document_id: UUID | None = None
+    received_at: datetime | None = None
     processing_status: str | None = None
+    source: str | None = None
+    email_sender: str | None = None
+    email_subject: str | None = None
     invoice_no: str | None
     vendor_name: str | None
     invoice_date: date | None

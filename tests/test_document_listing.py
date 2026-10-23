@@ -45,8 +45,10 @@ def test_list_documents_returns_only_authenticated_owner_page():
     page_window = page_query.filter.return_value.order_by.return_value
     page_results = page_window.offset.return_value.limit.return_value.all
     page_results.return_value = [document]
+    invoice_query = MagicMock()
+    invoice_query.filter.return_value.all.return_value = []
     db = MagicMock()
-    db.query.side_effect = [count_query, page_query]
+    db.query.side_effect = [count_query, page_query, invoice_query]
     _override(owner_id, db)
 
     try:
@@ -61,7 +63,7 @@ def test_list_documents_returns_only_authenticated_owner_page():
     assert body["items"][0]["status"] == "extracted"
     assert body["items"][0]["email_sender"] == "billing@example.com"
     assert body["items"][0]["email_subject"] == "Invoice INV-12"
-    assert body["items"][0]["source"] == "email_poll"
+    assert body["items"][0]["source"] == "email"
     assert len(page_query.filter.call_args.args) == 3
     owner_filter = page_query.filter.call_args.args[0]
     compiled = owner_filter.compile(dialect=postgresql.dialect())
@@ -195,7 +197,7 @@ def test_document_detail_includes_evidence_and_audit_history():
     document = SimpleNamespace(
         id=document_id,
         original_filename="invoice.pdf",
-        status="needs_vendor_review",
+        status="needs_data_review",
         doc_type="invoice",
         failure_message="Vendor requires review",
         created_at=datetime.now(UTC),
@@ -224,8 +226,10 @@ def test_document_detail_includes_evidence_and_audit_history():
         audit_query.filter.return_value.order_by.return_value.limit.return_value.all
     )
     audit_results.return_value = [event]
+    invoice_query = MagicMock()
+    invoice_query.filter.return_value.first.return_value = None
     db = MagicMock()
-    db.query.side_effect = [document_query, audit_query]
+    db.query.side_effect = [document_query, audit_query, invoice_query]
     _override(owner_id, db)
 
     try:

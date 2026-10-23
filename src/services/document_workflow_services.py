@@ -1240,7 +1240,11 @@ def evaluate_document_workflow(
         status = "processing"
     elif document.status == "failed":
         status = "extraction_failed"
-    elif document.status in {"needs_vendor_review", "incomplete"} or any(
+    elif document.status in {
+        "needs_vendor_review",
+        "needs_data_review",
+        "incomplete",
+    } or any(
         item.outcome == "mismatch" for item in checks
     ):
         status = "review_required"
@@ -1334,7 +1338,12 @@ def evaluate_document_workflow(
         actions.append(
             "Submit the invoice through the existing human approval workflow"
         )
-    if document.status in {"failed", "needs_vendor_review", "incomplete"}:
+    if document.status in {
+        "failed",
+        "needs_vendor_review",
+        "needs_data_review",
+        "incomplete",
+    }:
         actions.append("Correct the extraction or vendor data, then retry processing")
 
     return WorkflowResult(
@@ -1464,7 +1473,12 @@ def recommend_invoice_review(
     if source is not None:
         workflow = evaluate_document_workflow(db, source.id, owner_id=owner_id)
         checks = list(workflow.checks)
-        if source.status in {"needs_vendor_review", "incomplete", "failed"}:
+        if source.status in {
+            "needs_vendor_review",
+            "needs_data_review",
+            "incomplete",
+            "failed",
+        }:
             extraction_failed = source.status == "failed"
             checks.append(
                 WorkflowCheck(
@@ -1486,7 +1500,13 @@ def recommend_invoice_review(
             )
         status = workflow.status
         review_required = workflow.human_review_required or bool(
-            source.status in {"needs_vendor_review", "incomplete", "failed"}
+            source.status
+            in {
+                "needs_vendor_review",
+                "needs_data_review",
+                "incomplete",
+                "failed",
+            }
         )
         action = (
             workflow.recommended_next_actions[0]

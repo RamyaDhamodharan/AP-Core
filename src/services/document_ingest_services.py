@@ -42,18 +42,21 @@ def ingest_file(
     object_key: str | None = None,
     document_id: uuid.UUID | None = None,
     source_flag: str | None = None,
+    internal_email_body: bool = False,
 ) -> IngestResult:
     """Persist one file and enqueue document processing after its row commits."""
     ingest_started = time.perf_counter()
     filename = Path(filename or "upload").name
     extension = Path(filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
+    if extension not in ALLOWED_EXTENSIONS and not (
+        internal_email_body and source == "email" and extension == ".txt"
+    ):
         return IngestResult("failed", None, "Unsupported file type")
     if not content_bytes:
         return IngestResult("failed", None, "Uploaded file is empty")
     max_size = (
         int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20")) * 1024 * 1024
-        if source == "email_poll" and extension != ".eml"
+        if source in {"email", "email_poll"} and extension != ".eml"
         else MAX_FILE_SIZE
     )
     if len(content_bytes) > max_size:
@@ -117,9 +120,29 @@ def ingest_file(
         db.rollback()
         try:
             delete_file(storage_path)
-        except Exception:
-            logger.exception("MinIO cleanup failed after duplicate ingestion")
+        except Exception as cleanup_exc:
+            if source in {"email", "email_poll"}:
+                logger.warning(
+                    "Email MinIO cleanup after duplicate failed (%s)",
+                    type(cleanup_exc).__name__,
+                )
+            else:
+                logger.error(
+                    "MinIO cleanup failed after duplicate ingestion (%s)",
+                    type(cleanup_exc).__name__,
+                )
         existing = db.query(Document).filter_by(file_hash=file_hash).first()
+        if existing is None and source in {"email", "email_poll"}:
+            email_message_id = document_meta.get("email_message_id")
+            if email_message_id:
+                existing = (
+                    db.query(Document)
+                    .filter_by(
+                        email_message_id=email_message_id,
+                        parent_document_id=None,
+                    )
+                    .first()
+                )
         return IngestResult(
             "duplicate_blocked",
             existing.id if existing else None,
@@ -130,17 +153,20 @@ def ingest_file(
         try:
             delete_file(storage_path)
         except Exception:
-            if source == "email_poll":
+            if source in {"email", "email_poll"}:
                 logger.warning("Email MinIO cleanup failed (%s)", type(exc).__name__)
             else:
-                logger.exception("MinIO cleanup failed after ingestion error")
-        if source == "email_poll":
+                logger.error(
+                    "MinIO cleanup failed after ingestion error (%s)",
+                    type(exc).__name__,
+                )
+        if source in {"email", "email_poll"}:
             logger.warning("Email file ingestion failed (%s)", type(exc).__name__)
             raise RuntimeError(
                 "Email file persistence failed while saving to storage/database: "
                 f"{type(exc).__name__}: {exc}"
             ) from None
-        logger.exception("File ingestion failed for %s", filename)
+        logger.error("File ingestion failed for %s (%s)", filename, type(exc).__name__)
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 
     if extension != ".eml":

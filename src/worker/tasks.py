@@ -20,6 +20,14 @@ def process_document(self, document_id: str) -> None:
     _process_in_background(uuid.UUID(document_id))
 
 
+@celery_app.task(name="ap.recover_raw_email", bind=True, max_retries=0)
+def recover_raw_email(self, document_id: str) -> None:
+    """Recover supported attachments from a persisted raw EML document."""
+    from src.services.document_recovery_services import recover_raw_email_document
+
+    recover_raw_email_document(uuid.UUID(document_id))
+
+
 @celery_app.task(name="ap.send_notification", bind=True, max_retries=2)
 def send_notification(self, notification_id: str) -> None:
     """Process one queued notification through the shared email outbox."""
@@ -37,6 +45,23 @@ def poll_email(self) -> dict:
     db = SessionLocal()
     try:
         return poll_email_with_lock(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="ap.retry_email_message", bind=True, max_retries=0)
+def retry_email_message(self, email_message_id: str) -> dict:
+    """Re-fetch one explicitly selected mail, including UIDs outside poll overlap."""
+    from src.db.session_db import SessionLocal
+    from src.models.email_models import EmailMessage
+    from src.services.email_polling_services import poll_email_with_lock
+
+    db = SessionLocal()
+    try:
+        row = db.query(EmailMessage).filter_by(id=uuid.UUID(email_message_id)).first()
+        if row is None:
+            return {"failed": 1, "message": "Email message no longer exists"}
+        return poll_email_with_lock(db, force_uids={row.uid})
     finally:
         db.close()
 
@@ -63,5 +88,18 @@ def run_follow_ups(self) -> dict:
     db = SessionLocal()
     try:
         return run_follow_ups_service(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="ap.sweep_stuck_documents", bind=True, max_retries=0)
+def sweep_stuck_documents(self) -> int:
+    """Mark abandoned document work as failed so users can retry it."""
+    from src.db.session_db import SessionLocal
+    from src.services.document_recovery_services import sweep_stuck_documents as sweep
+
+    db = SessionLocal()
+    try:
+        return sweep(db)
     finally:
         db.close()
