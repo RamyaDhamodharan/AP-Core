@@ -2,20 +2,98 @@
 
 import hashlib
 import json
+import os
 import time
+from decimal import Decimal
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
+from src.models.goods_receipt_models import GoodsReceipt
+from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.match_run_models import MatchRun
 from src.models.notification_models import Notification
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
-from src.services.document_workflow_services import recommend_invoice_review
+from src.services.document_workflow_services import (
+    _owner_scope,
+    recommend_invoice_review,
+)
+from src.services.email_sender_services import may_send_automatic_reply
 from src.services.invoice_issue_services import sync_invoice_issues
 from src.services.invoice_state_services import transition_invoice
+
+
+def _suggested_purchase_orders(db: Session, invoice: Invoice, owner_id=None):
+    """Return transparent, bounded scores for vendor/amount/item-close POs."""
+    invoice_lines = (
+        db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
+    )
+    po_rows = (
+        db.query(PurchaseOrder)
+        .filter(
+            PurchaseOrder.is_current.is_(True), *_owner_scope(PurchaseOrder, owner_id)
+        )
+        .all()
+    )
+    tax_id = (invoice.vendor_tax_id_raw or "").strip().casefold()
+    invoice_total = Decimal(str(invoice.total_amount or 0))
+    invoice_terms = [
+        str(line.item_code or line.description or "").casefold().strip()
+        for line in invoice_lines
+    ]
+    scored = []
+    for po in po_rows:
+        po_vendor = getattr(po, "vendor", None)
+        vendor_exact = bool(invoice.vendor_id and po.vendor_id == invoice.vendor_id)
+        tax_exact = bool(
+            tax_id
+            and po_vendor
+            and (po_vendor.tax_id or "").strip().casefold() == tax_id
+        )
+        if not vendor_exact and not tax_exact:
+            continue
+        score = 40.0 if vendor_exact else 35.0
+        po_total = Decimal(str(po.total_amount or 0))
+        if invoice_total and po_total:
+            relative = float(
+                abs(invoice_total - po_total) / max(abs(po_total), Decimal("0.01"))
+            )
+            score += max(0.0, 30.0 * (1.0 - relative))
+        lines = (
+            db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).all()
+        )
+        po_terms = [
+            str(line.item_code or line.description or "").casefold().strip()
+            for line in lines
+        ]
+        overlaps = sum(
+            1
+            for term in invoice_terms
+            if term
+            and any(
+                term == other or term in other or other in term for other in po_terms
+            )
+        )
+        score += 30.0 * overlaps / max(len(invoice_terms), 1) if invoice_terms else 0.0
+        if score >= 50:
+            scored.append((po, Decimal(str(round(min(score, 100.0), 2)))))
+    return sorted(scored, key=lambda pair: pair[1], reverse=True)[:5]
+
+
+def _status_after_match(
+    *, po_linked: bool, result: str, has_discrepancies: bool, missing_receipt: bool
+) -> str:
+    if (
+        po_linked
+        and result == "match_ok"
+        and not has_discrepancies
+        and not missing_receipt
+    ):
+        return "ready_to_pay"
+    return "needs_review"
 
 
 def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
@@ -95,6 +173,8 @@ def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
 
 def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | None:
     """Run and persist matching once per distinct invoice/PO state."""
+    unit_price_tolerance = f"{os.getenv('INVOICE_UNIT_PRICE_TOLERANCE_PCT', '2')}%"
+    total_tolerance = f"{os.getenv('INVOICE_TOTAL_TOLERANCE_PCT', '1')}%"
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
         return None
@@ -143,10 +223,11 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         .scalar()
         or 0
     )
+    checks = [check.model_dump(mode="json") for check in recommendation.checks]
     differences = [
-        check.model_dump(mode="json")
-        for check in recommendation.checks
-        if check.outcome in {"mismatch", "not_possible"}
+        check
+        for check in checks
+        if check.get("outcome") in {"mismatch", "not_possible"}
     ]
     sync_invoice_issues(
         db,
@@ -160,14 +241,137 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         run_no=previous_no + 1,
         po_id=invoice.po_id,
         result=result,
-        rules_used={"unit_price_tolerance_pct": "2%", "state_fingerprint": fingerprint},
+        rules_used={
+            "unit_price_tolerance_pct": unit_price_tolerance,
+            "total_tolerance_pct": total_tolerance,
+            "state_fingerprint": fingerprint,
+        },
         differences=differences,
         created_by=user_id,
     )
     db.add(run)
     db.flush()
 
+    # Save workspace candidates and explainable discrepancy rows alongside the
+    # existing matching run so human decisions survive list/detail refreshes.
+    db.query(InvoiceDiscrepancy).filter(
+        InvoiceDiscrepancy.invoice_id == invoice.id,
+    ).delete(synchronize_session=False)
+    if invoice.po_id:
+        match = (
+            db.query(InvoiceMatch)
+            .filter(
+                InvoiceMatch.invoice_id == invoice.id,
+                InvoiceMatch.po_id == invoice.po_id,
+                InvoiceMatch.status != "rejected",
+            )
+            .order_by(InvoiceMatch.created_at.desc())
+            .first()
+        )
+        if match is None:
+            receipt = (
+                db.query(GoodsReceipt)
+                .filter(GoodsReceipt.po_id == invoice.po_id)
+                .order_by(GoodsReceipt.receipt_date.desc())
+                .first()
+            )
+            match = InvoiceMatch(
+                invoice_id=invoice.id,
+                po_id=invoice.po_id,
+                gr_id=receipt.id if receipt else None,
+                match_type="3-way" if receipt else "2-way",
+                score=Decimal("100"),
+                status="confirmed",
+                confirmed_by=user_id,
+            )
+            db.add(match)
+        else:
+            receipt = (
+                db.query(GoodsReceipt)
+                .filter(GoodsReceipt.po_id == invoice.po_id)
+                .order_by(GoodsReceipt.receipt_date.desc())
+                .first()
+            )
+            match.gr_id = receipt.id if receipt else None
+            match.match_type = "3-way" if receipt else "2-way"
+            match.score = Decimal("100")
+            match.status = "confirmed"
+            match.confirmed_by = user_id or match.confirmed_by
+    else:
+        db.query(InvoiceMatch).filter(
+            InvoiceMatch.invoice_id == invoice.id,
+            InvoiceMatch.status == "suggested",
+        ).delete(synchronize_session=False)
+        candidates = _suggested_purchase_orders(db, invoice, user_id)
+        for po, score in candidates:
+            db.add(
+                InvoiceMatch(
+                    invoice_id=invoice.id,
+                    po_id=po.id,
+                    match_type="2-way",
+                    score=score,
+                    status="suggested",
+                )
+            )
+        if candidates:
+            differences.append(
+                {
+                    "name": "suggested_po_match",
+                    "reason": "Suggested PO match",
+                    "severity": "warning",
+                }
+            )
+        else:
+            differences.append(
+                {"name": "no_po_found", "reason": "No PO found", "severity": "error"}
+            )
+
+    workspace_checks = checks + [
+        row
+        for row in differences
+        if row.get("name") in {"suggested_po_match", "no_po_found"}
+    ]
+    for difference in workspace_checks:
+        field_name = str(difference.get("name", "matching"))[:80]
+        outcome = difference.get("outcome")
+        severity = (
+            "match"
+            if outcome == "passed"
+            else "within_tolerance"
+            if difference.get("severity") != "error"
+            else "error"
+        )
+        db.add(
+            InvoiceDiscrepancy(
+                invoice_id=invoice.id,
+                field=field_name,
+                invoice_value=difference.get("actual"),
+                po_value=difference.get("expected"),
+                gr_value=(
+                    difference.get("expected")
+                    if field_name == "invoice_vs_accepted_quantity"
+                    else difference.get("actual")
+                    if field_name == "partial_receipt"
+                    else None
+                ),
+                severity=severity,
+                resolved=outcome == "passed",
+                reason=str(
+                    difference.get("reason")
+                    or difference.get("description")
+                    or field_name
+                ),
+            )
+        )
+    run.differences = differences
+    run.rules_used = {
+        **(run.rules_used or {}),
+        "unit_price_tolerance_pct": unit_price_tolerance,
+        "total_tolerance_pct": total_tolerance,
+    }
+
     old = {
+        "status": getattr(invoice, "status", "processing"),
         "match_status": invoice.match_status,
         "final_status": invoice.final_status,
         "workflow_status": getattr(invoice, "workflow_status", None),
@@ -199,6 +403,44 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         "result": result,
     }
     invoice.final_run_id = run.id
+    missing_receipt = "goods_receipt" in getattr(
+        recommendation, "missing_document_types", []
+    )
+    has_discrepancies = bool(differences) or result != "match_ok" or missing_receipt
+    invoice.status = _status_after_match(
+        po_linked=bool(invoice.po_id),
+        result=result,
+        has_discrepancies=has_discrepancies,
+        missing_receipt=missing_receipt,
+    )
+    if invoice.status == "ready_to_pay":
+        db.add(
+            AuditLog(
+                action="invoice_status_transition",
+                actor="system",
+                entity_type="invoice",
+                entity_id=invoice.id,
+                old_value={"status": old.get("status", "processing")},
+                new_value={"status": "ready_to_pay", "actor": "system"},
+                reason="Automatic PO and receipt match completed without discrepancies",
+                message="Automatic match completed without discrepancies",
+                created_by=None,
+            )
+        )
+    elif invoice.status == "needs_review":
+        db.add(
+            AuditLog(
+                action="invoice_status_transition",
+                actor="system",
+                entity_type="invoice",
+                entity_id=invoice.id,
+                old_value={"status": old.get("status", "processing")},
+                new_value={"status": "needs_review", "actor": "system"},
+                reason="Matching produced discrepancy records or missing evidence",
+                message="Matching requires human review",
+                created_by=None,
+            )
+        )
     if result == "match_ok":
         new.update(workflow_status=workflow_status)
     db.add(
@@ -229,7 +471,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     )
     if result == "no_match" and invoice.source_document_id:
         document = db.get(Document, invoice.source_document_id)
-        if document and document.email_sender:
+        if document and document.email_sender and may_send_automatic_reply(document):
             db.add(
                 Notification(
                     document_id=document.id,

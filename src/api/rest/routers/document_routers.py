@@ -54,6 +54,7 @@ from ....services.document_retry_services import (
     with_transient_retries,
 )
 from ....services.document_workflow_services import refresh_related_workflows
+from ....services.email_sender_services import may_send_automatic_reply
 from ....services.invoice_confidence_services import (
     normalize_invoice_confidence,
     requires_verification,
@@ -150,7 +151,7 @@ def _auto_reject_unmatched_invoice(db, invoice: Invoice, document: Document) -> 
         for email in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
         if email.strip()
     }
-    if sender and sender.casefold() in allowed:
+    if sender and sender.casefold() in allowed and may_send_automatic_reply(document):
         db.add(
             Notification(
                 document_id=document.id,
@@ -202,6 +203,8 @@ def reclassify_other_document(
     document.storage_path = new_key
     document.status = "received"
     document.classify_override = doc_type
+    document.source_flag = None
+    document.failure_message = None
     document.updated_by = user_id
     db.add(
         AuditLog(
@@ -759,7 +762,7 @@ def _save_invoice_from_extraction(
         ):
             match_issues.append("Invoice total does not match purchase order")
 
-        match_status = "match_issues" if match_issues else "ready_for_review"
+        match_status = "match_issues" if match_issues else "pending"
 
     invoice_values = {
         "invoice_no": invoice_no,
@@ -1733,14 +1736,36 @@ def parse_document(
             detail="Stored file not found",
         )
 
+    if getattr(document, "source_flag", None) == "bulk_sender":
+        document.doc_type = "other"
+        try:
+            _route_document_to_other(db, document, "other", 1.0)
+            document.failure_message = "bulk sender, not a bill"
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            document.failure_message = (
+                "Bulk sender attachment could not be moved to Other storage; "
+                f"retry processing ({type(exc).__name__})."
+            )[:500]
+            db.commit()
+        return {
+            "id": str(document.id),
+            "status": document.status,
+            "doc_type": "other",
+            "failure_message": document.failure_message,
+        }
+
     extension = Path(document.original_filename).suffix.casefold()
     if extension not in ALLOWED_EXTENSIONS:
         document.status = "failed"
         document.failure_message = (
             "This file type is unsupported; ask the vendor to send a PDF or image."
         )
-        if getattr(document, "doc_type", None) != "other" and getattr(
-            document, "email_sender", None
+        if (
+            may_send_automatic_reply(document)
+            and getattr(document, "doc_type", None) != "other"
+            and getattr(document, "email_sender", None)
         ):
             db.add(
                 Notification(
@@ -2267,8 +2292,10 @@ def parse_document(
                 document_id,
                 validation_issues,
             )
-            if getattr(document, "doc_type", None) != "other" and getattr(
-                document, "email_sender", None
+            if (
+                may_send_automatic_reply(document)
+                and getattr(document, "doc_type", None) != "other"
+                and getattr(document, "email_sender", None)
             ):
                 db.add(
                     Notification(
@@ -2358,8 +2385,10 @@ def parse_document(
                 failure_detail = (
                     f"{document.original_filename}: {document.failure_message}"
                 )
-                if getattr(document, "doc_type", None) != "other" and getattr(
-                    document, "email_sender", None
+                if (
+                    may_send_automatic_reply(document)
+                    and getattr(document, "doc_type", None) != "other"
+                    and getattr(document, "email_sender", None)
                 ):
                     db.add(
                         Notification(

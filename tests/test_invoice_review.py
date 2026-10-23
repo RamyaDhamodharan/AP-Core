@@ -35,7 +35,7 @@ def _setup_review(invoice):
     return reviewer_id, db, teardown
 
 
-def _invoice(match_status="ready_for_review"):
+def _invoice(match_status="pending"):
     return SimpleNamespace(
         id=uuid.uuid4(),
         source_document_id=None,
@@ -43,6 +43,8 @@ def _invoice(match_status="ready_for_review"):
         po_number_raw=None,
         invoice_no="TEST-1",
         match_status=match_status,
+        status="needs_review" if match_status == "match_issues" else "ready_to_pay",
+        workflow_status="match_approved",
         final_status=None,
         final_by=None,
         final_at=None,
@@ -79,6 +81,7 @@ def test_review_invoice_approves_and_audits_decision():
     assert audit.entity_id == invoice.id
     assert audit.created_by == reviewer_id
     assert audit.old_value == {
+        "status": "ready_to_pay",
         "final_status": None,
         "workflow_status": "match_approved",
         "final_by": None,

@@ -337,7 +337,7 @@ def test_rejected_invoice_resubmit_creates_new_version_and_keeps_history(monkeyp
         gl_code=None,
         po_number_raw="PO-X",
         po_id=uuid.uuid4(),
-        match_status="ready_for_review",
+        match_status="pending",
         final_status="rejected",
         owner_user_id=uuid.uuid4(),
     )

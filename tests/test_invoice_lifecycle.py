@@ -31,7 +31,7 @@ def test_transition_writes_history_and_legacy_statuses():
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         workflow_status="match_approved",
-        match_status="ready_for_review",
+        match_status="pending",
         final_status=None,
     )
     db = MagicMock()
@@ -47,7 +47,8 @@ def test_transition_writes_history_and_legacy_statuses():
     assert history.changed_by == user_id
     assert history.created_at.tzinfo == UTC
     assert invoice.final_status == "approved"
-    assert invoice.match_status == "ready_for_review"
+    assert invoice.match_status == "pending"
+    assert invoice.status == "ready_to_pay"
     db.add.assert_called_once_with(history)
 
 
@@ -55,7 +56,7 @@ def test_invalid_transition_returns_conflict():
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         workflow_status="paid",
-        match_status="ready_for_review",
+        match_status="pending",
         final_status="approved",
     )
     with pytest.raises(HTTPException) as error:
@@ -98,7 +99,7 @@ def test_associate_can_hold_with_a_reason():
         po_id=None,
         po_number_raw=None,
         invoice_no="TEST-1",
-        match_status="ready_for_review",
+        match_status="pending",
         workflow_status="match_approved",
         final_status=None,
         final_by=None,
@@ -117,13 +118,14 @@ def test_associate_can_hold_with_a_reason():
     )
     assert result.final_status == "on_hold"
     assert invoice.workflow_status == "on_hold"
+    assert invoice.status == "on_hold"
 
 
 def test_associate_can_record_payment_once_without_external_payment():
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         workflow_status="approved",
-        match_status="ready_for_review",
+        match_status="pending",
         final_status="approved",
         paid_at=None,
         payment_method=None,
@@ -165,7 +167,7 @@ def test_void_payment_requires_reason_and_restores_ready_to_pay_state():
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         workflow_status="paid",
-        match_status="ready_for_review",
+        match_status="pending",
         final_status="approved",
         paid_at=datetime.now(UTC),
         payment_method="upi",

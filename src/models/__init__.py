@@ -8,6 +8,7 @@ from src.models import follow_up_models as follow_up_models
 from src.models import goods_receipt_models as goods_receipt_models
 from src.models import invoice_issue_models as invoice_issue_models
 from src.models import invoice_models as invoice_models
+from src.models import invoice_match_models as invoice_match_models
 from src.models import (
     invoice_supporting_document_models as invoice_supporting_document_models,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "follow_up_models",
     "goods_receipt_models",
     "invoice_models",
+    "invoice_match_models",
     "invoice_issue_models",
     "invoice_supporting_document_models",
     "match_run_models",

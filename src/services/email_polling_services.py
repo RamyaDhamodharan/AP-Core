@@ -20,7 +20,10 @@ from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.email_models import EmailMessage, EmailPollState
 from src.models.notification_models import Notification
+from src.models.vendor_models import Vendor, VendorAlias
 from src.services.document_ingest_services import ingest_file
+from src.services.email_sender_services import is_automated_sender
+from src.services.vendor_resolution_services import normalize_vendor_name
 
 logger = logging.getLogger(__name__)
 OVERLAP_UIDS = 10
@@ -38,6 +41,7 @@ EMPTY_COUNTS = {
     "filtered": 0,
     "failed": 0,
     "skipped_known": 0,
+    "filtered_by_reason": {},
 }
 ATTACHMENT_FORMATS = {
     "application/pdf": (".pdf", lambda data: data.startswith(b"%PDF-")),
@@ -226,8 +230,13 @@ def _is_transient_email_error(exc: Exception) -> bool:
     if any(
         hint in class_name
         for hint in (
-            "operationalerror", "interfaceerror", "connecttimeout", "readtimeout",
-            "protocolerror", "connectionclosed", "serviceunavailable",
+            "operationalerror",
+            "interfaceerror",
+            "connecttimeout",
+            "readtimeout",
+            "protocolerror",
+            "connectionclosed",
+            "serviceunavailable",
         )
     ):
         return True
@@ -235,10 +244,20 @@ def _is_transient_email_error(exc: Exception) -> bool:
     return any(
         hint in message
         for hint in (
-            "connection refused", "connection reset", "connection aborted",
-            "connection timed out", "timed out", "ssl eof", "unexpected eof",
-            "temporarily unavailable", "server disconnected", "broken pipe",
-            "minio", "database connection", "could not connect", "connection is closed",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "connection timed out",
+            "timed out",
+            "ssl eof",
+            "unexpected eof",
+            "temporarily unavailable",
+            "server disconnected",
+            "broken pipe",
+            "minio",
+            "database connection",
+            "could not connect",
+            "connection is closed",
         )
     )
 
@@ -304,7 +323,24 @@ def _internal_date(response) -> datetime | None:
 
 
 def _count_result(counts: dict) -> dict:
-    return {key: int(counts.get(key, 0)) for key in EMPTY_COUNTS}
+    return {
+        key: (
+            dict(counts.get(key, {}))
+            if key == "filtered_by_reason"
+            else int(counts.get(key, 0))
+        )
+        for key in EMPTY_COUNTS
+    }
+
+
+def _empty_counts() -> dict:
+    return {**EMPTY_COUNTS, "filtered_by_reason": {}}
+
+
+def _count_filtered(counts: dict, reason: str) -> None:
+    counts["filtered"] += 1
+    by_reason = counts.setdefault("filtered_by_reason", {})
+    by_reason[reason] = by_reason.get(reason, 0) + 1
 
 
 def _record_run(
@@ -343,7 +379,7 @@ def poll_email_with_lock(db) -> dict:
             "ap:email-poll-lock", timeout=300, blocking_timeout=0
         )
         if not lock.acquire(blocking=False):
-            return {**EMPTY_COUNTS, "skipped": "lock"}
+            return {**_empty_counts(), "skipped": "lock"}
         return poll_email_messages(db)
     except Exception:
         logger.warning("Email polling Redis lock is unavailable")
@@ -356,7 +392,7 @@ def poll_email_with_lock(db) -> dict:
         )
         db.commit()
         return {
-            **EMPTY_COUNTS,
+            **_empty_counts(),
             "failed": 1,
             "message": "Email polling lock unavailable",
         }
@@ -399,7 +435,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
 
     mailbox = username
     folder = os.getenv("IMAP_FOLDER", "INBOX").strip() or "INBOX"
-    counts = dict(EMPTY_COUNTS)
+    counts = _empty_counts()
     state = None
     try:
         status, _ = client.select(folder, readonly=True)
@@ -529,8 +565,10 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                     continue
                 # The overlap is a reconciliation window, never a reason to
                 # download an unknown message body or repeat a non-due retry.
-                if not known or known.status != "failed" or (
-                    known.next_retry_at and known.next_retry_at > datetime.now(UTC)
+                if (
+                    not known
+                    or known.status != "failed"
+                    or (known.next_retry_at and known.next_retry_at > datetime.now(UTC))
                 ):
                     continue
             counts["emails"] += 1
@@ -600,7 +638,7 @@ def _poll_configuration_failure(db, message: str) -> dict:
     logger.warning("Email polling unavailable: %s", message)
     mailbox = os.getenv("IMAP_USER", "").strip()
     folder = os.getenv("IMAP_FOLDER", "INBOX").strip() or "INBOX"
-    counts = {**EMPTY_COUNTS, "failed": 1}
+    counts = {**_empty_counts(), "failed": 1}
     if mailbox:
         state = (
             db.query(EmailPollState).filter_by(mailbox=mailbox, folder=folder).first()
@@ -640,8 +678,13 @@ def _imap_factory(host: str, port: int):
     return imaplib.IMAP4(host, port, timeout=30)
 
 
-def _sender_filter_reason(msg: Message, mailbox: str, sender: str) -> str | None:
+def _sender_filter_reason(
+    msg: Message, mailbox: str, sender: str, db=None
+) -> str | None:
     sender_key = sender.casefold()
+    sender_name = email.utils.parseaddr(str(msg.get("From", "")))[0]
+    if _known_vendor_sender(db, sender_key, sender_name):
+        return None
     blocklist = _address_list("EMAIL_SENDER_BLOCKLIST")
     blocklist.update(_address_list("EMAIL_BLOCKED_SENDERS"))
     local, _, domain = sender_key.partition("@")
@@ -672,19 +715,67 @@ def _sender_filter_reason(msg: Message, mailbox: str, sender: str) -> str | None
         )
     )
     if bounce_sender or bounce_subject:
-        return "bounce_or_mailer_daemon"
-    auto_header = msg.get("Auto-Submitted")
-    if auto_header is not None and str(auto_header).strip().casefold() != "no":
-        return "auto_submitted"
-    if str(msg.get("Precedence", "")).strip().casefold() in {"bulk", "junk"}:
-        return "precedence_bulk_or_junk"
+        return "bounce"
+    if _is_bulk_marketing(msg, sender_key):
+        return "bulk_marketing"
     mailbox_key = email.utils.parseaddr(mailbox)[1].casefold() or mailbox.casefold()
     if sender_key and sender_key == mailbox_key:
         return "sender_is_mailbox"
     allowed = _address_list("EMAIL_ALLOWED_SENDERS")
+    trust_allowlist = _address_list("EMAIL_SENDER_ALLOWLIST")
+    if sender_key in trust_allowlist or _matches_domain_list(
+        sender_key, trust_allowlist
+    ):
+        return None
     if allowed and sender_key not in allowed:
         return "sender_not_allowlisted"
     return None
+
+
+def _is_bulk_marketing(msg: Message, sender: str) -> bool:
+    return (
+        msg.get("List-Unsubscribe") is not None
+        or msg.get("Feedback-ID") is not None
+        or bool(str(msg.get("X-Auto-Response-Suppress", "")).strip())
+        or (
+            msg.get("Auto-Submitted") is not None
+            and str(msg.get("Auto-Submitted")).strip().casefold() != "no"
+        )
+        or str(msg.get("Precedence", "")).strip().casefold() in {"bulk", "list", "junk"}
+        or _matches_domain_list(sender, _address_list("EMAIL_BULK_DOMAINS"))
+    )
+
+
+def _matches_domain_list(sender: str, entries: set[str]) -> bool:
+    domain = sender.rpartition("@")[2]
+    return any(
+        domain == item.lstrip("@.") or domain.endswith("." + item.lstrip("@."))
+        for item in entries
+    )
+
+
+def _known_vendor_sender(db, sender: str, sender_name: str = "") -> bool:
+    allowed = _address_list("EMAIL_SENDER_ALLOWLIST")
+    if sender in allowed or _matches_domain_list(sender, allowed):
+        return True
+    if db is None:
+        return False
+    domain = sender.rpartition("@")[2]
+    normalized_sender_name = normalize_vendor_name(sender_name)
+    for vendor in db.query(Vendor).all():
+        contact = (getattr(vendor, "contact_email", None) or "").casefold()
+        if contact == sender or (
+            contact and _matches_domain_list(sender, {contact.rpartition("@")[2]})
+        ):
+            return True
+    for alias in db.query(VendorAlias).all():
+        value = (getattr(alias, "alias_norm", "") or "").casefold()
+        if getattr(alias, "is_active", True) and (
+            value in (sender, domain, normalized_sender_name)
+            or _matches_domain_list(sender, {value})
+        ):
+            return True
+    return False
 
 
 def _address_list(variable: str) -> set[str]:
@@ -848,13 +939,39 @@ def _process_uid(
             detail="outside_initial_lookback",
         )
         db.commit()
-        counts["filtered"] += 1
+        _count_filtered(counts, "outside_initial_lookback")
         return True
 
-    filter_reason = _sender_filter_reason(msg, mailbox, sender)
-    if filter_reason:
+    filter_reason = _sender_filter_reason(msg, mailbox, sender, db)
+    bulk_or_blocked = filter_reason in {"blocked_sender", "bulk_marketing", "bounce"}
+    valid_pdf = _has_valid_pdf_attachment(msg)
+    auto_submitted = (
+        msg.get("Auto-Submitted") is not None
+        and str(msg.get("Auto-Submitted")).strip().casefold() != "no"
+    )
+    trusted_vendor = _known_vendor_sender(
+        db,
+        sender.casefold(),
+        email.utils.parseaddr(str(msg.get("From", "")))[0],
+    )
+    source_flag = (
+        "bulk_sender"
+        if bulk_or_blocked and valid_pdf and not trusted_vendor
+        else "auto_reply"
+        if auto_submitted
+        or is_automated_sender(sender)
+        or (
+            (bulk_or_blocked or _is_bulk_marketing(msg, sender.casefold()))
+            and trusted_vendor
+        )
+        else None
+    )
+    if source_flag:
+        prior.filter_reason = filter_reason
+    if filter_reason and source_flag != "bulk_sender":
         prior.status = "ignored"
         prior.failure_reason = filter_reason
+        prior.filter_reason = filter_reason
         _audit(
             db,
             "email_skipped_filtered",
@@ -863,7 +980,7 @@ def _process_uid(
             detail=filter_reason,
         )
         db.commit()
-        counts["filtered"] += 1
+        _count_filtered(counts, filter_reason)
         return True
 
     # Replies to a sent draft without a bill attachment are conversation events,
@@ -872,7 +989,7 @@ def _process_uid(
 
     in_reply_to = str(msg.get("In-Reply-To", "")).strip() or None
     reply_draft = match_reply(db, subject, in_reply_to)
-    if reply_draft is not None and not _has_valid_attachment(msg):
+    if reply_draft is not None and not source_flag and not _has_valid_attachment(msg):
         record_vendor_reply(
             db, reply_draft, sender=sender, subject=subject, message_id=message_id
         )
@@ -888,19 +1005,20 @@ def _process_uid(
         counts["emails"] += 1
         return True
 
-    if not _has_valid_attachment(msg):
+    if not _has_valid_attachment(msg, pdf_only=bool(source_flag)):
         prior.status = "ignored"
         prior.raw_object_key = None
+        prior.filter_reason = "no_attachment"
         prior.failure_reason = _invalid_attachment_reason(msg)
         _audit(
             db,
             "email_skipped_filtered",
             "Email has no valid supported attachment",
             entity_id=prior.id,
-            detail=prior.failure_reason,
+            detail=prior.filter_reason,
         )
         db.commit()
-        counts["filtered"] += 1
+        _count_filtered(counts, "no_attachment")
         return True
 
     try:
@@ -925,17 +1043,18 @@ def _process_uid(
                     "email_uid": uid,
                     "email_body_preview": preview,
                     "email_eml_key": eml_key,
+                    "source_flag": source_flag,
                 },
                 object_key=eml_key,
             )
             if result.status != "received" or result.document_id is None:
                 raise RuntimeError(
-                    "Raw email document could not be persisted: "
-                    f"{result.message}"
+                    f"Raw email document could not be persisted: {result.message}"
                 )
             root = db.get(Document, result.document_id)
         if root is None:
             raise RuntimeError("Raw email document was unavailable after commit")
+        root.source_flag = source_flag
         prior.raw_object_key = eml_key
         db.commit()
 
@@ -947,7 +1066,7 @@ def _process_uid(
             detail=hashlib.sha256(message_id.encode()).hexdigest()[:16],
         )
         db.commit()
-        if reply_draft is not None:
+        if reply_draft is not None and not source_flag:
             record_vendor_reply(
                 db,
                 reply_draft,
@@ -965,6 +1084,7 @@ def _process_uid(
         )
         received_at = received or datetime.now(UTC)
 
+        referenced_cids = _referenced_content_ids(msg)
         for part in msg.walk():
             if part.is_multipart():
                 continue
@@ -975,11 +1095,9 @@ def _process_uid(
                 continue
             payload = part.get_payload(decode=True) or b""
             content_type = part.get_content_type().casefold()
-            if (
-                disposition == "inline"
-                and content_type.startswith("image/")
-                and len(payload) < INLINE_IMAGE_MIN_BYTES
-            ):
+            if _skip_image_part(part, payload, referenced_cids):
+                continue
+            if source_flag and content_type != "application/pdf":
                 continue
             if accepted_attachment_count >= MAX_ATTACHMENTS_PER_EMAIL:
                 counts["failed"] += 1
@@ -1056,6 +1174,7 @@ def _process_uid(
                 parent_document_id=root.id,
                 object_key=object_key,
                 document_id=document_id,
+                source_flag=source_flag,
             )
             if result.status == "received":
                 valid += 1
@@ -1083,7 +1202,8 @@ def _process_uid(
                 "No bill attachment found",
                 entity_id=prior.id,
             )
-            _queue_no_attachment_notification(db, root, sender)
+            if not source_flag and not filter_reason:
+                _queue_no_attachment_notification(db, root, sender)
         prior.status = "processed" if valid else "ignored"
         if valid:
             root.status = "processed"
@@ -1122,8 +1242,9 @@ def _process_uid(
         return _record_email_failure(db, retry_row, uid, counts, exc)
 
 
-def _has_valid_attachment(msg: Message) -> bool:
+def _has_valid_attachment(msg: Message, *, pdf_only: bool = False) -> bool:
     max_bytes = max(1, int(os.getenv("EMAIL_MAX_ATTACHMENT_MB", "20"))) * 1024 * 1024
+    referenced_cids = _referenced_content_ids(msg)
     for part in msg.walk():
         if part.is_multipart():
             continue
@@ -1131,14 +1252,105 @@ def _has_valid_attachment(msg: Message) -> bool:
         if not (part.get_filename() or disposition in {"attachment", "inline"}):
             continue
         payload = part.get_payload(decode=True) or b""
-        if (
-            disposition == "inline"
-            and part.get_content_type().casefold().startswith("image/")
-            and len(payload) < INLINE_IMAGE_MIN_BYTES
-        ):
+        if _skip_image_part(part, payload, referenced_cids):
+            continue
+        if pdf_only and part.get_content_type().casefold() != "application/pdf":
             continue
         if len(payload) <= max_bytes and _attachment_format(part, payload):
             return True
+    return False
+
+
+def _has_valid_pdf_attachment(msg: Message) -> bool:
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        if not (part.get_filename() or disposition in {"attachment", "inline"}):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        detected = _attachment_format(part, payload)
+        if detected and detected[0] == ".pdf":
+            return True
+    return False
+
+
+def _referenced_content_ids(msg: Message) -> set[str]:
+    html_parts = []
+    for part in msg.walk():
+        if part.get_content_type().casefold() == "text/html":
+            payload = part.get_payload(decode=True)
+            if payload:
+                charset = part.get_content_charset() or "utf-8"
+                html_parts.append(payload.decode(charset, errors="replace"))
+    return {
+        value.strip("<>\"' ").casefold()
+        for value in re.findall(r"(?i)cid:([^\s\"'<>]+)", " ".join(html_parts))
+    }
+
+
+def _skip_image_part(part: Message, payload: bytes, referenced_cids: set[str]) -> bool:
+    if not part.get_content_type().casefold().startswith("image/"):
+        return False
+    min_bytes = max(
+        0, int(os.getenv("EMAIL_ATTACHMENT_MIN_BYTES", str(INLINE_IMAGE_MIN_BYTES)))
+    )
+    content_id = str(part.get("Content-ID", "")).strip("<> ").casefold()
+    return bool(
+        part.get_content_disposition() == "inline"
+        or (content_id and content_id in referenced_cids)
+        or len(payload) < min_bytes
+        or _is_tracking_pixel(payload, part.get_content_type().casefold())
+    )
+
+
+def _is_tracking_pixel(payload: bytes, content_type: str) -> bool:
+    if (
+        content_type == "image/png"
+        and len(payload) >= 24
+        and payload.startswith(b"\x89PNG\r\n\x1a\n")
+    ):
+        width = int.from_bytes(payload[16:20], "big")
+        height = int.from_bytes(payload[20:24], "big")
+        return width <= 1 and height <= 1
+    if content_type == "image/jpeg" and payload.startswith(b"\xff\xd8"):
+        index = 2
+        while index + 4 < len(payload):
+            if payload[index] != 0xFF:
+                index += 1
+                continue
+            marker = payload[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+                continue
+            if index + 2 > len(payload):
+                break
+            segment_length = int.from_bytes(payload[index : index + 2], "big")
+            if segment_length < 2 or index + segment_length > len(payload):
+                break
+            if (
+                marker
+                in {
+                    0xC0,
+                    0xC1,
+                    0xC2,
+                    0xC3,
+                    0xC5,
+                    0xC6,
+                    0xC7,
+                    0xC9,
+                    0xCA,
+                    0xCB,
+                    0xCD,
+                    0xCE,
+                    0xCF,
+                }
+                and segment_length >= 7
+            ):
+                height = int.from_bytes(payload[index + 3 : index + 5], "big")
+                width = int.from_bytes(payload[index + 5 : index + 7], "big")
+                return width <= 1 and height <= 1
+            index += segment_length
     return False
 
 
@@ -1165,7 +1377,10 @@ def _invalid_attachment_reason(msg: Message) -> str:
 
 
 def _queue_no_attachment_notification(db, root: Document, sender: str) -> None:
-    if not sender:
+    if not sender or _is_automated_sender(sender):
+        return
+    allowed = _address_list("TEST_MAILBOX_ALLOWLIST")
+    if sender.casefold() not in allowed:
         return
     existing = (
         db.query(Notification)
@@ -1191,6 +1406,10 @@ def _queue_no_attachment_notification(db, root: Document, sender: str) -> None:
         )
     )
     db.commit()
+
+
+def _is_automated_sender(sender: str) -> bool:
+    return is_automated_sender(sender)
 
 
 def _dispatch_queued_notifications(db, document_id) -> None:
