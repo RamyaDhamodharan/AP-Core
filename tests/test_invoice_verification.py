@@ -14,6 +14,7 @@ from src.models.audit_models import AuditLog
 from src.models.notification_models import Notification
 from src.services.document_workflow_services import compare_available_records
 from src.services.invoice_confidence_services import (
+    confidence_level,
     confidence_threshold,
     normalize_invoice_confidence,
     requires_verification,
@@ -28,9 +29,10 @@ def test_missing_model_confidence_is_derived_and_gates_verification(monkeypatch)
         {"vendor": "Test Vendor", "invoice_number": "INV-1", "total": 12}
     )
     assert confidence_threshold() == 85
-    assert confidence["vendor"] == {"confidence": 75.0, "derived": True}
+    assert confidence["vendor"] == {"confidence": 0.0, "derived": True}
     assert confidence["due_date"] == {"confidence": 0.0, "derived": True}
     assert requires_verification(confidence)
+    assert confidence_level(confidence) == "unknown"
 
 
 def test_confidence_threshold_allows_verified_model_scores(monkeypatch):
@@ -52,6 +54,7 @@ def test_confidence_threshold_allows_verified_model_scores(monkeypatch):
         field: {"confidence": 95, "derived": False} for field in data
     }
     assert not requires_verification(normalize_invoice_confidence(data))
+    assert confidence_level(normalize_invoice_confidence(data)) == "high"
 
 
 def test_verify_edits_audit_old_new_reason_and_associate_can_continue(monkeypatch):
@@ -178,6 +181,7 @@ def test_get_verification_returns_values_confidence_and_gl_warning(monkeypatch):
     assert result["fields"]["invoice_number"]["value"] == "INV-2"
     assert result["fields"]["total"]["confidence"] == 40
     assert result["needs_verification"] is True
+    assert result["confidence_level"] == "unknown"
     assert result["gl_code_warning"] == "Unknown GL code: 9999"
 
 
@@ -198,7 +202,7 @@ def test_unmatched_invoice_is_rejected_with_reason_and_allowlisted_notice(monkey
     assert any(isinstance(obj, AuditLog) for obj in objects)
     notice = next(obj for obj in objects if isinstance(obj, Notification))
     assert notice.recipient_email == "test@example.com"
-    assert "No Match" in notice.body
+    assert notice.body == "No purchase order / unknown vendor"
 
 
 def test_verification_edit_requires_reason():
@@ -225,7 +229,8 @@ def test_verification_edit_requires_reason():
 
 
 def test_tax_difference_over_tolerance_is_a_match_issue(monkeypatch):
-    monkeypatch.setenv("INVOICE_TAX_TOLERANCE", "1.00")
+    monkeypatch.setenv("TAX_TOLERANCE_ABS", "0.01")
+    monkeypatch.setenv("TAX_TOLERANCE_PERCENT", "0.5")
     invoice = SimpleNamespace(
         vendor_id=uuid.uuid4(),
         po_number_raw="PO-1",
@@ -253,6 +258,66 @@ def test_tax_difference_over_tolerance_is_a_match_issue(monkeypatch):
     tax_check = next(item for item in checks if item.name == "tax")
     assert tax_check.outcome == "mismatch"
     assert tax_check.difference == Decimal("1.02")
+
+
+def _tax_check(monkeypatch, invoice_tax, expected_tax, *, subtotal="100", rate=None):
+    monkeypatch.setenv("TAX_TOLERANCE_ABS", "0.01")
+    monkeypatch.setenv("TAX_TOLERANCE_PERCENT", "0.5")
+    invoice = SimpleNamespace(
+        vendor_id=uuid.uuid4(),
+        po_number_raw="PO-1",
+        currency="USD",
+        tax_amount=invoice_tax,
+        subtotal=Decimal(subtotal),
+        total_amount=Decimal("110"),
+    )
+    po = SimpleNamespace(
+        vendor_id=invoice.vendor_id,
+        po_number="PO-1",
+        currency="USD",
+        tax_amount=expected_tax,
+        subtotal=Decimal(subtotal),
+        tax_rate=rate,
+        total_amount=Decimal("110"),
+    )
+    return next(
+        check
+        for check in compare_available_records(
+            db=None,
+            invoice=invoice,
+            purchase_order=po,
+            receipts=[],
+            po_lines=[],
+            invoice_lines=[],
+        )
+        if check.name == "tax"
+    )
+
+
+def test_tax_undetermined_is_a_warning_issue(monkeypatch):
+    check = _tax_check(monkeypatch, None, None)
+    assert check.outcome == "not_possible"
+    assert check.reason == "Tax could not be verified"
+    assert check.severity == "warning"
+
+
+def test_tax_tolerance_uses_absolute_floor_percent_and_currency_rounding(monkeypatch):
+    assert (
+        _tax_check(monkeypatch, Decimal("10.01"), Decimal("10.00")).outcome == "passed"
+    )
+    assert (
+        _tax_check(
+            monkeypatch, Decimal("100.40"), Decimal("100.00"), subtotal="20000"
+        ).outcome
+        == "passed"
+    )
+    outside = _tax_check(
+        monkeypatch, Decimal("100.51"), Decimal("100.00"), subtotal="20000"
+    )
+    assert outside.outcome == "mismatch"
+    assert outside.reason == "Tax does not match expected"
+    rounded = _tax_check(monkeypatch, Decimal("1.004"), Decimal("1.00"))
+    assert rounded.outcome == "passed"
 
 
 def test_invoice_filter_builder_supports_workflow_bucket_amount_gl_and_confidence():

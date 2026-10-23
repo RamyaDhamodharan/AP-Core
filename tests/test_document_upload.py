@@ -90,6 +90,23 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
         final_at=None,
         match_status="pending",
         invoice_no="INV-1",
+        workflow_status="matching",
+        status="processing",
+        field_confidence={
+            field: {"confidence": 95, "derived": False}
+            for field in (
+                "vendor",
+                "invoice_number",
+                "invoice_date",
+                "due_date",
+                "currency",
+                "subtotal",
+                "tax",
+                "total",
+                "order_number",
+                "gl_code",
+            )
+        },
     )
     db = MagicMock()
     document = None
@@ -200,6 +217,21 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
             "total": "10",
             "subtotal": "10",
             "tax": "0",
+            "field_confidence": {
+                field: {"confidence": 95, "derived": False}
+                for field in (
+                    "vendor",
+                    "invoice_number",
+                    "invoice_date",
+                    "due_date",
+                    "currency",
+                    "subtotal",
+                    "tax",
+                    "total",
+                    "order_number",
+                    "gl_code",
+                )
+            },
             "line_items": [],
         },
     )

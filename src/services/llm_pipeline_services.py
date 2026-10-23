@@ -274,29 +274,6 @@ def extract_document(
         result = {
             key: value for key, value in payload.items() if key != "document_type"
         }
-        if doc_type == "invoice" and "field_confidence" not in result:
-            result["field_confidence"] = {
-                field: {"confidence": 100, "derived": False}
-                for field in (
-                    "vendor",
-                    "invoice_number",
-                    "invoice_date",
-                    "due_date",
-                    "currency",
-                    "subtotal",
-                    "tax",
-                    "total",
-                    "order_number",
-                    "gl_code",
-                )
-            }
-            result["field_confidence"]["line_items"] = [
-                {
-                    field: {"confidence": 100, "derived": False}
-                    for field in ("qty", "unit_price", "line_amount")
-                }
-                for _line in result.get("line_items", [])
-            ]
         return result
 
     api_key = os.getenv("GROQ_API_KEY", "")

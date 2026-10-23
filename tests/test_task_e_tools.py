@@ -1,3 +1,5 @@
+import pytest
+
 from scripts import evaluate, seed_import
 from src.services import llm_pipeline_services
 
@@ -166,6 +168,76 @@ def test_evaluation_report_scores_fields_match_and_duplicate_cases():
     assert scores["match_result_accuracy"] == 1
     assert scores["missed_duplicates"] == 1
     assert scores["match_confusion"] == {"match_ok": {"match_ok": 1}}
+
+
+def test_quality_metrics_cover_field_amount_outcome_and_confidence_cases():
+    expected = {
+        "one.pdf": {
+            "fields": {
+                "vendor": "Acme",
+                "invoice_number": "INV-1",
+                "invoice_date": "2026-01-02",
+                "total": "100.00",
+            },
+            "match_result": "matched",
+        },
+        "two.png": {"fields": {"invoice_number": "INV-2"}, "match_result": "no_match"},
+    }
+    metrics = evaluate.score_quality(
+        [
+            {
+                "filename": "one.pdf",
+                "extracted_json": {
+                    "vendor": "Acme",
+                    "invoice_number": "INV-1",
+                    "invoice_date": "2026-01-02",
+                    "total_amount": "100.009",
+                },
+                "match_result": "matched",
+                "confidence_band": "high",
+            },
+            {
+                "filename": "two.png",
+                "extracted_json": {"invoice_number": "OTHER"},
+                "match_result": "needs_review",
+                "confidence_band": "low",
+            },
+        ],
+        expected,
+    )
+    assert metrics["fields"]["total"]["accuracy"] == 1
+    assert metrics["fields"]["invoice_number"]["accuracy"] == 0.5
+    assert metrics["field_accuracy"] == 4 / 5
+    assert metrics["match_accuracy"] == 0.5
+    assert metrics["match_confusion"]["no_match"]["needs_review"] == 1
+    assert metrics["no_match"] == {"precision": None, "recall": 0.0}
+    assert metrics["needs_review"] == {"precision": 0.0, "recall": None}
+    assert metrics["confidence_calibration"]["high"]["accuracy"] == 1
+    assert metrics["confidence_calibration"]["low"]["accuracy"] == 0
+    assert "two.png" in metrics["mismatches"]
+
+
+def test_evaluator_safety_requires_confirmation_and_exact_database_allowlist():
+    url = "postgresql+psycopg:///eval_core"
+    with pytest.raises(ValueError, match="--confirm"):
+        evaluate._validate_eval_safety(False, url, "eval_core")
+    with pytest.raises(ValueError, match="EVAL_ALLOWED_DATABASES"):
+        evaluate._validate_eval_safety(True, url, "core")
+    assert evaluate._validate_eval_safety(True, url, "eval_core,other") == "eval_core"
+
+
+def test_evaluation_loads_csv_answer_key(tmp_path):
+    key = tmp_path / "key.csv"
+    key.write_text(
+        "filename,vendor,invoice_number,invoice_date,due_date,currency,subtotal,"
+        "tax,total,po_number,expected_match_outcome\n"
+        "sample.pdf,Acme,INV-1,,,,,,,,matched\n",
+        encoding="utf-8",
+    )
+    row = evaluate._load_answer_rows(key)["sample.pdf"]
+    assert row["fields"]["vendor"] == "Acme"
+    assert row["fields"]["invoice_number"] == "INV-1"
+    assert row["match_result"] == "matched"
 
 
 def test_evaluator_identifies_email_duplicate_without_a_new_document(

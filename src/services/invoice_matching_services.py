@@ -15,15 +15,29 @@ from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.match_run_models import MatchRun
-from src.models.notification_models import Notification
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.document_workflow_services import (
     _owner_scope,
     recommend_invoice_review,
 )
-from src.services.email_sender_services import may_send_automatic_reply
+from src.services.invoice_confidence_services import (
+    confidence_unavailable,
+    requires_verification,
+)
 from src.services.invoice_issue_services import sync_invoice_issues
-from src.services.invoice_state_services import transition_invoice
+from src.services.invoice_state_services import (
+    legacy_workflow_status,
+    transition_invoice,
+)
+
+
+def _email_no_match_auto_reject_enabled() -> bool:
+    return os.getenv("EMAIL_NO_MATCH_AUTO_REJECT", "true").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _suggested_purchase_orders(db: Session, invoice: Invoice, owner_id=None):
@@ -189,7 +203,12 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     )
     if previous and (previous.rules_used or {}).get("state_fingerprint") == fingerprint:
         return previous
-
+    original_workflow_status = getattr(
+        invoice, "workflow_status", None
+    ) or legacy_workflow_status(invoice)
+    preserve_final_status = original_workflow_status in {
+        "approved", "paid", "rejected"
+    } or getattr(invoice, "status", None) in {"ready_to_pay", "paid", "rejected"}
     po_link_started = time.perf_counter()
     recommendation = recommend_invoice_review(db, invoice, owner_id=user_id)
     db.add(
@@ -209,7 +228,8 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
     if not invoice.po_id:
         result = "no_match"
     elif any(
-        check.outcome == "mismatch" and check.severity == "error"
+        check.outcome == "not_possible"
+        or (check.outcome == "mismatch" and check.severity == "error")
         for check in recommendation.checks
     ):
         result = "match_issues"
@@ -326,6 +346,18 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
                 {"name": "no_po_found", "reason": "No PO found", "severity": "error"}
             )
 
+    no_match_auto_reject = _email_no_match_auto_reject_enabled()
+    has_suggested_candidate = bool(candidates) if not invoice.po_id else False
+    # A suggested PO is a review case. It is never classified as a completed no-match.
+    if result == "no_match" and has_suggested_candidate:
+        result = "match_issues"
+    auto_reject = (
+        result == "no_match"
+        and no_match_auto_reject
+        and not preserve_final_status
+        and original_workflow_status != "rejected"
+    )
+
     workspace_checks = checks + [
         row
         for row in differences
@@ -364,6 +396,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
             )
         )
     run.differences = differences
+    run.result = result
     run.rules_used = {
         **(run.rules_used or {}),
         "unit_price_tolerance_pct": unit_price_tolerance,
@@ -377,12 +410,22 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         "workflow_status": getattr(invoice, "workflow_status", None),
         "final_run_id": str(invoice.final_run_id) if invoice.final_run_id else None,
     }
-    current_workflow_status = getattr(invoice, "workflow_status", None)
+    current_workflow_status = (
+        getattr(invoice, "workflow_status", None) or original_workflow_status
+    )
     workflow_status = {
         "match_ok": "match_approved",
         "match_issues": "match_issues",
         "no_match": "no_match",
     }[result]
+    confidence_needs_review = requires_verification(
+        getattr(invoice, "field_confidence", None) or {}
+    )
+    confidence_missing = confidence_unavailable(
+        getattr(invoice, "field_confidence", None) or {}
+    )
+    if confidence_needs_review and not auto_reject:
+        workflow_status = "verifying"
     if current_workflow_status not in {
         "approved",
         "paid",
@@ -395,8 +438,25 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
             invoice,
             workflow_status,
             changed_by=user_id,
-            reason="Invoice match completed",
+            reason=(
+                "Confidence unavailable, please verify"
+                if confidence_missing
+                else "One or more extracted fields need verification"
+                if confidence_needs_review
+                else "Invoice match completed"
+            ),
         )
+    if auto_reject:
+        from src.api.rest.routers.document_routers import (
+            _auto_reject_unmatched_invoice,
+        )
+
+        document = (
+            db.get(Document, invoice.source_document_id)
+            if invoice.source_document_id
+            else None
+        )
+        _auto_reject_unmatched_invoice(db, invoice, document)
     new = {
         "match_status": invoice.match_status,
         "match_run_id": str(run.id),
@@ -407,13 +467,20 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         recommendation, "missing_document_types", []
     )
     has_discrepancies = bool(differences) or result != "match_ok" or missing_receipt
-    invoice.status = _status_after_match(
-        po_linked=bool(invoice.po_id),
-        result=result,
-        has_discrepancies=has_discrepancies,
-        missing_receipt=missing_receipt,
-    )
-    if invoice.status == "ready_to_pay":
+    if not preserve_final_status:
+        invoice.status = (
+            "rejected"
+            if auto_reject
+            else "needs_review"
+            if requires_verification(getattr(invoice, "field_confidence", None) or {})
+            else _status_after_match(
+                po_linked=bool(invoice.po_id),
+                result=result,
+                has_discrepancies=has_discrepancies,
+                missing_receipt=missing_receipt,
+            )
+        )
+    if not preserve_final_status and invoice.status == "ready_to_pay":
         db.add(
             AuditLog(
                 action="invoice_status_transition",
@@ -427,7 +494,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
                 created_by=None,
             )
         )
-    elif invoice.status == "needs_review":
+    elif not preserve_final_status and invoice.status == "needs_review":
         db.add(
             AuditLog(
                 action="invoice_status_transition",
@@ -436,7 +503,13 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
                 entity_id=invoice.id,
                 old_value={"status": old.get("status", "processing")},
                 new_value={"status": "needs_review", "actor": "system"},
-                reason="Matching produced discrepancy records or missing evidence",
+                reason=(
+                    "Confidence unavailable, please verify"
+                    if confidence_missing
+                    else "One or more extracted fields need verification"
+                    if confidence_needs_review
+                    else "Matching produced discrepancy records or missing evidence"
+                ),
                 message="Matching requires human review",
                 created_by=None,
             )
@@ -469,20 +542,5 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
             created_by=user_id,
         )
     )
-    if result == "no_match" and invoice.source_document_id:
-        document = db.get(Document, invoice.source_document_id)
-        if document and document.email_sender and may_send_automatic_reply(document):
-            db.add(
-                Notification(
-                    document_id=document.id,
-                    recipient_email=document.email_sender,
-                    subject="Invoice could not be matched",
-                    body=(
-                        f"Invoice {invoice.invoice_no or ''} has no matching "
-                        "purchase order."
-                    ),
-                    status="queued",
-                )
-            )
     db.flush()
     return run

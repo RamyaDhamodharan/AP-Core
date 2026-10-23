@@ -118,6 +118,8 @@ def _workflow_session(
         po_number="PO-1",
         currency="USD",
         total_amount=Decimal("100"),
+        subtotal=Decimal("100"),
+        tax_amount=Decimal("0"),
         is_current=True,
         po_date=None,
         created_by=owner_id,
@@ -142,6 +144,23 @@ def _workflow_session(
         po_id=po_id if with_po else None,
         currency="USD",
         total_amount=Decimal("100"),
+        subtotal=Decimal("100"),
+        tax_amount=Decimal("0"),
+        field_confidence={
+            field: {"confidence": 95, "derived": False}
+            for field in (
+                "vendor",
+                "invoice_number",
+                "invoice_date",
+                "due_date",
+                "currency",
+                "subtotal",
+                "tax",
+                "total",
+                "order_number",
+                "gl_code",
+            )
+        },
         is_current=True,
         final_status=None,
         created_by=owner_id,
@@ -216,6 +235,8 @@ def _records(*, invoice_qty="4", accepted_qty="4", invoice_price="10"):
         po_number_raw="PO-1",
         currency="USD",
         total_amount=Decimal(str(invoice_qty)) * Decimal(str(invoice_price)),
+        subtotal=Decimal(str(invoice_qty)) * Decimal(str(invoice_price)),
+        tax_amount=Decimal("0"),
     )
     invoice_line = SimpleNamespace(
         po_line_id=po_line_id,
@@ -239,6 +260,8 @@ def _records(*, invoice_qty="4", accepted_qty="4", invoice_price="10"):
         po_number="PO-1",
         currency="USD",
         total_amount=Decimal("100"),
+        subtotal=Decimal("100"),
+        tax_amount=Decimal("0"),
     )
     receipt = SimpleNamespace(
         po_id=po_id,
@@ -603,6 +626,21 @@ def test_invoice_recommendation_finding_ids_are_stable_and_status_is_explicit():
         set(check.evidence_record_ids)
         == {record.id for record in first.supporting_records}
         for check in first.checks
+    )
+
+
+def test_missing_invoice_confidence_forces_recommendation_review():
+    session, _rows, _sources, _doc, _po, _gr, invoice, owner = _workflow_session()
+    invoice.field_confidence = {}
+
+    result = recommend_invoice_review(session, invoice, owner_id=owner)
+
+    assert result.matching_status == "review_required"
+    assert result.human_review_required is True
+    assert any(
+        check.name == "confidence"
+        and check.reason == "Confidence unavailable, please verify"
+        for check in result.checks
     )
 
 

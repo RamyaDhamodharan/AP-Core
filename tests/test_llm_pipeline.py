@@ -41,10 +41,7 @@ def test_e2e_stub_classifies_and_extracts_embedded_sample(monkeypatch):
     assert classify_document(raw_text, with_confidence=True) == ("invoice", 1.0)
     extracted = extract_document(raw_text, "invoice")
     assert extracted["invoice_number"] == "E2E-INV-ONLY"
-    assert extracted["field_confidence"]["invoice_number"] == {
-        "confidence": 100,
-        "derived": False,
-    }
+    assert "field_confidence" not in extracted
 
 
 def test_classify_document_returns_invoice(monkeypatch):
