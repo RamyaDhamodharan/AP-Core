@@ -18,6 +18,7 @@ from src.models.document_models import Document
 from src.models.email_models import EmailMessage as EmailMessageRecord
 from src.models.email_models import EmailPollState
 from src.models.notification_models import Notification
+from src.models.user_models import User
 from src.models.vendor_models import Vendor, VendorAlias
 from src.services import document_ingest_services, email_polling_services
 
@@ -1132,10 +1133,16 @@ def test_email_message_list_exposes_filter_reason(polling_setup):
     assert result[0]["filter_reason"] == "bulk_marketing"
 
 
-def test_manual_poll_endpoint_requires_admin(monkeypatch):
+def test_manual_poll_endpoint_requires_admin(monkeypatch, user_stub_factory):
     secret = "email-poll-test-secret-with-32-bytes"
     monkeypatch.setenv("JWT_SECRET_KEY", secret)
     db = MagicMock()
+    associate_user = user_stub_factory(role="associate")
+    admin_user = user_stub_factory(role="admin")
+    users = {associate_user.id: associate_user, admin_user.id: admin_user}
+    db.get.side_effect = lambda model, user_id: (
+        users.get(user_id) if model is User else None
+    )
     app.dependency_overrides[get_db] = lambda: db
     client = TestClient(app)
     monkeypatch.setattr(
@@ -1145,12 +1152,12 @@ def test_manual_poll_endpoint_requires_admin(monkeypatch):
     )
     try:
         associate = jwt.encode(
-            {"sub": str(uuid.uuid4()), "type": "access", "role": "associate"},
+            {"sub": str(associate_user.id), "type": "access", "role": "associate"},
             secret,
             algorithm="HS256",
         )
         admin = jwt.encode(
-            {"sub": str(uuid.uuid4()), "type": "access", "role": "admin"},
+            {"sub": str(admin_user.id), "type": "access", "role": "admin"},
             secret,
             algorithm="HS256",
         )
@@ -1171,21 +1178,27 @@ def test_manual_poll_endpoint_requires_admin(monkeypatch):
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_status_endpoint_requires_admin(monkeypatch):
+def test_status_endpoint_requires_admin(monkeypatch, user_stub_factory):
     secret = "email-poll-status-secret-with-32-bytes"
     monkeypatch.setenv("JWT_SECRET_KEY", secret)
     db = MagicMock()
+    associate_user = user_stub_factory(role="associate")
+    admin_user = user_stub_factory(role="admin")
+    users = {associate_user.id: associate_user, admin_user.id: admin_user}
+    db.get.side_effect = lambda model, user_id: (
+        users.get(user_id) if model is User else None
+    )
     db.query.return_value.filter_by.return_value.first.return_value = None
     app.dependency_overrides[get_db] = lambda: db
     client = TestClient(app)
     try:
         associate = jwt.encode(
-            {"sub": str(uuid.uuid4()), "type": "access", "role": "associate"},
+            {"sub": str(associate_user.id), "type": "access", "role": "associate"},
             secret,
             algorithm="HS256",
         )
         admin = jwt.encode(
-            {"sub": str(uuid.uuid4()), "type": "access", "role": "admin"},
+            {"sub": str(admin_user.id), "type": "access", "role": "admin"},
             secret,
             algorithm="HS256",
         )
