@@ -91,7 +91,7 @@ def downgrade() -> None:
         "match_status = CASE history.from_status "
         "WHEN 'verifying' THEN 'needs_vendor_review'::core.match_status "
         "WHEN 'matching' THEN 'waiting_for_po'::core.match_status "
-        "WHEN 'match_approved' THEN 'ready_for_review'::core.match_status "
+        "WHEN 'match_approved' THEN 'pending'::core.match_status "
         "WHEN 'match_issues' THEN 'match_issues'::core.match_status "
         "WHEN 'no_match' THEN 'no_match'::core.match_status "
         "ELSE 'pending'::core.match_status END "

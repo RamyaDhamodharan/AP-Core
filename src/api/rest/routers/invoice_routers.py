@@ -17,6 +17,7 @@ from src.models.document_models import Document
 from src.models.email_draft_models import EmailDraft, EmailDraftEvent
 from src.models.follow_up_models import FollowUp
 from src.models.invoice_issue_models import InvoiceIssue
+from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.invoice_supporting_document_models import InvoiceSupportingDocument
@@ -34,6 +35,7 @@ from src.schemas.invoice_schemas import (
     InvoiceMatchStatus,
     InvoiceReviewRequest,
     InvoiceReviewResponse,
+    InvoiceStatus,
     InvoiceWorkflowStatus,
 )
 from src.services.document_workflow_services import (
@@ -280,6 +282,7 @@ def _invoice_dashboard_response(
                     .get("confidence")
                 ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
+                status=getattr(invoice, "status", None) or _workspace_status(invoice),
             )
             for invoice, vendor_name, document_status in rows
         ],
@@ -287,6 +290,32 @@ def _invoice_dashboard_response(
         page=page,
         page_size=page_size,
     )
+
+
+def _workspace_status(invoice: Invoice) -> str:
+    if getattr(invoice, "status", None):
+        return invoice.status
+    if invoice.final_status == "rejected":
+        return "rejected"
+    if invoice.final_status == "on_hold":
+        return "on_hold"
+    if invoice.final_status == "approved":
+        return "ready_to_pay"
+    if getattr(invoice, "workflow_status", None) in {
+        "match_approved",
+        "approved",
+        "paid",
+    }:
+        return "ready_to_pay"
+    if getattr(invoice, "workflow_status", None) in {
+        "match_issues",
+        "no_match",
+        "verifying",
+    }:
+        return "needs_review"
+    if invoice.match_status in {"match_issues", "no_match", "needs_vendor_review"}:
+        return "needs_review"
+    return "processing"
 
 
 def _dashboard_query_parameters(
@@ -368,6 +397,7 @@ def list_invoices(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     match_status: InvoiceMatchStatus | None = None,
+    status: InvoiceStatus | None = None,
     final_status: InvoiceFinalStatus | None = None,
     vendor_id: uuid.UUID | None = None,
     invoice_date_from: date | None = None,
@@ -414,6 +444,8 @@ def list_invoices(
     )
     if owner_user_id:
         filters.append(Invoice.owner_user_id == owner_user_id)
+    if status:
+        filters.append(Invoice.status == status)
     if overdue:
         filters.extend(
             [
@@ -771,6 +803,7 @@ def get_invoice_detail(
         "invoice_no": invoice.invoice_no,
         "vendor_id": str(invoice.vendor_id) if invoice.vendor_id else None,
         "vendor_name": invoice.vendor_name_raw,
+        "vendor_tax_id": getattr(invoice, "vendor_tax_id_raw", None),
         "invoice_date": invoice.invoice_date,
         "due_date": invoice.due_date,
         "currency": invoice.currency,
@@ -783,6 +816,42 @@ def get_invoice_detail(
         "match_status": invoice.match_status,
         "final_status": invoice.final_status,
         "workflow_status": getattr(invoice, "workflow_status", "received"),
+        "status": getattr(invoice, "status", None) or _workspace_status(invoice),
+        "payment_terms": (
+            extracted.get("payment_terms") if isinstance(extracted, dict) else None
+        ),
+        "line_items": [
+            {
+                "description": line.description,
+                "item_code": line.item_code,
+                "qty": line.qty,
+                "unit_price": line.unit_price,
+                "amount": line.line_amount,
+            }
+            for line in db.query(InvoiceLine)
+            .filter(InvoiceLine.invoice_id == invoice.id)
+            .all()
+        ],
+        "discrepancies": [
+            {
+                "id": str(item.id),
+                "field": item.field,
+                "invoice_value": item.invoice_value,
+                "po_value": item.po_value,
+                "gr_value": item.gr_value,
+                "severity": item.severity,
+                "resolved": item.resolved,
+                "reason": item.reason,
+            }
+            for item in db.query(InvoiceDiscrepancy)
+            .filter(
+                InvoiceDiscrepancy.invoice_id == invoice.id,
+            )
+            .order_by(
+                InvoiceDiscrepancy.resolved.asc(), InvoiceDiscrepancy.severity.desc()
+            )
+            .all()
+        ],
         "confidence": normalized_confidence,
         "field_confidence": getattr(invoice, "field_confidence", None)
         or normalized_confidence,
@@ -800,6 +869,247 @@ def get_invoice_detail(
             or 0
         ),
     }
+
+
+def _review_invoice_or_404(db: Session, invoice_id: uuid.UUID, user: dict):
+    owner_id = _owner_id(user)
+    invoice = (
+        db.query(Invoice)
+        .outerjoin(Document, Invoice.source_document_id == Document.id)
+        .filter(Invoice.id == invoice_id, _invoice_owner_filter(owner_id))
+        .with_for_update(of=Invoice)
+        .first()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return invoice, owner_id
+
+
+@router.get("/{invoice_id:uuid}/match-candidates")
+def invoice_match_candidates(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    invoice, owner_id = _review_invoice_or_404(db, invoice_id, current_user)
+    rows = (
+        db.query(InvoiceMatch, PurchaseOrder)
+        .join(PurchaseOrder, InvoiceMatch.po_id == PurchaseOrder.id)
+        .filter(
+            InvoiceMatch.invoice_id == invoice.id, InvoiceMatch.status != "rejected"
+        )
+        .order_by(InvoiceMatch.score.desc().nullslast(), InvoiceMatch.created_at)
+        .all()
+    )
+    if not rows and not invoice.po_id:
+        from src.services.invoice_matching_services import _suggested_purchase_orders
+
+        rejected_po_ids = {
+            row.po_id
+            for row in db.query(InvoiceMatch)
+            .filter(
+                InvoiceMatch.invoice_id == invoice.id,
+                InvoiceMatch.status == "rejected",
+            )
+            .all()
+        }
+        for po, score in _suggested_purchase_orders(db, invoice, owner_id):
+            if po.id in rejected_po_ids:
+                continue
+            match = InvoiceMatch(
+                invoice_id=invoice.id,
+                po_id=po.id,
+                match_type="2-way",
+                score=score,
+                status="suggested",
+            )
+            db.add(match)
+            rows.append((match, po))
+        if rows:
+            old_status = invoice.status
+            db.query(InvoiceDiscrepancy).filter(
+                InvoiceDiscrepancy.invoice_id == invoice.id,
+                InvoiceDiscrepancy.field == "no_po_found",
+            ).delete(synchronize_session=False)
+            db.add(
+                InvoiceDiscrepancy(
+                    invoice_id=invoice.id,
+                    field="suggested_po_match",
+                    severity="warning",
+                    reason="Suggested PO match",
+                )
+            )
+            invoice.status = "needs_review"
+            if old_status != "needs_review":
+                db.add(
+                    AuditLog(
+                        action="invoice_status_transition",
+                        actor="system",
+                        entity_type="invoice",
+                        entity_id=invoice.id,
+                        old_value={"status": old_status},
+                        new_value={"status": "needs_review"},
+                        reason="Suggested purchase orders need human confirmation",
+                        created_by=None,
+                    )
+                )
+        db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "candidates": [
+            {
+                "match_id": str(match.id),
+                "po_id": str(po.id),
+                "po_number": po.po_number,
+                "vendor_name": po.vendor_name,
+                "total_amount": po.total_amount,
+                "currency": po.currency,
+                "score": float(match.score or 0),
+                "status": match.status,
+            }
+            for match, po in rows
+        ],
+    }
+
+
+@router.post("/{invoice_id:uuid}/match")
+def confirm_invoice_match(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    try:
+        po_id = uuid.UUID(str(payload.get("po_id", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="po_id is required") from exc
+    candidate = (
+        db.query(InvoiceMatch)
+        .filter(
+            InvoiceMatch.invoice_id == invoice.id,
+            InvoiceMatch.po_id == po_id,
+            InvoiceMatch.status == "suggested",
+        )
+        .first()
+    )
+    po = (
+        db.query(PurchaseOrder)
+        .filter(PurchaseOrder.id == po_id, PurchaseOrder.is_current.is_(True))
+        .first()
+    )
+    if candidate is None or po is None:
+        raise HTTPException(status_code=404, detail="Suggested PO match not found")
+    old_status = invoice.status
+    invoice.po_id = po.id
+    invoice.po_number_raw = po.po_number
+    candidate.status = "confirmed"
+    candidate.confirmed_by = actor_id
+    from src.services.invoice_matching_services import run_match_for_invoice
+
+    run = run_match_for_invoice(db, invoice.id, actor_id)
+    db.add(
+        AuditLog(
+            action="invoice_match_confirmed",
+            actor=str(actor_id),
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={"status": old_status, "po_id": None},
+            new_value={
+                "status": invoice.status,
+                "po_id": str(po.id),
+                "match_run_id": str(run.id) if run else None,
+            },
+            reason=(payload.get("reason") or "Suggested purchase order confirmed"),
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "status": getattr(invoice, "status", _workspace_status(invoice)),
+        "po_id": str(po.id),
+    }
+
+
+@router.post("/{invoice_id:uuid}/match/reject")
+def reject_invoice_match(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    try:
+        po_id = uuid.UUID(str(payload.get("po_id", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="po_id is required") from exc
+    candidate = (
+        db.query(InvoiceMatch)
+        .filter(
+            InvoiceMatch.invoice_id == invoice.id,
+            InvoiceMatch.po_id == po_id,
+            InvoiceMatch.status == "suggested",
+        )
+        .first()
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Suggested PO match not found")
+    candidate.status = "rejected"
+    db.add(
+        AuditLog(
+            action="invoice_match_rejected",
+            actor=str(actor_id),
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={"po_id": str(po_id), "status": "suggested"},
+            new_value={"status": "rejected"},
+            reason=(payload.get("reason") or "Suggested purchase order declined"),
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    return invoice_match_candidates(invoice_id, db, current_user)
+
+
+@router.post("/{invoice_id:uuid}/approve-exception")
+def approve_invoice_exception(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="A reason is required")
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    if invoice.status != "needs_review":
+        raise HTTPException(
+            status_code=409,
+            detail="Exception approval is only available for invoices that need review",
+        )
+    old_status = invoice.status
+    transition_invoice(
+        db, invoice, "approved", changed_by=actor_id, reason=reason, force=True
+    )
+    invoice.status = "ready_to_pay"
+    invoice.final_by = actor_id
+    invoice.final_at = datetime.now(UTC)
+    db.add(
+        AuditLog(
+            action="invoice_exception_approved",
+            actor=str(actor_id),
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value={"status": old_status},
+            new_value={"status": "ready_to_pay"},
+            reason=reason,
+            message="Approved with exception by reviewer",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    return {"invoice_id": str(invoice.id), "status": invoice.status, "reason": reason}
 
 
 @router.get(
@@ -887,7 +1197,7 @@ def review_invoice(
     )
     if (
         payload.decision == "approved"
-        and invoice.match_status in _UNRESOLVED_MATCH_STATUSES
+        and getattr(invoice, "status", _workspace_status(invoice)) != "ready_to_pay"
         and not has_issue_override
     ):
         raise HTTPException(
@@ -939,6 +1249,7 @@ def review_invoice(
         invoice, "workflow_status", None
     ) or legacy_workflow_status(invoice)
     old_value = {
+        "status": getattr(invoice, "status", _workspace_status(invoice)),
         "final_status": invoice.final_status,
         "workflow_status": old_workflow_status,
         "final_by": str(invoice.final_by) if invoice.final_by else None,
@@ -954,14 +1265,21 @@ def review_invoice(
     )
     invoice.final_by = reviewer_id
     invoice.final_at = decided_at
+    invoice.status = {
+        "approved": "ready_to_pay",
+        "rejected": "rejected",
+        "on_hold": "on_hold",
+    }[payload.decision]
 
     db.add(
         AuditLog(
             action="invoice_review_decision",
+            actor=str(reviewer_id),
             entity_type="invoice",
             entity_id=invoice.id,
             old_value=old_value,
             new_value={
+                "status": invoice.status,
                 "final_status": payload.decision,
                 "workflow_status": payload.decision,
                 "reason": payload.reason or payload.comment,

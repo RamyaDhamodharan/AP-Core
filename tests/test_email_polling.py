@@ -18,6 +18,7 @@ from src.models.document_models import Document
 from src.models.email_models import EmailMessage as EmailMessageRecord
 from src.models.email_models import EmailPollState
 from src.models.notification_models import Notification
+from src.models.vendor_models import Vendor, VendorAlias
 from src.services import document_ingest_services, email_polling_services
 
 
@@ -35,6 +36,12 @@ class FakeQuery:
         return self
 
     def order_by(self, *_):
+        return self
+
+    def offset(self, *_):
+        return self
+
+    def limit(self, *_):
         return self
 
     def with_for_update(self):
@@ -470,11 +477,7 @@ def test_permanent_processing_error_is_final_without_retry(polling_setup, monkey
     monkeypatch.setattr(email_polling_services, "ingest_file", permanent_failure)
     result, _ = _poll(
         db,
-        {
-            1: _mail(
-                attachments=[("bill.pdf", PDF, "application", "pdf")]
-            )
-        },
+        {1: _mail(attachments=[("bill.pdf", PDF, "application", "pdf")])},
     )
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
     assert result["failed"] == 1
@@ -566,8 +569,12 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
         monkeypatch.setenv("EMAIL_MAX_ATTEMPTS", "5")
         for attempt in range(5):
             failed_before = next(
-                (row for row in db.rows if isinstance(row, EmailMessageRecord)
-                 and row.message_id == "<storage-failure@vendor.test>"),
+                (
+                    row
+                    for row in db.rows
+                    if isinstance(row, EmailMessageRecord)
+                    and row.message_id == "<storage-failure@vendor.test>"
+                ),
                 None,
             )
             if failed_before:
@@ -584,8 +591,7 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
                 state.last_uid,
             )
             assert any(
-                document.original_filename == "good.pdf"
-                for document in _documents(db)
+                document.original_filename == "good.pdf" for document in _documents(db)
             )
             if attempt == 0:
                 assert state.last_uid == 0
@@ -639,7 +645,7 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
             "Invoice",
             "",
             "",
-            "auto_submitted",
+            "bulk_marketing",
         ),
         (
             "vendor@example.test",
@@ -647,7 +653,7 @@ def test_storage_failure_is_logged_sanitized_retried_and_does_not_block_batch(
             "Invoice",
             "",
             "",
-            "precedence_bulk_or_junk",
+            "bulk_marketing",
         ),
         (
             "vendor@example.test",
@@ -701,11 +707,12 @@ def test_sender_blocklist_matches_configured_domain_or_pattern(
             )
         },
     )
-    assert result["filtered"] == 1
+    assert result["attachments"] == 1
     row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
-    assert row.status == "ignored"
-    assert row.raw_object_key is None
-    assert not _documents(db)
+    assert row.status == "processed"
+    assert row.raw_object_key
+    child = next(doc for doc in _documents(db) if doc.parent_document_id)
+    assert child.source_flag == "bulk_sender"
 
 
 def test_bounce_subject_and_auto_submitted_no_filter(polling_setup):
@@ -897,12 +904,232 @@ def test_status_endpoint_returns_persisted_uid_state(polling_setup):
         "duplicates": 1,
         "filtered": 1,
         "failed": 0,
+        "filtered_by_reason": {"bulk_marketing": 1},
     }
     payload = email_polling_routers.email_poll_status(db=db, _user={"role": "admin"})
     assert payload["last_uid"] == 42
     assert payload["uidvalidity"] == 7
     assert payload["last_run_at"]
     assert payload["last_result"] == state.last_result
+    assert payload["filtered_by_reason"] == {"bulk_marketing": 1}
+
+
+def test_unknown_no_reply_pdf_is_ingested_as_bulk_other(polling_setup, monkeypatch):
+    db, _, _ = polling_setup
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                sender="noreply@unknown.test",
+                attachments=[("bill.pdf", PDF, "application", "pdf")],
+            )
+        },
+    )
+    assert result["attachments"] == 1
+    child = next(doc for doc in _documents(db) if doc.parent_document_id)
+    assert child.source_flag == "bulk_sender"
+    from fastapi import BackgroundTasks
+
+    from src.api.rest.routers import document_routers
+
+    parent = next(doc for doc in _documents(db) if doc.parent_document_id is None)
+    db.rows.remove(parent)
+    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
+    response = document_routers.parse_document(
+        document_id=child.id,
+        background_tasks=BackgroundTasks(),
+        db=db,
+        current_user={"worker": True},
+    )
+    assert response["status"] == "other"
+    assert response["failure_message"] == "bulk sender, not a bill"
+    assert child.status == "other"
+    assert child.doc_type == "other"
+
+
+def test_unknown_bulk_without_pdf_is_ignored_with_reason(polling_setup):
+    db, uploads, _ = polling_setup
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                sender="promo@marketing.test",
+                extra_headers={"List-Unsubscribe": "<mailto:stop@marketing.test>"},
+            )
+        },
+    )
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert row.status == "ignored"
+    assert row.filter_reason == "bulk_marketing"
+    assert result["filtered_by_reason"] == {"bulk_marketing": 1}
+    assert not uploads and not _documents(db)
+
+
+def test_known_vendor_sender_bypasses_blocklist_and_bulk_filters(
+    polling_setup, monkeypatch
+):
+    db, _, _ = polling_setup
+    vendor = Vendor(
+        name="Trusted", contact_email="noreply@trusted.test", is_active=True
+    )
+    db.add(vendor)
+    db.add(
+        VendorAlias(
+            vendor_id=vendor.id or uuid.uuid4(),
+            alias_norm="trusted.test",
+            is_active=True,
+        )
+    )
+    monkeypatch.setenv("EMAIL_SENDER_BLOCKLIST", "noreply")
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                sender="noreply@trusted.test",
+                attachments=[("bill.pdf", PDF, "application", "pdf")],
+                extra_headers={"Precedence": "bulk"},
+            )
+        },
+    )
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert row.status == "processed"
+    child = next(doc for doc in _documents(db) if doc.parent_document_id)
+    assert child.source_flag == "auto_reply"
+    assert result["attachments"] == 1
+
+
+def test_vendor_alias_display_name_is_trusted(polling_setup, monkeypatch):
+    db, _, _ = polling_setup
+    vendor = Vendor(
+        name="Trusted", contact_email="billing@trusted.test", is_active=True
+    )
+    db.add(vendor)
+    db.add(
+        VendorAlias(
+            vendor_id=vendor.id or uuid.uuid4(),
+            alias_norm="trusted billing",
+            is_active=True,
+        )
+    )
+    monkeypatch.setenv("EMAIL_SENDER_BLOCKLIST", "noreply")
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                sender="Trusted Billing <noreply@unknown.test>",
+                attachments=[("bill.pdf", PDF, "application", "pdf")],
+            )
+        },
+    )
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    child = next(doc for doc in _documents(db) if doc.parent_document_id)
+    assert row.status == "processed"
+    assert child.source_flag == "auto_reply"
+    assert result["attachments"] == 1
+
+
+def test_no_reply_never_gets_no_attachment_notification(polling_setup, monkeypatch):
+    db, _, notifications = polling_setup
+    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "noreply@sender.test")
+    db.add(Vendor(name="Trusted", contact_email="noreply@sender.test", is_active=True))
+    _poll(db, {1: _mail(sender="noreply@sender.test")})
+    assert not any(isinstance(row, Notification) for row in db.rows)
+    assert notifications == []
+
+
+def test_bulk_image_only_is_ignored_but_vendor_image_is_accepted(polling_setup):
+    db, _, _ = polling_setup
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                sender="promo@bulk.test",
+                extra_headers={"Feedback-ID": "x"},
+                attachments=[("photo.png", PNG, "image", "png")],
+            )
+        },
+    )
+    assert result["filtered_by_reason"] == {"bulk_marketing": 1}
+    assert not _documents(db)
+
+
+def test_attachment_minimum_size_skips_non_inline_images(polling_setup):
+    db, _, _ = polling_setup
+    _poll(db, {1: _mail(attachments=[("tiny.png", PNG, "image", "png", "attachment")])})
+    row = next(row for row in db.rows if isinstance(row, EmailMessageRecord))
+    assert row.filter_reason == "no_attachment"
+
+
+def test_cid_and_tracking_pixel_images_are_skipped():
+    message = MIMEMessage()
+    message.set_content('<html><img src="cid:logo@test"></html>', subtype="html")
+    message.add_related(PNG, maintype="image", subtype="png", cid="<logo@test>")
+    assert not email_polling_services._has_valid_attachment(
+        email_polling_services.email.message_from_bytes(message.as_bytes())
+    )
+
+    from email.message import Message
+
+    pixel = Message()
+    pixel["Content-Type"] = "image/png"
+    pixel.set_payload(
+        b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + (1).to_bytes(4, "big") * 2 + b"x" * 6000
+    )
+    assert email_polling_services._skip_image_part(
+        pixel, pixel.get_payload(decode=True), set()
+    )
+
+
+def test_other_documents_are_reclassifiable(polling_setup, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from src.api.rest.routers import document_routers
+
+    db, _, _ = polling_setup
+    document = Document(
+        id=uuid.uuid4(),
+        original_filename="bulk.pdf",
+        file_hash="a" * 64,
+        storage_path="other/2026/10/id/bulk.pdf",
+        status="other",
+        doc_type="other",
+        source="email_poll",
+        source_flag="bulk_sender",
+        failure_message="bulk sender, not a bill",
+    )
+    db.add(document)
+    monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
+    monkeypatch.setattr(
+        document_routers, "dispatch_document_processing", lambda *_: None
+    )
+    response = document_routers.reclassify_other_document(
+        document_id=document.id,
+        doc_type="invoice",
+        background_tasks=BackgroundTasks(),
+        db=db,
+        current_user={"sub": str(uuid.uuid4())},
+    )
+    assert response["status"] == "received"
+    assert document.source_flag is None
+    assert document.classify_override == "invoice"
+    assert document.failure_message is None
+
+
+def test_email_message_list_exposes_filter_reason(polling_setup):
+    from src.api.rest.routers.email_polling_routers import email_poll_messages
+
+    db, _, _ = polling_setup
+    row = EmailMessageRecord(
+        message_id="<filtered@bulk.test>",
+        uid=1,
+        mailbox="ap@test-mail.test",
+        sender="promo@bulk.test",
+        status="ignored",
+        filter_reason="bulk_marketing",
+    )
+    db.add(row)
+    result = email_poll_messages(db=db, _user={"role": "admin"})
+    assert result[0]["filter_reason"] == "bulk_marketing"
 
 
 def test_manual_poll_endpoint_requires_admin(monkeypatch):

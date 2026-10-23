@@ -65,6 +65,7 @@ class EmailMessage(Base):
         server_default=text("'received'"),
     )
     failure_reason: Mapped[str | None] = mapped_column(String(200))
+    filter_reason: Mapped[str | None] = mapped_column(String(200))
     attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )

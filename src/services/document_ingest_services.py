@@ -41,6 +41,7 @@ def ingest_file(
     background_tasks: BackgroundTasks | None = None,
     object_key: str | None = None,
     document_id: uuid.UUID | None = None,
+    source_flag: str | None = None,
 ) -> IngestResult:
     """Persist one file and enqueue document processing after its row commits."""
     ingest_started = time.perf_counter()
@@ -70,6 +71,8 @@ def ingest_file(
         )
 
     document_id = document_id or uuid.uuid4()
+    document_meta = dict(email_meta or {})
+    document_meta.setdefault("source_flag", source_flag)
     received_at = datetime.now(UTC)
     storage_path = object_key or (
         f"incoming/{received_at:%Y}/{received_at:%m}/{document_id}/{filename}"
@@ -91,7 +94,7 @@ def ingest_file(
             updated_by=user_id,
             parent_document_id=parent_document_id,
             source=source,
-            **(email_meta or {}),
+            **document_meta,
         )
         db.add(document)
         db.add(

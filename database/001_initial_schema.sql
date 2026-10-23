@@ -8,7 +8,7 @@ CREATE SCHEMA IF NOT EXISTS core;
 CREATE TYPE auth.user_role AS ENUM ('associate', 'admin');
 CREATE TYPE core.doc_type AS ENUM ('po', 'invoice', 'goods_receipt', 'other');
 CREATE TYPE core.doc_status AS ENUM ('received', 'parsing', 'parsed', 'classified', 'extracted', 'needs_vendor_review', 'processed', 'ignored', 'other', 'incomplete', 'duplicate_blocked', 'failed');
-CREATE TYPE core.match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'ready_for_review', 'match_issues', 'no_match');
+CREATE TYPE core.match_status AS ENUM ('pending', 'needs_vendor_review', 'waiting_for_po', 'needs_po_confirmation', 'match_issues', 'no_match');
 CREATE TYPE core.match_result AS ENUM ('match_ok', 'match_issues', 'no_match');
 CREATE TYPE core.review_decision AS ENUM ('approved', 'rejected', 'on_hold');
 CREATE TYPE core.invoice_workflow_status AS ENUM ('received', 'reading', 'verifying', 'matching', 'match_approved', 'match_issues', 'no_match', 'approved', 'rejected', 'on_hold', 'paid', 'overdue', 'resubmitted', 'failed');
@@ -93,6 +93,7 @@ CREATE TABLE core.documents (
   email_body_preview text,
   email_eml_key varchar(500),
   source varchar(40),
+  source_flag varchar(100),
   failure_message varchar(500),
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid REFERENCES auth.users(id),
@@ -337,6 +338,7 @@ CREATE TABLE core.email_messages (
   raw_object_key varchar(500),
   status varchar(40) NOT NULL DEFAULT 'received',
   failure_reason varchar(200),
+  filter_reason varchar(200),
   attempts integer NOT NULL DEFAULT 0,
   next_retry_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),

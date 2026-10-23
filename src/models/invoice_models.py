@@ -55,6 +55,20 @@ class Invoice(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    status: Mapped[str] = mapped_column(
+        ENUM(
+            "processing",
+            "needs_review",
+            "ready_to_pay",
+            "on_hold",
+            "rejected",
+            name="invoice_status",
+            schema="core",
+            create_type=False,
+        ),
+        nullable=False,
+        server_default=text("'processing'"),
+    )
     source_document_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("documents.id"),
@@ -96,7 +110,6 @@ class Invoice(Base):
             "needs_vendor_review",
             "waiting_for_po",
             "needs_po_confirmation",
-            "ready_for_review",
             "match_issues",
             "no_match",
             name="match_status",

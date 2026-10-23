@@ -33,7 +33,7 @@ def test_pipeline_match_sets_match_approved_without_admin_decision(monkeypatch):
     query_max = _query(max_run=0)
     db = MagicMock()
     db.get.return_value = invoice
-    db.query.side_effect = [query_previous, query_max]
+    db.query.side_effect = [query_previous, query_max] + [_query() for _ in range(20)]
     db.flush.side_effect = lambda: [
         setattr(obj, "id", run_id)
         for obj in [call.args[0] for call in db.add.call_args_list]

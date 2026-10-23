@@ -65,15 +65,19 @@ def invoice_payload(
     invoice_number: str,
     po_number: str,
     unit_price: float = 20.0,
+    quantity: int = 5,
+    due_date: str = "2026-11-20",
+    gl_code: str | None = None,
+    field_confidence: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    total = round(unit_price * 5, 2)
-    return {
+    total = round(unit_price * quantity, 2)
+    payload = {
         "document_type": "invoice",
         "vendor": vendor,
         "invoice_number": invoice_number,
         "order_number": po_number,
         "invoice_date": "2026-10-20",
-        "due_date": "2026-11-20",
+        "due_date": due_date,
         "currency": "USD",
         "subtotal": total,
         "tax": 0,
@@ -83,16 +87,23 @@ def invoice_payload(
                 "item_code": "E2E-WIDGET",
                 "description": "Synthetic E2E widget",
                 "uom": "EA",
-                "qty": 5,
+                "qty": quantity,
                 "unit_price": unit_price,
                 "line_amount": total,
             }
         ],
     }
+    if gl_code is not None:
+        payload["gl_code"] = gl_code
+    if field_confidence is not None:
+        payload["field_confidence"] = field_confidence
+    return payload
 
 
-def po_payload(*, vendor: str, po_number: str, unit_price: float = 20.0):
-    total = round(unit_price * 5, 2)
+def po_payload(
+    *, vendor: str, po_number: str, unit_price: float = 20.0, quantity: int = 5
+):
+    total = round(unit_price * quantity, 2)
     return {
         "document_type": "po",
         "vendor": vendor,
@@ -107,7 +118,7 @@ def po_payload(*, vendor: str, po_number: str, unit_price: float = 20.0):
                 "item_code": "E2E-WIDGET",
                 "description": "Synthetic E2E widget",
                 "uom": "EA",
-                "qty": 5,
+                "qty": quantity,
                 "unit_price": unit_price,
                 "line_amount": total,
             }
@@ -122,12 +133,15 @@ def build_mail(
     attachments: tuple[tuple[str, bytes, str], ...] = (),
     body: str = "Synthetic E2E mailbox message.",
     sender: str = "supplier@localhost",
+    extra_headers: dict[str, str] | None = None,
 ) -> bytes:
     message = EmailMessage()
     message["From"] = sender
     message["To"] = "ap-test@localhost"
     message["Subject"] = subject
     message["Message-ID"] = message_id
+    for name, value in (extra_headers or {}).items():
+        message[name] = value
     message.set_content(body)
     for name, content, content_type in attachments:
         maintype, subtype = content_type.split("/", 1)

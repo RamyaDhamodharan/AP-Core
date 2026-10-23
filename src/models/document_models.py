@@ -82,6 +82,7 @@ class Document(Base):
     email_body_preview: Mapped[str | None] = mapped_column(Text)
     email_eml_key: Mapped[str | None] = mapped_column(String(500))
     source: Mapped[str | None] = mapped_column(String(40))
+    source_flag: Mapped[str | None] = mapped_column(String(100))
     failure_message: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
