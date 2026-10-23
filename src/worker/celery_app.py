@@ -35,6 +35,7 @@ celery_app.conf.update(
         "ap.process_document": {"queue": "documents"},
         "ap.sweep_stuck_documents": {"queue": "documents"},
         "ap.poll_email": {"queue": "email"},
+        "ap.retry_email_message": {"queue": "email"},
         "ap.send_notification": {"queue": "email"},
         "ap.mark_overdue": {"queue": "email"},
         "ap.run_follow_ups": {"queue": "email"},
@@ -56,7 +57,9 @@ celery_app.conf.beat_schedule = {
     },
     "sweep-stuck-documents-every-five-minutes": {
         "task": "ap.sweep_stuck_documents",
-        "schedule": schedule(300),
+        "schedule": schedule(
+            max(30, int(os.getenv("DOCUMENT_STUCK_SWEEP_INTERVAL_SECONDS", "300")))
+        ),
     },
 }
 

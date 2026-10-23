@@ -19,6 +19,42 @@ from src.worker.dispatch import dispatch_document_processing
 router = APIRouter(prefix="/api/email-polling", tags=["email-polling"])
 
 
+def _retry_email_uid_in_background(uid: int) -> None:
+    from src.db.session_db import SessionLocal
+    from src.services.email_polling_services import poll_email_with_lock
+
+    db = SessionLocal()
+    try:
+        poll_email_with_lock(db, force_uids={uid})
+    finally:
+        db.close()
+
+
+@router.post("/recover-stuck")
+def recover_stuck_documents(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Run the audited stuck-document recovery/backfill on demand."""
+    from src.services.document_recovery_services import sweep_stuck_documents
+
+    swept = sweep_stuck_documents(db)
+    db.add(
+        AuditLog(
+            action="document_recovery_backfill_requested",
+            entity_type="system",
+            result="success",
+            message="Administrator ran stuck-document recovery",
+            output_summary={"documents_swept": swept},
+            created_by=UUID(str(current_user["sub"]))
+            if current_user.get("sub")
+            else None,
+        )
+    )
+    db.commit()
+    return {"documents_swept": swept}
+
+
 @router.post("/run")
 def run_email_poll(
     db: Session = Depends(get_db),
@@ -167,12 +203,14 @@ def retry_email_message(
     db.commit()
     if os.getenv("USE_CELERY", "false").lower() == "true":
         try:
-            from src.worker.tasks import poll_email
+            from src.worker.tasks import retry_email_message as retry_task
 
-            poll_email.delay()
+            retry_task.delay(str(row.id))
         except Exception:
-            # The persisted retry remains eligible for the next scheduled/manual poll.
+            # Keep the row retryable if Celery is temporarily unavailable.
             pass
+    else:
+        background_tasks.add_task(_retry_email_uid_in_background, row.uid)
     documents = (
         db.query(Document)
         .filter(

@@ -41,6 +41,23 @@ def poll_email(self) -> dict:
         db.close()
 
 
+@celery_app.task(name="ap.retry_email_message", bind=True, max_retries=0)
+def retry_email_message(self, email_message_id: str) -> dict:
+    """Re-fetch one explicitly selected mail, including UIDs outside poll overlap."""
+    from src.db.session_db import SessionLocal
+    from src.models.email_models import EmailMessage
+    from src.services.email_polling_services import poll_email_with_lock
+
+    db = SessionLocal()
+    try:
+        row = db.query(EmailMessage).filter_by(id=uuid.UUID(email_message_id)).first()
+        if row is None:
+            return {"failed": 1, "message": "Email message no longer exists"}
+        return poll_email_with_lock(db, force_uids={row.uid})
+    finally:
+        db.close()
+
+
 @celery_app.task(name="ap.mark_overdue", bind=True, max_retries=0)
 def mark_overdue(self) -> int:
     """Move approved unpaid invoices past their local due date into overdue."""

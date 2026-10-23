@@ -1,6 +1,9 @@
 import hashlib
 import imaplib
+import random
+import struct
 import uuid
+import zlib
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage as MIMEMessage
 from email.utils import format_datetime
@@ -71,6 +74,9 @@ class FakeQuery:
                 getattr(row, key, None) == value for key, value in self.filters.items()
             )
         ]
+
+    def count(self):
+        return len(self.all())
 
 
 class FakeDB:
@@ -167,6 +173,25 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"image bytes " * 20
 JPEG = b"\xff\xd8\xff" + b"image bytes " * 20
 
 
+def _large_png() -> bytes:
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    rng = random.Random(17)
+    rows = b"".join(b"\0" + rng.randbytes(400) for _ in range(100))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 100, 100, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
 def _mail(
     message_id="<one@vendor.test>",
     attachments=(),
@@ -235,10 +260,10 @@ def polling_setup(monkeypatch):
     return db, uploads, notifications
 
 
-def _poll(db, messages, *, client_type=FakeIMAP, **imap_kwargs):
+def _poll(db, messages, *, client_type=FakeIMAP, force_uids=None, **imap_kwargs):
     client = client_type(messages, **imap_kwargs)
     result = email_polling_services.poll_email_messages(
-        db, lambda *_: client, sleep=lambda _: None
+        db, lambda *_: client, sleep=lambda _: None, force_uids=force_uids
     )
     return result, client
 
@@ -769,7 +794,7 @@ def test_oversized_attachment_is_failed_without_storage(polling_setup, monkeypat
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
-def test_inline_image_under_five_kb_is_skipped(polling_setup):
+def test_inline_image_under_twenty_kb_is_skipped(polling_setup):
     db, _, _ = polling_setup
     result, _ = _poll(
         db, {1: _mail(attachments=[("pixel.png", PNG, "image", "png", "inline")])}
@@ -779,6 +804,31 @@ def test_inline_image_under_five_kb_is_skipped(polling_setup):
     assert email_row.status == "needs_attention"
     assert email_row.raw_object_key is None
     assert email_row.failure_reason == "No attachment found"
+
+
+def test_large_invoice_inline_image_is_ingested_as_email_document(polling_setup):
+    db, _, _ = polling_setup
+    image = _large_png()
+    assert len(image) > 20 * 1024
+    _poll(
+        db,
+        {1: _mail(attachments=[("invoice.png", image, "image", "png", "inline")])},
+    )
+    parent = next(
+        row
+        for row in db.rows
+        if isinstance(row, Document) and row.parent_document_id is None
+    )
+    child = next(
+        row
+        for row in db.rows
+        if isinstance(row, Document) and row.parent_document_id == parent.id
+    )
+    assert child.source == "email"
+    assert child.mime == "image/png"
+    assert child.email_sender == parent.email_sender
+    assert child.email_subject == parent.email_subject
+    assert child.email_message_id == parent.email_message_id
 
 
 def test_at_most_ten_attachments_are_ingested(polling_setup):
@@ -839,11 +889,54 @@ def test_retried_email_reuses_existing_documents_without_duplicates(polling_setu
     assert email_row.status == "processed"
 
 
+def test_ingest_root_integrity_conflict_is_treated_as_duplicate(
+    polling_setup, monkeypatch
+):
+    from sqlalchemy.exc import IntegrityError
+
+    db, _, _ = polling_setup
+    message_id = "<duplicate-root@vendor.test>"
+    existing = Document(
+        id=uuid.uuid4(),
+        original_filename="email.eml",
+        file_hash="d" * 64,
+        status="processed",
+        source="email",
+        email_message_id=message_id,
+        parent_document_id=None,
+    )
+    db.add(existing)
+    add = db.add
+
+    def conflicting_add(row):
+        if (
+            isinstance(row, Document)
+            and row.email_message_id == message_id
+            and row.parent_document_id is None
+        ):
+            raise IntegrityError("insert", {}, Exception("unique root"))
+        add(row)
+
+    monkeypatch.setattr(db, "add", conflicting_add)
+    result = document_ingest_services.ingest_file(
+        db,
+        "email.eml",
+        b"different raw email bytes",
+        "message/rfc822",
+        None,
+        "email",
+        email_meta={"email_message_id": message_id},
+    )
+    assert result.status == "duplicate_blocked"
+    assert result.document_id == existing.id
+    assert len(_documents(db)) == 1
+
+
 def test_admin_email_retry_resets_attempts_and_audits(polling_setup, monkeypatch):
     from fastapi import BackgroundTasks
 
     from src.api.rest.routers.email_polling_routers import retry_email_message
-    from src.worker.tasks import poll_email
+    from src.worker.tasks import retry_email_message as retry_task
 
     db, _, _ = polling_setup
     row = EmailMessageRecord(
@@ -858,7 +951,7 @@ def test_admin_email_retry_resets_attempts_and_audits(polling_setup, monkeypatch
     )
     db.add(row)
     dispatched = []
-    monkeypatch.setattr(poll_email, "delay", lambda: dispatched.append(True))
+    monkeypatch.setattr(retry_task, "delay", lambda *_args: dispatched.append(True))
     monkeypatch.setenv("USE_CELERY", "true")
     result = retry_email_message(
         message_id=row.id,
@@ -877,6 +970,64 @@ def test_admin_email_retry_resets_attempts_and_audits(polling_setup, monkeypatch
     )
 
 
+def test_failed_retry_records_fresh_reason_instead_of_backfill_placeholder(
+    polling_setup, monkeypatch
+):
+    from fastapi import BackgroundTasks
+
+    from src.api.rest.routers.email_polling_routers import retry_email_message
+
+    db, _, _ = polling_setup
+    row = EmailMessageRecord(
+        id=uuid.uuid4(),
+        message_id="<retry-real-reason@vendor.test>",
+        uid=12,
+        mailbox="ap@test-mail.test",
+        status="failed_final",
+        failure_reason="Unknown (before reason tracking)",
+        attempts=5,
+    )
+    db.add(row)
+    monkeypatch.setenv("USE_CELERY", "false")
+    retry_email_message(
+        message_id=row.id,
+        background_tasks=BackgroundTasks(),
+        db=db,
+        current_user={"role": "admin", "sub": str(uuid.uuid4())},
+    )
+    raw = _mail(
+        message_id=row.message_id,
+        attachments=[("bill.pdf", b"not a pdf", "application", "pdf")],
+    )
+    _poll(db, {12: raw})
+    assert row.status == "failed_final"
+    assert row.failure_reason != "Unknown (before reason tracking)"
+    assert "Unsupported attachment" in row.failure_reason
+
+
+def test_forced_retry_processes_uid_older_than_checkpoint_overlap(polling_setup):
+    db, _, _ = polling_setup
+    state = _state(db)
+    state.last_uid = 100
+    row = EmailMessageRecord(
+        message_id="<old-retry@vendor.test>",
+        uid=1,
+        mailbox="ap@test-mail.test",
+        folder="INBOX",
+        status="failed",
+        attempts=0,
+    )
+    db.add(row)
+    raw = _mail(
+        message_id=row.message_id,
+        attachments=[("old-invoice.pdf", PDF, "application", "pdf")],
+    )
+    result, _ = _poll(db, {1: raw}, force_uids={1})
+    assert result["attachments"] == 1
+    assert row.status == "processed"
+    assert state.last_uid == 100
+
+
 def test_stuck_document_sweep_marks_failed_and_propagates_reason(
     polling_setup, monkeypatch
 ):
@@ -888,7 +1039,7 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
         id=uuid.uuid4(),
         original_filename="stuck.pdf",
         file_hash="b" * 64,
-        status="parsing",
+        status="received",
         source="email",
         email_message_id="<stuck@vendor.test>",
         updated_at=old,
@@ -903,12 +1054,133 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
     )
     db.add(document)
     db.add(message)
-    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "60")
-    assert sweep_stuck_documents(db) == 2
+    db.add(
+        AuditLog(
+            action="document_stuck_requeued",
+            entity_type="document",
+            entity_id=document.id,
+            result="success",
+            message="previous retry",
+        )
+    )
+    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
+    monkeypatch.setenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "1")
+    assert sweep_stuck_documents(db) == 1
     assert document.status == "failed"
-    assert "stopped unexpectedly" in document.failure_message
+    assert "recovery attempts" in document.failure_message
     assert message.status == "failed_final"
     assert message.failure_reason == document.failure_message
+
+
+def test_sweep_requeues_old_received_document_on_documents_queue(
+    polling_setup, monkeypatch
+):
+    from src.services.document_recovery_services import sweep_stuck_documents
+    from src.worker.tasks import process_document
+
+    db, _, _ = polling_setup
+    document = Document(
+        id=uuid.uuid4(),
+        original_filename="stuck.pdf",
+        file_hash="c" * 64,
+        status="received",
+        source="upload",
+        updated_at=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    db.add(document)
+    queued = []
+    monkeypatch.setattr(
+        process_document,
+        "apply_async",
+        lambda **kwargs: queued.append(kwargs),
+    )
+    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
+    assert sweep_stuck_documents(db) == 1
+    assert document.status == "parsing"
+    assert queued == [{"args": [str(document.id)], "queue": "documents"}]
+
+
+def test_stuck_raw_email_without_attachment_gets_attention_reason(
+    polling_setup, monkeypatch
+):
+    from src.services.document_recovery_services import sweep_stuck_documents
+    from src.storage import minio_storage
+
+    db, _, _ = polling_setup
+    raw = _mail(message_id="<stuck-no-attachment@vendor.test>")
+    document = Document(
+        id=uuid.uuid4(),
+        original_filename="email.eml",
+        file_hash=hashlib.sha256(raw).hexdigest(),
+        storage_path="emails/2026/10/stuck.eml",
+        mime="message/rfc822",
+        status="received",
+        source="email",
+        email_message_id="<stuck-no-attachment@vendor.test>",
+        updated_at=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    message = EmailMessageRecord(
+        message_id=document.email_message_id,
+        uid=10,
+        mailbox="ap@test-mail.test",
+        status="failed_final",
+    )
+    db.add(document)
+    db.add(message)
+    monkeypatch.setattr(minio_storage, "download_file", lambda _key: raw)
+    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
+    assert sweep_stuck_documents(db) == 1
+    assert document.status == "ignored"
+    assert document.failure_message == "No attachment found"
+    assert message.status == "needs_attention"
+    assert message.failure_reason == "No attachment found"
+
+
+def test_stuck_raw_email_recovers_inline_invoice_image(polling_setup, monkeypatch):
+    from src.services.document_recovery_services import sweep_stuck_documents
+    from src.storage import minio_storage
+
+    db, _, _ = polling_setup
+    raw = _mail(
+        message_id="<stuck-inline-image@vendor.test>",
+        attachments=[("invoice.png", _large_png(), "image", "png", "inline")],
+    )
+    document = Document(
+        id=uuid.uuid4(),
+        original_filename="email.eml",
+        file_hash=hashlib.sha256(raw).hexdigest(),
+        storage_path="emails/2026/10/stuck-inline.eml",
+        mime="message/rfc822",
+        status="received",
+        source="email",
+        email_sender="billing@vendor.test",
+        email_subject="Invoice screenshot",
+        email_message_id="<stuck-inline-image@vendor.test>",
+        updated_at=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    message = EmailMessageRecord(
+        message_id=document.email_message_id,
+        uid=11,
+        mailbox="ap@test-mail.test",
+        status="failed_final",
+    )
+    db.add(document)
+    db.add(message)
+    monkeypatch.setattr(minio_storage, "download_file", lambda _key: raw)
+    monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
+    assert sweep_stuck_documents(db) == 1
+    child = next(
+        row
+        for row in db.rows
+        if isinstance(row, Document) and row.parent_document_id == document.id
+    )
+    assert child.original_filename == "invoice.png"
+    assert child.mime == "image/png"
+    assert child.source == "email"
+    assert child.email_sender == document.email_sender
+    assert child.email_subject == document.email_subject
+    assert child.email_message_id == document.email_message_id
+    assert message.status == "processed"
 
 
 def test_celery_task_routes_match_compose_worker_queues():
@@ -916,10 +1188,23 @@ def test_celery_task_routes_match_compose_worker_queues():
 
     routes = celery_app.conf.task_routes
     assert routes["ap.poll_email"]["queue"] == "email"
+    assert routes["ap.retry_email_message"]["queue"] == "email"
     assert routes["ap.send_notification"]["queue"] == "email"
     assert routes["ap.run_follow_ups"]["queue"] == "email"
     assert routes["ap.process_document"]["queue"] == "documents"
     assert routes["ap.sweep_stuck_documents"]["queue"] == "documents"
+    assert (
+        celery_app.conf.beat_schedule["sweep-stuck-documents-every-five-minutes"][
+            "task"
+        ]
+        == "ap.sweep_stuck_documents"
+    )
+    assert (
+        celery_app.conf.beat_schedule["sweep-stuck-documents-every-five-minutes"][
+            "schedule"
+        ].run_every.total_seconds()
+        == 300
+    )
 
 
 def test_html_body_is_stripped_when_no_plain_text(polling_setup):

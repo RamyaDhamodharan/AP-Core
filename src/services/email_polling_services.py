@@ -31,7 +31,7 @@ OVERLAP_UIDS = 10
 DEFAULT_MAX_ATTEMPTS = 5
 RETRY_DELAYS_MINUTES = (5, 15, 60, 360)
 MAX_ATTACHMENTS_PER_EMAIL = 10
-INLINE_IMAGE_MIN_BYTES = 5 * 1024
+INLINE_IMAGE_MIN_BYTES = 20 * 1024
 IMAP_AUTH_ERROR = "Gmail rejected the login: use an App Password and enable IMAP"
 IMAP_REACHABILITY_ERROR = "Cannot reach IMAP host"
 IMAP_CONFIG_ERROR = "IMAP_USER / IMAP_PASSWORD not set"
@@ -388,7 +388,7 @@ def _record_run(
     return result
 
 
-def poll_email_with_lock(db) -> dict:
+def poll_email_with_lock(db, *, force_uids: set[int] | None = None) -> dict:
     """Run the poll under the existing shared Redis lock."""
     from redis import Redis
 
@@ -400,7 +400,7 @@ def poll_email_with_lock(db) -> dict:
         )
         if not lock.acquire(blocking=False):
             return {**_empty_counts(), "skipped": "lock"}
-        result = poll_email_messages(db)
+        result = poll_email_messages(db, force_uids=force_uids)
         logger.info(
             "email_poll_run %s",
             json.dumps(
@@ -446,7 +446,13 @@ def poll_email_with_lock(db) -> dict:
                 lock.release()
 
 
-def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
+def poll_email_messages(
+    db,
+    imap_factory=None,
+    *,
+    sleep=time.sleep,
+    force_uids: set[int] | None = None,
+) -> dict:
     """Fetch new UIDs read-only, committing each parent before its checkpoint."""
     host = os.getenv("IMAP_HOST", "").strip()
     username = os.getenv("IMAP_USER", "").strip()
@@ -562,6 +568,7 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
                 for row in retry_rows
                 if row.next_retry_at is None or row.next_retry_at <= now
             }
+            due_retry_uids.update(force_uids or set())
             new_uids = _uid_search(client, f"UID {state.last_uid + 1}:*")
             new_uids = new_uids[:max_messages]
             overlap_start = max(1, state.last_uid - OVERLAP_UIDS + 1)
@@ -572,7 +579,11 @@ def poll_email_messages(db, imap_factory=None, *, sleep=time.sleep) -> dict:
             )
             uids = sorted(set(overlap_uids + new_uids + list(due_retry_uids)))
 
-        uids = [uid for uid in sorted(set(uids)) if uid <= highest_uid]
+        uids = [
+            uid
+            for uid in sorted(set(uids) | (force_uids or set()))
+            if uid <= highest_uid
+        ]
         blocked_by_failure = False
 
         for uid in uids:
@@ -1141,7 +1152,10 @@ def _process_uid(
                 },
                 object_key=eml_key,
             )
-            if result.status != "received" or result.document_id is None:
+            if (
+                result.status not in {"received", "duplicate_blocked"}
+                or result.document_id is None
+            ):
                 raise RuntimeError(
                     f"Raw email document could not be persisted: {result.message}"
                 )
@@ -1446,16 +1460,13 @@ def _skip_image_part(part: Message, payload: bytes, referenced_cids: set[str]) -
     min_bytes = max(
         0, int(os.getenv("EMAIL_ATTACHMENT_MIN_BYTES", str(INLINE_IMAGE_MIN_BYTES)))
     )
-    content_id = str(part.get("Content-ID", "")).strip("<> ").casefold()
     return bool(
-        part.get_content_disposition() == "inline"
-        or (content_id and content_id in referenced_cids)
-        or len(payload) < min_bytes
-        or _is_tracking_pixel(payload, part.get_content_type().casefold())
+        len(payload) < min_bytes
+        or _is_tiny_image(payload, part.get_content_type().casefold())
     )
 
 
-def _is_tracking_pixel(payload: bytes, content_type: str) -> bool:
+def _is_tiny_image(payload: bytes, content_type: str) -> bool:
     if (
         content_type == "image/png"
         and len(payload) >= 24
@@ -1463,7 +1474,7 @@ def _is_tracking_pixel(payload: bytes, content_type: str) -> bool:
     ):
         width = int.from_bytes(payload[16:20], "big")
         height = int.from_bytes(payload[20:24], "big")
-        return width <= 1 and height <= 1
+        return width < 100 or height < 100
     if content_type == "image/jpeg" and payload.startswith(b"\xff\xd8"):
         index = 2
         while index + 4 < len(payload):
@@ -1500,7 +1511,7 @@ def _is_tracking_pixel(payload: bytes, content_type: str) -> bool:
             ):
                 height = int.from_bytes(payload[index + 3 : index + 5], "big")
                 width = int.from_bytes(payload[index + 5 : index + 7], "big")
-                return width <= 1 and height <= 1
+                return width < 100 or height < 100
             index += segment_length
     return False
 
@@ -1519,9 +1530,9 @@ def _invalid_attachment_reason(msg: Message) -> str:
         if (
             disposition == "inline"
             and part.get_content_type().casefold().startswith("image/")
-            and len(payload) < INLINE_IMAGE_MIN_BYTES
+            and _is_tiny_image(payload, part.get_content_type().casefold())
         ):
-            return "inline_image_below_min_size"
+            return "Only an inline image found, send a PDF"
         if len(payload) > max_bytes:
             return "attachment_too_large"
     return "invalid_attachment" if found_candidate else "no_valid_attachment"

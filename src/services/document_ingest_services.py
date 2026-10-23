@@ -117,9 +117,26 @@ def ingest_file(
         db.rollback()
         try:
             delete_file(storage_path)
-        except Exception:
-            logger.exception("MinIO cleanup failed after duplicate ingestion")
+        except Exception as cleanup_exc:
+            if source in {"email", "email_poll"}:
+                logger.warning(
+                    "Email MinIO cleanup after duplicate failed (%s)",
+                    type(cleanup_exc).__name__,
+                )
+            else:
+                logger.exception("MinIO cleanup failed after duplicate ingestion")
         existing = db.query(Document).filter_by(file_hash=file_hash).first()
+        if existing is None and source in {"email", "email_poll"}:
+            email_message_id = document_meta.get("email_message_id")
+            if email_message_id:
+                existing = (
+                    db.query(Document)
+                    .filter_by(
+                        email_message_id=email_message_id,
+                        parent_document_id=None,
+                    )
+                    .first()
+                )
         return IngestResult(
             "duplicate_blocked",
             existing.id if existing else None,
