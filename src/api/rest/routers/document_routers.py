@@ -30,13 +30,14 @@ from sqlalchemy import Float, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ....api.rest.dependencies import get_current_user
+from ....api.rest.dependencies import get_current_user, require_role
 from ....db.session_db import SessionLocal, get_db
 from ....models.audit_models import AuditLog
 from ....models.document_models import Document
 from ....models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from ....models.invoice_match_models import InvoiceDiscrepancy
 from ....models.invoice_models import Invoice, InvoiceLine
+from ....models.match_run_models import MatchRun
 from ....models.notification_models import Notification
 from ....models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from ....models.vendor_models import Vendor
@@ -439,9 +440,7 @@ def list_documents(
             DocumentSummary.model_validate(row).model_copy(
                 update={
                     "source": (
-                        "email"
-                        if row.source in {"email", "email_poll"}
-                        else row.source
+                        "email" if row.source in {"email", "email_poll"} else row.source
                     ),
                     "linked_invoice_id": (
                         linked_invoices[row.id].id
@@ -652,6 +651,42 @@ def _normalize_invoice_value(value: object) -> str:
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
 
 
+def _extracted_field_confidence(data: dict) -> dict:
+    value = data.get("field_confidence") or data.get("confidence") or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _confidence_needs_verification(confidence: dict) -> bool:
+    if not confidence:
+        return True
+    for raw in confidence.values():
+        score = raw.get("confidence") if isinstance(raw, dict) else raw
+        try:
+            score = Decimal(str(score)) if score is not None else None
+            if score is not None and Decimal(0) <= score <= Decimal(1):
+                score *= 100
+            if score is None or score < Decimal("85"):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _extraction_needs_verification(data: dict, validation_issues=None) -> bool:
+    if validation_issues or _confidence_needs_verification(
+        _extracted_field_confidence(data)
+    ):
+        return True
+    for line in data.get("line_items") or []:
+        if not isinstance(line, dict) or _confidence_needs_verification(
+            line.get("field_confidence")
+            if isinstance(line.get("field_confidence"), dict)
+            else {}
+        ):
+            return True
+    return False
+
+
 def _parse_document_date(value: object) -> date | None:
     if not value:
         return None
@@ -772,11 +807,20 @@ def _process_in_background(document_id: uuid.UUID) -> None:
 
             if document is None or document.status != "received":
                 return
-            if document.created_by is None and document.source != "email_poll":
+            if document.created_by is None and document.source not in {
+                "email",
+                "email_poll",
+            }:
                 logger.error(
                     "Skipping processing for document %s without an uploader",
                     document_id,
                 )
+                document.status = "failed"
+                document.failure_message = (
+                    "Document processing could not start because no uploader was "
+                    "recorded. Ask an administrator to retry processing."
+                )
+                db.commit()
                 return
 
             worker_user = {"sub": str(document.created_by)}
@@ -861,6 +905,22 @@ async def upload_document(
             }
         )
     return response
+
+
+@router.post(
+    "/admin/backfill-procurement", dependencies=[Depends(require_role("admin"))]
+)
+def backfill_procurement_documents_endpoint(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist existing extracted PO/GR documents that need data review."""
+    from ....services.procurement_backfill_services import (
+        backfill_procurement_documents,
+    )
+
+    actor_id = uuid.UUID(str(current_user["sub"])) if current_user.get("sub") else None
+    return backfill_procurement_documents(db, actor_id)
 
 
 def _save_invoice_from_extraction(
@@ -1026,7 +1086,7 @@ def _save_invoice_from_extraction(
             if (
                 current_version is not None
                 and total_amount is not None
-                    and getattr(current_version, "total_amount", None) == total_amount
+                and getattr(current_version, "total_amount", None) == total_amount
             ):
                 raise DuplicateInvoiceError(
                     "Duplicate current invoice: same vendor, number, and total",
@@ -1110,7 +1170,7 @@ def _apply_email_po_hint(document: Document, data: dict) -> None:
         data["order_number_source"] = "email"
 
 
-def _document_failure_message(error: Exception) -> str:
+def _document_failure_message(error: Exception, *, parse_failed: bool = False) -> str:
     failure_text = str(error).casefold()
     if "docx_parse_failed" in failure_text:
         return (
@@ -1128,6 +1188,8 @@ def _document_failure_message(error: Exception) -> str:
             "no text found",
         )
     ):
+        if parse_failed:
+            return "This file appears damaged; ask the vendor to resend it."
         return (
             "Scanned or image-only document with no readable text; "
             "upload an OCR-readable copy."
@@ -1149,6 +1211,8 @@ def _document_failure_message(error: Exception) -> str:
         for phrase in ("not an invoice", "not a bill", "document is not an invoice")
     ):
         return "This file does not appear to be an invoice; upload a bill to continue."
+    if "new vendor:" in failure_text:
+        return "New vendor. Add or select the vendor to continue matching."
     if any(word in failure_text for word in ("password", "encrypted", "not decrypted")):
         return "This file is password-protected; ask the vendor for an unlocked copy."
     if (
@@ -1186,7 +1250,7 @@ def _document_failure_message(error: Exception) -> str:
             "Some document details need review. Review the highlighted fields "
             "and correct them."
         )
-    if any(
+    if parse_failed and any(
         marker in failure_text
         for marker in (
             "corrupt",
@@ -1410,10 +1474,12 @@ def _save_goods_receipt_from_extraction(
     db: Session,
     document: Document,
     data: dict,
-    vendor: Vendor,
+    vendor: Vendor | None,
     *,
     purchase_order_id: uuid.UUID | None = None,
+    validation_issues: list[str] | None = None,
 ) -> None:
+    """Save a readable receipt even when PO/vendor/optional details need review."""
     gr_number = str(
         data.get("gr_number")
         or data.get("receipt_number")
@@ -1427,12 +1493,16 @@ def _save_goods_receipt_from_extraction(
         .filter(GoodsReceipt.source_document_id == document.id)
         .first()
     )
+    if existing_receipt is not None:
+        existing_receipt.field_confidence = _extracted_field_confidence(data)
+        existing_receipt.vendor_id = vendor.id if vendor else existing_receipt.vendor_id
     duplicate_query = db.query(GoodsReceipt).filter(
         func.lower(func.trim(GoodsReceipt.gr_number)) == gr_number.lower()
     )
     if existing_receipt is not None:
         duplicate_query = duplicate_query.filter(GoodsReceipt.id != existing_receipt.id)
-    if duplicate_query.first():
+    duplicate = duplicate_query.first()
+    if duplicate:
         raise ValueError(f"Duplicate goods receipt number: {gr_number}")
     po_number = str(data.get("order_number") or data.get("po_number") or "").strip()
     if purchase_order_id is not None:
@@ -1460,150 +1530,109 @@ def _save_goods_receipt_from_extraction(
             )
             .all()
         )
-    if not po_candidates:
-        raise AwaitingRelatedDocumentError(
-            "Goods receipt purchase order has not arrived"
-        )
-    if len(po_candidates) > 1:
-        raise AwaitingHumanDecisionError("Goods receipt purchase order is ambiguous")
-    po = po_candidates[0]
-    if po.vendor_id != vendor.id:
-        raise ValueError("Goods receipt vendor does not match purchase order")
+    po = po_candidates[0] if len(po_candidates) == 1 else None
+    if po and vendor and po.vendor_id and po.vendor_id != vendor.id:
+        validation_issues = [*(validation_issues or []), "Vendor does not match PO"]
     po_lines = (
         db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).all()
+        if po is not None
+        else []
     )
     mapped = []
-    mapped_po_line_ids = set()
     for raw in data.get("line_items") or []:
         if not isinstance(raw, dict):
-            raise ValueError("Goods receipt line item must be an object")
+            continue
         code = _line_value(raw, "item_code", "sku", "product_code")
         description = _line_value(raw, "description", "item_description")
         extracted_po_line_id = raw.get("po_line_id")
+        candidates = []
         if extracted_po_line_id is not None:
-            if not code and not description:
-                raise ValueError(
-                    "Goods receipt line needs an item code or description "
-                    "for PO validation"
-                )
             candidates = [
                 line for line in po_lines if str(line.id) == str(extracted_po_line_id)
             ]
-            if not candidates:
-                raise ValueError(
-                    "Goods receipt line references a PO line outside its purchase order"
-                )
         else:
             candidates = [
                 line
                 for line in po_lines
-                if (
-                    code
-                    and _normalize_invoice_value(line.item_code)
-                    == _normalize_invoice_value(code)
-                )
-                or (
-                    not code
-                    and description
-                    and _normalize_invoice_value(line.description)
-                    == _normalize_invoice_value(description)
-                )
+                if code
+                and _normalize_invoice_value(line.item_code)
+                == _normalize_invoice_value(code)
             ]
-        if len(candidates) != 1:
-            raise ValueError(
-                "Goods receipt line cannot be uniquely matched to a PO line"
-            )
-        po_line = candidates[0]
-        if extracted_po_line_id is not None and (
-            code
-            and _normalize_invoice_value(code)
-            != _normalize_invoice_value(po_line.item_code)
-            or (
-                description
-                and _normalize_invoice_value(description)
-                != _normalize_invoice_value(po_line.description)
-            )
-        ):
-            raise ValueError("Goods receipt line data conflicts with its PO line")
+            if not candidates and description:
+                candidates = [
+                    line
+                    for line in po_lines
+                    if _normalize_invoice_value(line.description)
+                    == _normalize_invoice_value(description)
+                ]
+        po_line = candidates[0] if len(candidates) == 1 else None
         extracted_uom = _line_value(raw, "uom", "unit_of_measure")
         if (
             extracted_uom
+            and po_line
             and po_line.uom
             and _normalize_invoice_value(extracted_uom)
             != _normalize_invoice_value(po_line.uom)
         ):
             raise ValueError("Goods receipt line unit does not match its PO line")
-        if po_line.id in mapped_po_line_ids:
-            raise ValueError("Goods receipt contains a duplicate PO line reference")
-        mapped_po_line_ids.add(po_line.id)
         received = _to_decimal(_line_value(raw, "received_qty", "quantity", "qty"))
         accepted = _to_decimal(raw.get("accepted_qty"))
         rejected = _to_decimal(raw.get("rejected_qty"))
+        valid_received = received is not None and received > 0
+        valid_accepted = accepted is not None and accepted >= 0
+        valid_rejected = rejected is not None and rejected >= 0
         if (
-            received is None
-            or accepted is None
-            or rejected is None
-            or received <= 0
-            or accepted < 0
-            or rejected < 0
-            or accepted + rejected != received
+            valid_received
+            and valid_accepted
+            and valid_rejected
+            and accepted + rejected != received
         ):
-            raise ValueError("Goods receipt line quantities are missing or invalid")
+            valid_accepted = valid_rejected = False
         mapped.append(
             GoodsReceiptLine(
-                po_line_id=po_line.id,
-                item_code=po_line.item_code,
-                description=po_line.description,
+                po_line_id=po_line.id if po_line else None,
+                item_code=(
+                    po_line.item_code if po_line else str(code)[:60] if code else None
+                ),
+                description=(
+                    po_line.description
+                    if po_line
+                    else str(description)[:300]
+                    if description
+                    else None
+                ),
                 uom=str(extracted_uom)[:10] if extracted_uom else None,
-                received_qty=received,
-                accepted_qty=accepted,
-                rejected_qty=rejected,
+                received_qty=received if valid_received else None,
+                accepted_qty=accepted if valid_accepted else None,
+                rejected_qty=rejected if valid_rejected else None,
+                field_confidence=(
+                    raw.get("field_confidence")
+                    if isinstance(raw.get("field_confidence"), dict)
+                    else {}
+                ),
             )
         )
-    if not mapped:
-        raise ValueError("Goods receipt line items are missing")
     receipt_date = _parse_document_date(data.get("receipt_date"))
-    if existing_receipt is not None:
-        old_lines = sorted(
-            (
-                str(line.po_line_id),
-                line.received_qty,
-                line.accepted_qty,
-                line.rejected_qty,
-            )
-            for line in existing_receipt.lines
-        )
-        new_lines = sorted(
-            (
-                str(line.po_line_id),
-                line.received_qty,
-                line.accepted_qty,
-                line.rejected_qty,
-            )
-            for line in mapped
-        )
-        if (
-            existing_receipt.gr_number == gr_number
-            and existing_receipt.po_id == po.id
-            and existing_receipt.vendor_id == vendor.id
-            and existing_receipt.receipt_date == receipt_date
-            and old_lines == new_lines
-        ):
-            return
-        raise ValueError(
-            "Goods receipt extraction differs from the previously saved record; "
-            "review required"
-        )
-    receipt = GoodsReceipt(
+    receipt = existing_receipt or GoodsReceipt(
         gr_number=gr_number,
-        po_id=po.id,
-        vendor_id=vendor.id,
         source_document_id=document.id,
-        receipt_date=receipt_date,
-        lines=mapped,
     )
-    db.add(receipt)
+    receipt.po_id = po.id if po else receipt.po_id
+    receipt.vendor_id = vendor.id if vendor else receipt.vendor_id
+    receipt.receipt_date = receipt_date or receipt.receipt_date
+    receipt.field_confidence = _extracted_field_confidence(data)
+    receipt.needs_verification = (
+        _extraction_needs_verification(data, validation_issues)
+        or receipt.po_id is None
+        or receipt.vendor_id is None
+    )
+    if mapped:
+        receipt.lines = mapped
+    if existing_receipt is None:
+        db.add(receipt)
     db.flush()
+    if po is not None:
+        _rematch_waiting_invoices_for_po(db, po)
 
 
 def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
@@ -1635,7 +1664,7 @@ def _rematch_waiting_invoices_for_po(
     po: PurchaseOrder,
 ) -> int:
     """Rematch current invoices waiting for this purchase order."""
-    po_number = _normalize_invoice_value(po.po_number)
+    po_number = _normalize_invoice_value(getattr(po, "po_number", None))
     if not po_number:
         return 0
 
@@ -1644,7 +1673,6 @@ def _rematch_waiting_invoices_for_po(
         .filter(
             func.lower(func.trim(Invoice.po_number_raw)) == po_number,
             Invoice.is_current.is_(True),
-            Invoice.match_status == "waiting_for_po",
         )
         .with_for_update()
         .all()
@@ -1653,46 +1681,32 @@ def _rematch_waiting_invoices_for_po(
     rematched = 0
 
     for invoice in invoices:
-        issues = []
-        invoice.po_id = po.id
-
-        if invoice.vendor_id != po.vendor_id:
-            issues.append("Vendor does not match purchase order")
-
-        invoice_currency = str(invoice.currency or "").strip().upper()
-        po_currency = str(po.currency or "").strip().upper()
-
-        if not invoice_currency or not po_currency or invoice_currency != po_currency:
-            issues.append("Currency does not match purchase order")
-
-        if (
-            po.total_amount is None
-            or invoice.total_amount is None
-            or abs(po.total_amount - invoice.total_amount) > 0.01
+        final_run_id = getattr(invoice, "final_run_id", None)
+        prior_run = (
+            db.get(MatchRun, final_run_id) if final_run_id else None
+        )
+        saved_outcome = (
+            (prior_run.rules_used or {}).get("match_outcome") if prior_run else None
+        ) or {}
+        saved_codes = {
+            item.get("code")
+            for item in saved_outcome.get("discrepancies", [])
+            if isinstance(item, dict)
+        }
+        if invoice.match_status != "waiting_for_po" and not saved_codes.intersection(
+            {"MISSING_PO", "MISSING_GR"}
         ):
-            issues.append("Invoice total does not match purchase order")
-
-        if legacy_workflow_status(invoice) not in {
-            "approved",
-            "rejected",
-            "on_hold",
-            "paid",
-        }:
-            transition_invoice(
-                db,
-                invoice,
-                "match_issues" if issues else "match_approved",
-                changed_by=getattr(invoice, "updated_by", None)
-                or getattr(invoice, "created_by", None),
-                reason="Purchase order arrived; invoice rematched",
-            )
-
+            continue
+        invoice.po_id = po.id
         if getattr(invoice, "id", None):
             run_match_for_invoice(
                 db,
                 invoice.id,
                 getattr(invoice, "updated_by", None)
                 or getattr(invoice, "created_by", None),
+                force=True,
+                idempotent=True,
+                trigger="dependency_arrived",
             )
         rematched += 1
 
@@ -1706,7 +1720,7 @@ def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
         db.query(Document)
         .filter(
             Document.doc_type == "goods_receipt",
-            Document.status == "extracted",
+            Document.status.in_({"extracted", "needs_data_review"}),
             Document.extracted_json.isnot(None),
         )
         .all()
@@ -1725,10 +1739,17 @@ def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
             continue
         vendor_name = str(data.get("vendor") or "").strip()
         vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
-        if vendor is None or vendor.id != po.vendor_id:
+        if vendor is not None and po.vendor_id and vendor.id != po.vendor_id:
             continue
         try:
-            _save_goods_receipt_from_extraction(db, document, data, vendor)
+            _save_goods_receipt_from_extraction(
+                db,
+                document,
+                data,
+                vendor,
+                purchase_order_id=po.id,
+                validation_issues=(["New vendor"] if vendor is None else []),
+            )
         except (
             AwaitingRelatedDocumentError,
             AwaitingHumanDecisionError,
@@ -1748,11 +1769,14 @@ def _save_purchase_order_from_extraction(
     db: Session,
     document: Document,
     data: dict,
-    vendor: Vendor,
+    vendor: Vendor | None,
+    *,
+    validation_issues: list[str] | None = None,
 ) -> PurchaseOrder:
-    """Persist a validated purchase order against its source document."""
+    """Persist a readable PO; incomplete extracted fields remain reviewable."""
     po_date = data.get("po_date") or data.get("order_date")
-    currency = str(data["currency"]).strip().upper()
+    raw_currency = str(data.get("currency") or "").strip().upper()
+    currency = raw_currency if re.fullmatch(r"[A-Z]{3}", raw_currency) else None
     total_amount = _to_decimal(data.get("total"))
     delivery_details = data.get("delivery_details")
     if delivery_details is None:
@@ -1775,30 +1799,17 @@ def _save_purchase_order_from_extraction(
         .first()
     )
     if existing is not None:
-        existing_lines = list(getattr(existing, "lines", []))
-        extracted_lines = data.get("line_items") or []
-        same_header = (
-            existing.po_number == _purchase_order_number(data)
-            and existing.vendor_id == vendor.id
-            and existing.po_date == _parse_document_date(po_date)
-            and str(existing.currency).strip().upper() == currency
-            and existing.total_amount == total_amount
-            and existing.tax_rate == _to_decimal(data.get("tax_rate"))
-            and existing.payment_terms == data.get("payment_terms")
-            and existing.delivery_details == delivery_details
-            and _line_fingerprints(existing_lines)
-            == _line_fingerprints(extracted_lines, extracted=True)
+        if existing.vendor_id is None and vendor is not None:
+            existing.vendor_id = vendor.id
+        existing.field_confidence = _extracted_field_confidence(data)
+        existing.needs_verification = _extraction_needs_verification(
+            data, validation_issues
         )
-        if same_header:
-            return existing
-        raise ValueError(
-            "Purchase order extraction differs from the previously saved record; "
-            "review required"
-        )
+        return existing
 
     purchase_order = PurchaseOrder(
         po_number=_purchase_order_number(data),
-        vendor_id=vendor.id,
+        vendor_id=vendor.id if vendor else None,
         source_document_id=document.id,
         po_date=_parse_document_date(po_date),
         currency=currency,
@@ -1810,6 +1821,8 @@ def _save_purchase_order_from_extraction(
         total_amount=total_amount,
         payment_terms=data.get("payment_terms"),
         delivery_details=delivery_details,
+        field_confidence=_extracted_field_confidence(data),
+        needs_verification=_extraction_needs_verification(data, validation_issues),
         created_by=getattr(document, "created_by", None),
         updated_by=document.created_by,
     )
@@ -1819,7 +1832,7 @@ def _save_purchase_order_from_extraction(
 
     for raw in data.get("line_items") or []:
         if not isinstance(raw, dict):
-            raise ValueError("Purchase order line item must be an object")
+            continue
         item_code = _line_value(raw, "item_code", "sku", "product_code")
         description = _line_value(raw, "description", "item_description")
         db.add(
@@ -1834,6 +1847,11 @@ def _save_purchase_order_from_extraction(
                 unit_price=_to_decimal(_line_value(raw, "unit_price", "price")),
                 line_amount=_to_decimal(
                     _line_value(raw, "line_amount", "amount", "total")
+                ),
+                field_confidence=(
+                    raw.get("field_confidence")
+                    if isinstance(raw.get("field_confidence"), dict)
+                    else {}
                 ),
                 created_by=document.created_by,
                 updated_by=document.created_by,
@@ -2234,9 +2252,8 @@ def parse_document(
                 if Path(temp_path).suffix.casefold() == ".docx":
                     raise ValueError("DOCX_PARSE_FAILED") from None
                 models_missing = _docling_models_missing()
-                if (
-                    Path(temp_path).suffix.casefold() == ".pdf"
-                    and (_is_extraction_model_error(exc) or models_missing)
+                if Path(temp_path).suffix.casefold() == ".pdf" and (
+                    _is_extraction_model_error(exc) or models_missing
                 ):
                     raw_text = _extract_pdf_text_layer(temp_path)
                     if not raw_text.strip():
@@ -2482,28 +2499,26 @@ def parse_document(
 
             vendor_name = str(extracted_data.get("vendor") or "").strip()
 
-            if vendor_name:
+            vendor_tax_id = str(extracted_data.get("vendor_tax_id") or "").strip()
+            if vendor_name or vendor_tax_id:
                 po_vendor = resolve_vendor(
                     db, vendor_name, tax_id=extracted_data.get("vendor_tax_id")
                 )
 
                 if po_vendor is None:
-                    validation_issues.append(
-                        f"Vendor not found or inactive: {vendor_name}"
-                    )
+                    validation_issues.append(f"New vendor: {vendor_name}")
 
         if doc_type == "goods_receipt" and isinstance(extracted_data, dict):
             if validation_data.get("line_errors"):
                 validation_issues.extend(validation_data["line_errors"])
             vendor_name = str(extracted_data.get("vendor") or "").strip()
-            if vendor_name:
+            vendor_tax_id = str(extracted_data.get("vendor_tax_id") or "").strip()
+            if vendor_name or vendor_tax_id:
                 goods_receipt_vendor = resolve_vendor(
                     db, vendor_name, tax_id=extracted_data.get("vendor_tax_id")
                 )
                 if goods_receipt_vendor is None:
-                    validation_issues.append(
-                        f"Vendor not found or inactive: {vendor_name}"
-                    )
+                    validation_issues.append(f"New vendor: {vendor_name}")
         _record_pipeline_step(
             db,
             document,
@@ -2516,7 +2531,11 @@ def parse_document(
         # Step 6: Check current purchase order duplicates.
         duplicate_purchase_order = None
 
-        if doc_type == "po" and not validation_issues and po_vendor is not None:
+        if (
+            doc_type == "po"
+            and isinstance(extracted_data, dict)
+            and _purchase_order_number(extracted_data)
+        ):
             duplicate_purchase_order = _find_duplicate_purchase_order(
                 db,
                 _purchase_order_number(extracted_data),
@@ -2617,20 +2636,38 @@ def parse_document(
                 }
             except ValueError as exc:
                 validation_issues.append(str(exc))
-        if doc_type == "po" and not validation_issues:
+        po_vendor_identity = bool(
+            isinstance(extracted_data, dict)
+            and (
+                str(
+                    extracted_data.get("vendor")
+                    or extracted_data.get("vendor_name")
+                    or ""
+                ).strip()
+                or str(
+                    extracted_data.get("vendor_tax_id")
+                    or extracted_data.get("tax_id")
+                    or ""
+                ).strip()
+            )
+        )
+        if doc_type == "po" and _purchase_order_number(extracted_data):
             if duplicate_purchase_order is not None:
                 validation_issues.append(
                     "Duplicate current purchase order number: "
                     f"{_purchase_order_number(extracted_data)}"
                 )
 
-            elif po_vendor is not None:
+            elif not po_vendor_identity:
+                validation_issues.append("Missing required field: vendor")
+            else:
                 try:
                     _save_purchase_order_from_extraction(
                         db,
                         document,
                         extracted_data,
                         po_vendor,
+                        validation_issues=validation_issues,
                     )
                 except ValueError as exc:
                     validation_issues.append(str(exc))
@@ -2661,12 +2698,20 @@ def parse_document(
 
         if (
             doc_type == "goods_receipt"
-            and not validation_issues
-            and goods_receipt_vendor is not None
+            and isinstance(extracted_data, dict)
+            and bool(
+                extracted_data.get("gr_number")
+                or extracted_data.get("receipt_number")
+                or extracted_data.get("goods_receipt_number")
+            )
         ):
             try:
                 _save_goods_receipt_from_extraction(
-                    db, document, extracted_data, goods_receipt_vendor
+                    db,
+                    document,
+                    extracted_data,
+                    goods_receipt_vendor,
+                    validation_issues=validation_issues,
                 )
             except (AwaitingRelatedDocumentError, AwaitingHumanDecisionError):
                 # Keep the validated source document available for later linking.
@@ -2684,7 +2729,16 @@ def parse_document(
                 "duplicate_blocked" if duplicate_invoice else "needs_data_review"
             )
             document.failure_message = _document_failure_message(
-                ValueError("; ".join(validation_issues))
+                ValueError(
+                    next(
+                        (
+                            issue
+                            for issue in validation_issues
+                            if issue.startswith("New vendor:")
+                        ),
+                        "; ".join(validation_issues),
+                    )
+                )
             )
             if duplicate_invoice_id:
                 document.extracted_json = {
@@ -2766,7 +2820,9 @@ def parse_document(
         )
 
         db.rollback()
-        failure_detail = _document_failure_message(exc)
+        failure_detail = _document_failure_message(
+            exc, parse_failed=active_pipeline_step == "parse"
+        )
 
         try:
             document = db.query(Document).filter_by(id=document_id).first()
@@ -2790,7 +2846,9 @@ def parse_document(
                     )
                 )
                 document.status = "failed"
-                document.failure_message = _document_failure_message(exc)
+                document.failure_message = _document_failure_message(
+                    exc, parse_failed=active_pipeline_step == "parse"
+                )
                 failure_detail = (
                     f"{document.original_filename}: {document.failure_message}"
                 )
@@ -2926,8 +2984,7 @@ def retry_document_processing(
         and getattr(document, "parent_document_id", None) is None
         and (
             getattr(document, "original_filename", "").casefold().endswith(".eml")
-            or (getattr(document, "mime", None) or "").casefold()
-            == "message/rfc822"
+            or (getattr(document, "mime", None) or "").casefold() == "message/rfc822"
         )
     )
     retry_status = "parsing" if is_raw_email else "received"

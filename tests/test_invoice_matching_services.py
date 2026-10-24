@@ -1,3 +1,5 @@
+import hashlib
+import json
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
@@ -95,6 +97,36 @@ def test_pipeline_match_sets_match_approved_without_admin_decision(monkeypatch):
         sum(isinstance(call.args[0], MatchRun) for call in db.add.call_args_list)
         == run_count + 1
     )
+
+
+def test_dependency_match_rerun_is_idempotent_when_inputs_are_unchanged(monkeypatch):
+    invoice = SimpleNamespace(id=uuid.uuid4())
+    state_fingerprint = hashlib.sha256(
+        json.dumps({}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    previous = SimpleNamespace(
+        rules_used={"state_fingerprint": state_fingerprint},
+    )
+    query = _query(previous=previous)
+    db = MagicMock()
+    db.get.return_value = invoice
+    db.query.return_value = query
+    monkeypatch.setattr(
+        matching,
+        "evaluate_invoice",
+        lambda *_args, **_kwargs: {"inputs_summary": {}},
+    )
+
+    result = matching.run_match_for_invoice(
+        db,
+        invoice.id,
+        force=True,
+        idempotent=True,
+        trigger="dependency_arrived",
+    )
+
+    assert result is previous
+    db.add.assert_not_called()
 
 
 def matching_confidence_fields():

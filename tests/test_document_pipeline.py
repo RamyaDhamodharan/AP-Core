@@ -543,8 +543,13 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
 
     db = MagicMock()
 
-    def auto_match(_db, invoice_id, user_id):
+    def auto_match(_db, invoice_id, user_id, **options):
         assert invoice_id == invoice.id
+        assert options == {
+            "force": True,
+            "idempotent": True,
+            "trigger": "dependency_arrived",
+        }
         invoice.match_status = "pending"
         invoice.final_status = "approved"
         return SimpleNamespace(result="match_ok")
@@ -583,7 +588,11 @@ def test_rematch_waiting_invoice_flags_amount_mismatch(monkeypatch):
     )
 
     db = MagicMock()
-    monkeypatch.setattr(document_routers, "run_match_for_invoice", lambda *_args: None)
+    monkeypatch.setattr(
+        document_routers,
+        "run_match_for_invoice",
+        lambda *_args, **_kwargs: None,
+    )
     (
         db.query.return_value.filter.return_value.with_for_update.return_value.all
     ).return_value = [invoice]
@@ -592,7 +601,7 @@ def test_rematch_waiting_invoice_flags_amount_mismatch(monkeypatch):
 
     assert count == 1
     assert invoice.po_id == po.id
-    assert invoice.match_status == "match_issues"
+    assert invoice.match_status == "waiting_for_po"
 
 
 def test_invoice_matching_requires_vendor_review_when_unresolved():
@@ -973,7 +982,7 @@ def test_parse_document_resolves_purchase_order_vendor_alias(monkeypatch):
     assert purchase_order.vendor_id == vendor.id
 
 
-def test_parse_document_does_not_persist_incomplete_purchase_order(
+def test_parse_document_persists_incomplete_purchase_order_for_verification(
     monkeypatch,
 ):
     data = {
@@ -993,7 +1002,16 @@ def test_parse_document_does_not_persist_incomplete_purchase_order(
     assert response.json()["status"] == "needs_data_review"
     assert "Missing required field: po_date" in response.json()["validation_issues"]
     assert document.extracted_json == data
-    _assert_no_purchase_order_persisted(db)
+    from src.models.purchase_order_models import PurchaseOrder
+
+    purchase_order = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], PurchaseOrder)
+    )
+    assert purchase_order.po_number == "PO-101"
+    assert purchase_order.needs_verification is True
+    assert purchase_order.po_date is None
 
 
 def test_parse_document_flags_duplicate_current_purchase_order(
@@ -1027,7 +1045,7 @@ def test_parse_document_flags_duplicate_current_purchase_order(
     _assert_no_purchase_order_persisted(db)
 
 
-def test_parse_document_requires_known_vendor_for_purchase_order(
+def test_parse_document_persists_purchase_order_with_unknown_vendor(
     monkeypatch,
 ):
     data = {
@@ -1046,12 +1064,17 @@ def test_parse_document_requires_known_vendor_for_purchase_order(
 
     assert response.status_code == 200
     assert response.json()["status"] == "needs_data_review"
-    assert (
-        "Vendor not found or inactive: Unknown Supplies"
-        in response.json()["validation_issues"]
-    )
+    assert "New vendor: Unknown Supplies" in response.json()["validation_issues"]
     assert document.extracted_json == data
-    _assert_no_purchase_order_persisted(db)
+    from src.models.purchase_order_models import PurchaseOrder
+
+    purchase_order = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], PurchaseOrder)
+    )
+    assert purchase_order.vendor_id is None
+    assert purchase_order.needs_verification is True
 
 
 def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
@@ -1081,7 +1104,11 @@ def test_parse_document_flags_po_line_subtotal_mismatch(monkeypatch):
         in response.json()["validation_issues"]
     )
     assert document.status == "needs_data_review"
-    _assert_no_purchase_order_persisted(db)
+    from src.models.purchase_order_models import PurchaseOrder
+
+    assert any(
+        isinstance(call.args[0], PurchaseOrder) for call in db.add.call_args_list
+    )
 
 
 def test_parse_document_not_found(monkeypatch):
@@ -1241,7 +1268,9 @@ def test_parse_document_classification_failure(monkeypatch, classification_resul
     ],
 )
 def test_parse_failure_has_plain_language_reason(error, expected):
-    message = document_routers._document_failure_message(RuntimeError(error))
+    message = document_routers._document_failure_message(
+        RuntimeError(error), parse_failed="appears damaged" in expected
+    )
     assert expected in message
 
 
@@ -1265,11 +1294,17 @@ def test_needs_data_review_invalid_values_are_not_reported_as_damaged_files():
     assert "need review" in message
 
 
+def test_invalid_pdf_text_without_parse_failure_is_not_called_damaged():
+    message = document_routers._document_failure_message(
+        RuntimeError("Invalid PDF header in an extracted field")
+    )
+    assert "damaged" not in message
+
+
 def test_missing_required_fields_are_named_in_review_message():
     message = document_routers._document_failure_message(
         RuntimeError(
-            "Missing required field: gr_number; "
-            "Missing required field: order_number"
+            "Missing required field: gr_number; Missing required field: order_number"
         )
     )
     assert "gr_number" in message

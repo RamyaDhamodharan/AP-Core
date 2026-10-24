@@ -311,9 +311,18 @@ def test_step_log_records_elapsed_milliseconds_and_compact_output():
     ],
 )
 def test_document_failure_messages_are_plain_and_actionable(technical, message):
-    result = _document_failure_message(RuntimeError(technical))
+    result = _document_failure_message(
+        RuntimeError(technical),
+        parse_failed=technical in {"corrupt PDF", "no text could be extracted"},
+    )
     assert message in result
     assert technical not in result
+
+
+def test_empty_parse_is_reported_as_damaged_only_at_parse_stage():
+    error = RuntimeError("No text could be extracted from the document")
+    assert "damaged" in _document_failure_message(error, parse_failed=True)
+    assert "damaged" not in _document_failure_message(error, parse_failed=False)
 
 
 def test_audit_search_supports_filters_paging_and_hides_technical_detail():

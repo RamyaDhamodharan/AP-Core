@@ -33,7 +33,7 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261023_0022"]
+    assert script.get_heads() == ["20261024_0023"]
     alias_revision = script.get_revision(ALIAS_REVISION)
     assert alias_revision is not None
     assert alias_revision.down_revision == BASELINE_REVISION

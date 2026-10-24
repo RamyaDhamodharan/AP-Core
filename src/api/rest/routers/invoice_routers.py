@@ -6,9 +6,9 @@ from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import Float, cast, func, or_
+from sqlalchemy import Float, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.api.rest.dependencies import get_current_user
 from src.db.session_db import get_db
@@ -16,6 +16,7 @@ from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.email_draft_models import EmailDraft, EmailDraftEvent
 from src.models.follow_up_models import FollowUp
+from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_issue_models import InvoiceIssue
 from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
@@ -956,6 +957,131 @@ def get_invoice_detail(
     saved_match_outcome = (
         (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
     )
+    linked_po = None
+    if invoice.po_id:
+        linked_po = db.scalar(
+            select(PurchaseOrder)
+            .options(selectinload(PurchaseOrder.lines))
+            .where(
+                PurchaseOrder.id == invoice.po_id,
+                or_(
+                    PurchaseOrder.created_by == owner_id,
+                    PurchaseOrder.source_document_id.in_(
+                        select(Document.id).where(Document.created_by == owner_id)
+                    ),
+                ),
+            )
+        )
+    linked_goods_receipts = []
+    if linked_po is not None:
+        linked_goods_receipts = list(
+            db.scalars(
+                select(GoodsReceipt)
+                .options(selectinload(GoodsReceipt.lines))
+                .where(
+                    GoodsReceipt.po_id == linked_po.id,
+                    or_(
+                        GoodsReceipt.created_by == owner_id,
+                        GoodsReceipt.source_document_id.in_(
+                            select(Document.id).where(Document.created_by == owner_id)
+                        ),
+                        GoodsReceipt.po_id == linked_po.id,
+                    ),
+                )
+                .order_by(GoodsReceipt.receipt_date.desc().nullslast())
+            ).all()
+        )
+    outcome_codes = {
+        item.get("code")
+        for item in (saved_match_outcome or {}).get("discrepancies", [])
+        if isinstance(item, dict)
+    }
+    match_checks = [
+        {
+            "code": code,
+            "label": label,
+            "status": "fail" if code in outcome_codes else "pass",
+            "invoice_value": invoice_value,
+            "expected_value": expected_value,
+        }
+        for code, label, invoice_value, expected_value in (
+            (
+                "MISSING_PO",
+                "Purchase order",
+                invoice.po_number_raw,
+                linked_po.po_number if linked_po else None,
+            ),
+            (
+                "VENDOR_MISMATCH",
+                "Vendor",
+                invoice.vendor_id,
+                linked_po.vendor_id if linked_po else None,
+            ),
+            (
+                "MISSING_GR",
+                "Goods receipt",
+                len(linked_goods_receipts),
+                "At least one receipt",
+            ),
+            (
+                "LINE_NOT_ON_PO",
+                "Invoice lines",
+                len(invoice.line_items)
+                if hasattr(invoice, "line_items")
+                else len(
+                    db.query(InvoiceLine)
+                    .filter(InvoiceLine.invoice_id == invoice.id)
+                    .all()
+                ),
+                "All invoice lines matched",
+            ),
+            (
+                "QUANTITY_VARIANCE",
+                "Received quantity",
+                "Invoice quantities",
+                "Accepted receipt quantities",
+            ),
+            ("PRICE_VARIANCE", "Unit price", "Invoice prices", "PO prices within 2%"),
+            (
+                "LINE_TOTAL_VARIANCE",
+                "Line totals",
+                "Quantity × price",
+                "Invoice line totals",
+            ),
+            (
+                "TAX_VARIANCE",
+                "Tax",
+                invoice.tax_amount,
+                linked_po.tax_amount if linked_po else None,
+            ),
+            (
+                "HEADER_TOTAL_VARIANCE",
+                "Header total",
+                invoice.total_amount,
+                invoice.subtotal + invoice.tax_amount
+                if invoice.subtotal is not None and invoice.tax_amount is not None
+                else None,
+            ),
+            (
+                "CURRENCY_MISMATCH",
+                "Currency",
+                invoice.currency,
+                linked_po.currency if linked_po else None,
+            ),
+            (
+                "POSSIBLE_DUPLICATE",
+                "Duplicate invoice",
+                invoice.invoice_no,
+                "No matching invoice",
+            ),
+            (
+                "LOW_CONFIDENCE",
+                "Field confidence",
+                "Saved field levels",
+                "At least 85%",
+            ),
+        )
+    ]
     return {
         "invoice_id": str(invoice.id),
         "source_document_id": str(invoice.source_document_id)
@@ -1017,6 +1143,57 @@ def get_invoice_detail(
             .all()
         ],
         "match_outcome": saved_match_outcome,
+        "match_checks": match_checks,
+        "payment_status": "Paid" if getattr(invoice, "paid_at", None) else "Not paid",
+        "linked_purchase_order": (
+            {
+                "id": str(linked_po.id),
+                "po_number": linked_po.po_number,
+                "vendor_id": str(linked_po.vendor_id) if linked_po.vendor_id else None,
+                "vendor_name": linked_po.vendor_name,
+                "source_document_id": str(linked_po.source_document_id)
+                if linked_po.source_document_id
+                else None,
+                "po_date": linked_po.po_date,
+                "currency": linked_po.currency,
+                "total_amount": linked_po.total_amount,
+                "needs_verification": linked_po.needs_verification,
+                "lines": [
+                    {
+                        "item_code": line.item_code,
+                        "description": line.description,
+                        "qty": line.qty,
+                        "unit_price": line.unit_price,
+                        "line_amount": line.line_amount,
+                    }
+                    for line in linked_po.lines
+                ],
+            }
+            if linked_po
+            else None
+        ),
+        "linked_goods_receipts": [
+            {
+                "id": str(receipt.id),
+                "gr_number": receipt.gr_number,
+                "source_document_id": str(receipt.source_document_id)
+                if receipt.source_document_id
+                else None,
+                "receipt_date": receipt.receipt_date,
+                "needs_verification": receipt.needs_verification,
+                "lines": [
+                    {
+                        "item_code": line.item_code,
+                        "description": line.description,
+                        "received_qty": line.received_qty,
+                        "accepted_qty": line.accepted_qty,
+                        "rejected_qty": line.rejected_qty,
+                    }
+                    for line in receipt.lines
+                ],
+            }
+            for receipt in linked_goods_receipts
+        ],
         "match_rule_set_version": (
             (saved_run.rules_used or {}).get("rule_set_version") if saved_run else None
         ),

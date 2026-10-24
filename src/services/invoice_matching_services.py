@@ -187,7 +187,13 @@ def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
 
 
 def run_match_for_invoice(
-    db: Session, invoice_id, user_id=None, *, force: bool = False
+    db: Session,
+    invoice_id,
+    user_id=None,
+    *,
+    force: bool = False,
+    idempotent: bool = False,
+    trigger: str | None = None,
 ) -> MatchRun | None:
     """Persist the initial match or an explicitly requested rerun."""
     unit_price_tolerance = f"{os.getenv('INVOICE_UNIT_PRICE_TOLERANCE_PCT', '2')}%"
@@ -220,6 +226,13 @@ def run_match_for_invoice(
             decision["inputs_summary"], sort_keys=True, separators=(",", ":")
         ).encode()
     ).hexdigest()
+    if (
+        idempotent
+        and previous is not None
+        and (previous.rules_used or {}).get("state_fingerprint") == fingerprint
+    ):
+        return previous
+    run_actor_id = None if trigger else user_id
     db.add(
         AuditLog(
             action="pipeline_step",
@@ -235,7 +248,7 @@ def run_match_for_invoice(
             output_summary={"po_linked": bool(getattr(invoice, "po_id", None))},
             result=("success" if getattr(invoice, "po_id", None) else "warning"),
             message="Purchase order link evaluated",
-            created_by=user_id,
+            created_by=run_actor_id,
         )
     )
     result = (
@@ -270,7 +283,7 @@ def run_match_for_invoice(
         db,
         invoice,
         issue_checks,
-        user_id,
+        run_actor_id,
         ["goods_receipt"]
         if any(item["code"] == "MISSING_GR" for item in differences)
         else [],
@@ -287,9 +300,10 @@ def run_match_for_invoice(
             "unit_price_tolerance_pct": unit_price_tolerance,
             "total_tolerance_pct": total_tolerance,
             "state_fingerprint": fingerprint,
+            "trigger": trigger or "requested",
         },
         differences=differences,
-        created_by=user_id,
+        created_by=run_actor_id,
     )
     db.add(run)
     db.flush()
@@ -324,7 +338,7 @@ def run_match_for_invoice(
                 match_type="3-way" if receipt else "2-way",
                 score=Decimal("100"),
                 status="confirmed",
-                confirmed_by=user_id,
+                confirmed_by=run_actor_id,
             )
             db.add(match)
         else:

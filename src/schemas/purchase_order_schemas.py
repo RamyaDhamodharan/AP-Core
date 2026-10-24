@@ -19,6 +19,7 @@ class PurchaseOrderLineResponse(BaseModel):
     qty: Decimal | None
     unit_price: Decimal | None
     line_amount: Decimal | None
+    field_confidence: dict[str, Any] | None = None
 
 
 class PurchaseOrderResponse(BaseModel):
@@ -32,12 +33,14 @@ class PurchaseOrderResponse(BaseModel):
     vendor_name: str | None
     source_document_id: uuid.UUID | None
     po_date: date | None
-    currency: str
+    currency: str | None
     subtotal: Decimal | None
     tax_amount: Decimal | None
     total_amount: Decimal | None
     payment_terms: Any | None = None
     delivery_details: Any | None = None
+    field_confidence: dict[str, Any] | None = None
+    needs_verification: bool = False
     created_at: datetime
     updated_at: datetime
     lines: list[PurchaseOrderLineResponse]

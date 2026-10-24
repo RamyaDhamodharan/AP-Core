@@ -32,6 +32,12 @@ class PurchaseOrder(Base):
             unique=True,
             postgresql_where=text("is_current"),
         ),
+        Index(
+            "uq_purchase_order_source_document",
+            "source_document_id",
+            unique=True,
+            postgresql_where=text("source_document_id IS NOT NULL"),
+        ),
     )
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -58,13 +64,17 @@ class PurchaseOrder(Base):
         ForeignKey("documents.id"),
     )
     po_date: Mapped[date | None] = mapped_column(Date)
-    currency: Mapped[str] = mapped_column(CHAR(3), nullable=False)
+    currency: Mapped[str | None] = mapped_column(CHAR(3))
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
     total_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     payment_terms: Mapped[Any | None] = mapped_column(JSONB)
     delivery_details: Mapped[Any | None] = mapped_column(JSONB)
+    field_confidence: Mapped[dict | None] = mapped_column(JSONB)
+    needs_verification: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
@@ -111,6 +121,7 @@ class PurchaseOrderLine(Base):
     qty: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
     unit_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
     line_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    field_confidence: Mapped[dict | None] = mapped_column(JSONB)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("auth.users.id")
     )

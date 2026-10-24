@@ -1,13 +1,18 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.api.rest.dependencies import get_current_user, require_role
 from src.db.session_db import get_db
+from src.models.audit_models import AuditLog
+from src.models.document_models import Document
+from src.models.goods_receipt_models import GoodsReceipt
+from src.models.invoice_models import Invoice
+from src.models.purchase_order_models import PurchaseOrder
 from src.models.vendor_models import Vendor, VendorAlias
 from src.schemas.vendor_schemas import (
     VendorAliasCreate,
@@ -106,6 +111,134 @@ def _raise_vendor_conflict(exc: IntegrityError) -> None:
         status_code=409,
         detail="Vendor conflicts with existing data",
     ) from exc
+
+
+def _normalize_tax_id(value: object) -> str:
+    return "".join(char for char in str(value or "").casefold() if char.isalnum())
+
+
+@router.post(
+    "/{vendor_id}/resolve-extracted",
+    dependencies=[Depends(require_role("admin"))],
+)
+def resolve_extracted_records_for_vendor(
+    vendor_id: uuid.UUID,
+    identity: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Link previously extracted rows matching a newly confirmed vendor."""
+    vendor = db.get(Vendor, vendor_id)
+    if vendor is None or not vendor.is_active:
+        raise HTTPException(status_code=404, detail="Active vendor not found")
+    names = {
+        normalize_vendor_name(value)
+        for value in (vendor.name, identity.get("name"))
+        if value and normalize_vendor_name(value)
+    }
+    tax_ids = {
+        _normalize_tax_id(value)
+        for value in (vendor.tax_id, identity.get("tax_id"))
+        if _normalize_tax_id(value)
+    }
+    summary = {"documents": 0, "purchase_orders": 0, "goods_receipts": 0, "invoices": 0}
+    documents = (
+        db.query(Document)
+        .filter(Document.extracted_json.is_not(None))
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+    rematch_ids = set()
+    actor_id = uuid.UUID(str(current_user["sub"]))
+    for document in documents:
+        data = document.extracted_json
+        if not isinstance(data, dict):
+            continue
+        raw_name = data.get("vendor") or data.get("vendor_name")
+        raw_tax_id = data.get("vendor_tax_id") or data.get("tax_id")
+        if not (
+            (raw_name and normalize_vendor_name(raw_name) in names)
+            or _normalize_tax_id(raw_tax_id) in tax_ids
+        ):
+            continue
+        summary["documents"] += 1
+        invoice = (
+            db.query(Invoice)
+            .filter(Invoice.source_document_id == document.id)
+            .with_for_update()
+            .first()
+        )
+        if invoice is not None and invoice.vendor_id is None:
+            invoice.vendor_id = vendor.id
+            invoice.updated_by = actor_id
+            summary["invoices"] += 1
+            rematch_ids.add(invoice.id)
+        po = (
+            db.query(PurchaseOrder)
+            .filter(PurchaseOrder.source_document_id == document.id)
+            .with_for_update()
+            .first()
+        )
+        if po is not None and po.vendor_id is None:
+            po.vendor_id = vendor.id
+            po.updated_by = actor_id
+            summary["purchase_orders"] += 1
+            from src.api.rest.routers.document_routers import (
+                _rematch_waiting_invoices_for_po,
+            )
+
+            _rematch_waiting_invoices_for_po(db, po)
+        receipt = (
+            db.query(GoodsReceipt)
+            .filter(GoodsReceipt.source_document_id == document.id)
+            .with_for_update()
+            .first()
+        )
+        if receipt is not None and receipt.vendor_id is None:
+            receipt.vendor_id = vendor.id
+            receipt.updated_by = actor_id
+            summary["goods_receipts"] += 1
+        if receipt is not None:
+            from src.api.rest.routers.document_routers import (
+                _rematch_waiting_invoices_for_po,
+                _save_goods_receipt_from_extraction,
+            )
+
+            _save_goods_receipt_from_extraction(
+                db,
+                document,
+                data,
+                vendor,
+                validation_issues=[],
+            )
+            if receipt.po_id:
+                related_po = db.get(PurchaseOrder, receipt.po_id)
+                if related_po is not None:
+                    _rematch_waiting_invoices_for_po(db, related_po)
+        data["vendor_resolution"] = {
+            "method": "user_confirmed",
+            "vendor_id": str(vendor.id),
+            "extracted_value": raw_name or raw_tax_id,
+        }
+        document.extracted_json = data
+    if rematch_ids:
+        from src.services.invoice_matching_services import run_match_for_invoice
+
+        for invoice_id in rematch_ids:
+            run_match_for_invoice(db, invoice_id, actor_id, force=True)
+    db.add(
+        AuditLog(
+            action="unknown_vendor_records_resolved",
+            entity_type="vendor",
+            entity_id=vendor.id,
+            result="success",
+            message="Extracted records were linked to a user-confirmed vendor",
+            output_summary=summary,
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    return summary
 
 
 @router.get(

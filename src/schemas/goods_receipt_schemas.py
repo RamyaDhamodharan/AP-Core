@@ -44,16 +44,23 @@ class GoodsReceiptUpdate(BaseModel):
 class GoodsReceiptLineResponse(GoodsReceiptLineInput):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
+    po_line_id: uuid.UUID | None
+    received_qty: Decimal | None
+    accepted_qty: Decimal | None
+    rejected_qty: Decimal | None
+    field_confidence: dict | None = None
 
 
 class GoodsReceiptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     gr_number: str
-    po_id: uuid.UUID
-    vendor_id: uuid.UUID
+    po_id: uuid.UUID | None
+    vendor_id: uuid.UUID | None
     source_document_id: uuid.UUID | None
-    receipt_date: date
+    receipt_date: date | None
+    field_confidence: dict | None = None
+    needs_verification: bool = False
     created_at: datetime
     updated_at: datetime
     lines: list[GoodsReceiptLineResponse]

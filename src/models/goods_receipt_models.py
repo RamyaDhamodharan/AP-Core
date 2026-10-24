@@ -3,6 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -14,7 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.vendor_models import Base
@@ -29,6 +30,12 @@ class GoodsReceipt(Base):
             text("lower(TRIM(BOTH FROM gr_number))"),
             unique=True,
         ),
+        Index(
+            "uq_goods_receipts_source_document",
+            "source_document_id",
+            unique=True,
+            postgresql_where=text("source_document_id IS NOT NULL"),
+        ),
         Index("ix_goods_receipts_po_id", "po_id"),
     )
 
@@ -36,16 +43,20 @@ class GoodsReceipt(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     gr_number: Mapped[str] = mapped_column(String(60), nullable=False)
-    po_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("purchase_orders.id"), nullable=False
+    po_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("purchase_orders.id"), nullable=True
     )
-    vendor_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vendors.id"), nullable=False
+    vendor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vendors.id"), nullable=True
     )
     source_document_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id")
     )
-    receipt_date: Mapped[date] = mapped_column(Date, nullable=False)
+    receipt_date: Mapped[date | None] = mapped_column(Date)
+    field_confidence: Mapped[dict | None] = mapped_column(JSONB)
+    needs_verification: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
@@ -85,17 +96,16 @@ class GoodsReceiptLine(Base):
         ForeignKey("goods_receipts.id", ondelete="CASCADE"),
         nullable=False,
     )
-    po_line_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("po_lines.id"), nullable=False
+    po_line_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("po_lines.id"), nullable=True
     )
     item_code: Mapped[str | None] = mapped_column(String(60))
     description: Mapped[str | None] = mapped_column(String(300))
     uom: Mapped[str | None] = mapped_column(String(10))
-    received_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
-    accepted_qty: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
-    rejected_qty: Mapped[Decimal] = mapped_column(
-        Numeric(14, 3), nullable=False, server_default=text("0")
-    )
+    received_qty: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    accepted_qty: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    rejected_qty: Mapped[Decimal | None] = mapped_column(Numeric(14, 3), nullable=True)
+    field_confidence: Mapped[dict | None] = mapped_column(JSONB)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("auth.users.id")
     )
