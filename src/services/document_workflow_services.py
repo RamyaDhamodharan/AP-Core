@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.models.document_models import Document
 from src.models.document_workflow_models import DocumentWorkflow
-from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
@@ -186,7 +185,6 @@ def compare_available_records(
                 actual=invoice.po_number_raw,
             )
 
-        currency_multiplier = Decimal(1)
         invoice_currency = normalize_value(invoice.currency).upper()
         po_currency = normalize_value(purchase_order.currency).upper()
         if not invoice_currency or not po_currency:
@@ -194,37 +192,13 @@ def compare_available_records(
         elif invoice_currency == po_currency:
             check("currency", "passed", "Invoice and PO currencies match")
         else:
-            rate = (
-                (
-                    db.query(ExchangeRate)
-                    .filter(
-                        ExchangeRate.from_currency == invoice_currency,
-                        ExchangeRate.to_currency == po_currency,
-                    )
-                    .order_by(ExchangeRate.rate_date.desc())
-                    .first()
-                )
-                if db is not None
-                else None
+            check(
+                "currency",
+                "mismatch",
+                f"Currency mismatch: invoice {invoice_currency}, PO {po_currency}",
+                expected=po_currency,
+                actual=invoice_currency,
             )
-            if rate is None:
-                check(
-                    "currency",
-                    "not_possible",
-                    "Currencies differ and no exchange rate is available",
-                    expected=po_currency,
-                    actual=invoice_currency,
-                )
-            else:
-                currency_multiplier = _decimal(rate.rate) or Decimal(1)
-                check(
-                    "currency",
-                    "passed",
-                    "Invoice amount converted using exchange rate",
-                    expected=po_currency,
-                    actual=invoice_currency,
-                    difference=currency_multiplier,
-                )
 
         invoice_tax = _decimal(getattr(invoice, "tax_amount", None))
         expected_tax = _decimal(getattr(purchase_order, "tax_amount", None))
@@ -277,8 +251,6 @@ def compare_available_records(
 
         invoice_total = _decimal(invoice.total_amount)
         po_total = _decimal(purchase_order.total_amount)
-        if invoice_total is not None:
-            invoice_total *= currency_multiplier
         if invoice_total is None or po_total is None:
             check(
                 "document_total",
