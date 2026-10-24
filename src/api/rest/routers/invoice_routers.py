@@ -443,6 +443,7 @@ def list_invoices(
     source: Literal["email", "upload"] | None = None,
     final_status: InvoiceFinalStatus | None = None,
     vendor_id: uuid.UUID | None = None,
+    po_id: uuid.UUID | None = None,
     invoice_date_from: date | None = None,
     invoice_date_to: date | None = None,
     due_date: date | None = None,
@@ -491,6 +492,8 @@ def list_invoices(
     )
     if owner_user_id:
         filters.append(Invoice.owner_user_id == owner_user_id)
+    if po_id:
+        filters.append(Invoice.po_id == po_id)
     if status:
         filters.append(Invoice.status == status)
     if source:

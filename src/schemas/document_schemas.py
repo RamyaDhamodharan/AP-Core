@@ -28,6 +28,8 @@ class DocumentSummary(BaseModel):
 class DocumentDetail(DocumentSummary):
     raw_text: str | None
     extracted_json: dict[str, Any] | None
+    linked_po_id: uuid.UUID | None = None
+    linked_gr_id: uuid.UUID | None = None
 
 
 class DocumentListResponse(BaseModel):

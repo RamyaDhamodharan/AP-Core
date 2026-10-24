@@ -495,6 +495,32 @@ def get_document_detail(
     linked_invoice = (
         db.query(Invoice).filter(Invoice.source_document_id == document.id).first()
     )
+    linked_po = (
+        db.query(PurchaseOrder)
+        .filter(
+            PurchaseOrder.source_document_id == document.id,
+            or_(
+                PurchaseOrder.created_by == owner_id,
+                PurchaseOrder.source_document_id.in_(
+                    db.query(Document.id).filter(Document.created_by == owner_id)
+                ),
+            ),
+        )
+        .first()
+    )
+    linked_gr = (
+        db.query(GoodsReceipt)
+        .filter(
+            GoodsReceipt.source_document_id == document.id,
+            or_(
+                GoodsReceipt.created_by == owner_id,
+                GoodsReceipt.source_document_id.in_(
+                    db.query(Document.id).filter(Document.created_by == owner_id)
+                ),
+            ),
+        )
+        .first()
+    )
     return DocumentReviewDetail.model_validate(
         {
             **DocumentSummary.model_validate(document).model_dump(),
@@ -505,6 +531,8 @@ def get_document_detail(
             ),
             "linked_invoice_id": linked_invoice.id if linked_invoice else None,
             "linked_invoice_status": linked_invoice.status if linked_invoice else None,
+            "linked_po_id": linked_po.id if linked_po else None,
+            "linked_gr_id": linked_gr.id if linked_gr else None,
             "raw_text": document.raw_text,
             "extracted_json": document.extracted_json,
             "audit_history": [
@@ -1133,13 +1161,43 @@ def _document_failure_message(error: Exception) -> str:
             "after storage connectivity is restored."
         )
     if any(
-        word in failure_text
-        for word in (
+        marker in failure_text
+        for marker in (
+            "missing required field",
+            "required field",
+            "validation",
+            "invalid monetary value",
+            "invalid date",
+            "line item",
+            "line amounts do not reconcile",
+            "amount mismatch",
+        )
+    ):
+        missing_fields = re.findall(
+            r"missing required field:\s*([a-z0-9_ -]+)", failure_text
+        )
+        fields = ", ".join(dict.fromkeys(field.strip() for field in missing_fields))
+        if fields:
+            return (
+                f"Required document details are missing: {fields}. "
+                "Review the highlighted fields and correct them."
+            )
+        return (
+            "Some document details need review. Review the highlighted fields "
+            "and correct them."
+        )
+    if any(
+        marker in failure_text
+        for marker in (
             "corrupt",
-            "invalid",
             "truncated",
             "unexpected eof",
             "format error",
+            "invalid pdf",
+            "invalid file format",
+            "invalid document format",
+            "invalid docx",
+            "invalid zip archive",
         )
     ):
         return "This file appears damaged; ask the vendor to resend it."
@@ -1147,11 +1205,6 @@ def _document_failure_message(error: Exception) -> str:
         return (
             "This invoice appears to be a duplicate; review the existing invoice "
             "before retrying."
-        )
-    if "missing required field" in failure_text or "required field" in failure_text:
-        return (
-            "Required document details are missing; review the highlighted fields "
-            "and correct them."
         )
     if "line amounts do not reconcile" in failure_text:
         return (

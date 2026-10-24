@@ -1233,6 +1233,7 @@ def test_parse_document_classification_failure(monkeypatch, classification_resul
     [
         ("Password required to open PDF", "password-protected"),
         ("Corrupt PDF: unexpected EOF", "appears damaged"),
+        ("Invalid PDF header", "appears damaged"),
         ("Unsupported input format", "unsupported"),
         ("No text could be extracted from the document", "no readable text"),
         ("Unsupported image format", "image format is unsupported"),
@@ -1252,6 +1253,27 @@ def test_parse_failure_fallback_names_extraction_failure():
         "Document extraction failed; retry processing. "
         "If it fails again, contact support."
     )
+
+
+def test_needs_data_review_invalid_values_are_not_reported_as_damaged_files():
+    message = document_routers._document_failure_message(
+        RuntimeError(
+            "Line item 1 has missing or invalid received/accepted/rejected quantities"
+        )
+    )
+    assert "damaged" not in message
+    assert "need review" in message
+
+
+def test_missing_required_fields_are_named_in_review_message():
+    message = document_routers._document_failure_message(
+        RuntimeError(
+            "Missing required field: gr_number; "
+            "Missing required field: order_number"
+        )
+    )
+    assert "gr_number" in message
+    assert "order_number" in message
 
 
 def test_exception_log_detail_redacts_credentials(monkeypatch):

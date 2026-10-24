@@ -2,7 +2,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -24,6 +24,25 @@ _GR_NUMBER_CONSTRAINTS = {
     "uq_goods_receipts_gr_number",
     "uq_goods_receipts_gr_number_norm",
 }
+
+
+def _owner_filter(owner_id: uuid.UUID):
+    return or_(
+        GoodsReceipt.created_by == owner_id,
+        GoodsReceipt.source_document_id.in_(
+            select(Document.id).where(Document.created_by == owner_id)
+        ),
+        GoodsReceipt.po_id.in_(
+            select(PurchaseOrder.id).where(
+                or_(
+                    PurchaseOrder.created_by == owner_id,
+                    PurchaseOrder.source_document_id.in_(
+                        select(Document.id).where(Document.created_by == owner_id)
+                    ),
+                )
+            )
+        ),
+    )
 
 
 def _is_goods_receipt_number_conflict(exc: IntegrityError) -> bool:
@@ -112,18 +131,42 @@ def _load(db: Session, receipt_id: uuid.UUID) -> GoodsReceipt:
     dependencies=[Depends(get_current_user)],
 )
 def list_goods_receipts(
+    response: Response,
     db: Session = Depends(get_db),
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     po_id: uuid.UUID | None = None,
+    source_document_id: uuid.UUID | None = None,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    sort_by: Annotated[
+        str, Query(pattern="^(receipt_date|gr_number)$")
+    ] = "receipt_date",
+    sort_dir: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
+    current_user: dict = Depends(get_current_user),
 ) -> list[GoodsReceipt]:
+    try:
+        owner_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    filters = [_owner_filter(owner_id)]
+    if po_id:
+        filters.append(GoodsReceipt.po_id == po_id)
+    if source_document_id:
+        filters.append(GoodsReceipt.source_document_id == source_document_id)
+    if search:
+        filters.append(GoodsReceipt.gr_number.ilike(f"%{search.strip()}%"))
+    sort_column = getattr(GoodsReceipt, sort_by)
+    sort_order = sort_column.asc() if sort_dir == "asc" else sort_column.desc()
+    total = db.scalar(select(func.count(GoodsReceipt.id)).where(*filters)) or 0
+    response.headers["X-Total-Count"] = str(total)
     query = (
         select(GoodsReceipt)
         .options(selectinload(GoodsReceipt.lines))
-        .order_by(GoodsReceipt.receipt_date.desc(), GoodsReceipt.id)
+        .where(*filters)
+        .order_by(sort_order, GoodsReceipt.id)
     )
-    if po_id:
-        query = query.where(GoodsReceipt.po_id == po_id)
     return list(db.scalars(query.offset((page - 1) * page_size).limit(page_size)).all())
 
 
@@ -133,9 +176,24 @@ def list_goods_receipts(
     dependencies=[Depends(get_current_user)],
 )
 def get_goods_receipt(
-    receipt_id: uuid.UUID, db: Session = Depends(get_db)
+    receipt_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> GoodsReceipt:
-    return _load(db, receipt_id)
+    try:
+        owner_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    receipt = db.scalar(
+        select(GoodsReceipt)
+        .options(selectinload(GoodsReceipt.lines))
+        .where(GoodsReceipt.id == receipt_id, _owner_filter(owner_id))
+    )
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Goods receipt not found")
+    return receipt
 
 
 @router.post(
