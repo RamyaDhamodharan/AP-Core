@@ -34,6 +34,7 @@ from src.api.rest.routers import (
 from src.services.docling_model_services import docling_models_available
 from src.services.llm_pipeline_services import validate_llm_provider_config
 from src.services.runtime_config_services import (
+    env_flag,
     warn_if_container_minio_endpoint_is_localhost,
     warn_if_container_redis_url_is_localhost,
 )
@@ -96,7 +97,7 @@ app.include_router(issue_routers.router)
 app.include_router(audit_routers.router)
 app.include_router(invoice_supporting_document_routers.router)
 app.include_router(purchase_order_routers.router)
-if os.getenv("ENABLE_GOODS_RECEIPT", "true").casefold() in {"1", "true", "yes", "on"}:
+if env_flag("REQUIRE_GOODS_RECEIPT", True, legacy_name="ENABLE_GOODS_RECEIPT"):
     app.include_router(goods_receipt_routers.router)
 app.include_router(notification_routers.router)
 

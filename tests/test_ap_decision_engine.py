@@ -185,3 +185,22 @@ def test_multiple_discrepancies_are_kept(monkeypatch):
 
     codes = _codes(monkeypatch, mutate)
     assert {"QUANTITY_VARIANCE", "PRICE_VARIANCE", "CURRENCY_MISMATCH"} <= codes
+
+
+@pytest.mark.parametrize(("setting", "expected"), [("true", True), ("false", False)])
+def test_goods_receipt_requirement_flag(monkeypatch, setting, expected):
+    monkeypatch.setenv("REQUIRE_GOODS_RECEIPT", setting)
+    db, invoice, _po, _line = _fixture(monkeypatch, receipt=False)
+    codes = {
+        item["code"] for item in engine.evaluate_invoice(db, invoice)["discrepancies"]
+    }
+    assert ("MISSING_GR" in codes) is expected
+    assert ("QUANTITY_VARIANCE" in codes) is expected
+
+
+@pytest.mark.parametrize(("setting", "expected"), [("true", True), ("false", False)])
+def test_currency_conversion_flag(setting, expected, monkeypatch):
+    from src.services.runtime_config_services import currency_conversion_enabled
+
+    monkeypatch.setenv("CURRENCY_CONVERSION", setting)
+    assert currency_conversion_enabled() is expected

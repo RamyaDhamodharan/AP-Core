@@ -14,6 +14,30 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 
+def env_flag(name: str, default: bool, *, legacy_name: str | None = None) -> bool:
+    """Read a boolean feature flag without accepting ambiguous values as true."""
+    raw = os.getenv(name)
+    if raw is None and legacy_name:
+        raw = os.getenv(legacy_name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def require_goods_receipt() -> bool:
+    return env_flag("REQUIRE_GOODS_RECEIPT", True)
+
+
+def no_match_auto_reject() -> bool:
+    return env_flag(
+        "NO_MATCH_AUTO_REJECT", True, legacy_name="EMAIL_NO_MATCH_AUTO_REJECT"
+    )
+
+
+def currency_conversion_enabled() -> bool:
+    return env_flag("CURRENCY_CONVERSION", True)
+
+
 def is_running_in_container() -> bool:
     """
     Handle is running in container.

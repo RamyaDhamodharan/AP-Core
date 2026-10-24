@@ -100,6 +100,7 @@ from ....services.llm_pipeline_services import (
     is_e2e_stub_enabled,
     validate_extracted_data,
 )
+from ....services.runtime_config_services import no_match_auto_reject
 from ....services.vendor_resolution_services import (
     find_active_alias_conflict,
     find_canonical_name_conflict,
@@ -187,12 +188,7 @@ def _auto_reject_unmatched_invoice(
     db, invoice: Invoice, document: Document | None
 ) -> None:
     """Reject a completed no-match and best-effort queue allowlisted email."""
-    if os.getenv("EMAIL_NO_MATCH_AUTO_REJECT", "true").casefold() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not no_match_auto_reject():
         return
     reason = "No purchase order / unknown vendor"
     current = legacy_workflow_status(invoice)
@@ -854,6 +850,12 @@ def _process_in_background(document_id: uuid.UUID) -> None:
             )
 
         except HTTPException as exc:
+            if (
+                exc.status_code == 409
+                and exc.detail == "Document processing is already in progress"
+            ):
+                logger.info("Duplicate processing delivery ignored for %s", document_id)
+                return
             logger.error(
                 "Auto processing failed for %s: %s",
                 document_id,
@@ -1754,9 +1756,7 @@ def _save_goods_receipt_from_extraction(
     # validation/linking issues should require review; low confidence alone
     # must not block or flag a usable PO/GR record.
     receipt.needs_verification = (
-        bool(validation_issues)
-        or receipt.po_id is None
-        or receipt.vendor_id is None
+        bool(validation_issues) or receipt.po_id is None or receipt.vendor_id is None
     )
     if mapped:
         receipt.lines = mapped

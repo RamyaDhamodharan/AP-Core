@@ -140,6 +140,38 @@ def test_duplicate_task_does_not_process_a_completed_document(monkeypatch):
     assert processed == []
 
 
+def test_duplicate_delivery_409_does_not_mark_in_progress_document_failed(monkeypatch):
+    from fastapi import HTTPException
+
+    from src.api.rest.routers import document_routers
+
+    document = SimpleNamespace(
+        id=uuid.uuid4(), status="received", created_by=uuid.uuid4()
+    )
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = document
+    monkeypatch.setattr(document_routers, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        document_routers,
+        "parse_document",
+        MagicMock(
+            side_effect=HTTPException(
+                status_code=409,
+                detail="Document processing is already in progress",
+            )
+        ),
+    )
+    mark_failed = MagicMock()
+    monkeypatch.setattr(
+        document_routers, "_mark_unhandled_processing_failure", mark_failed
+    )
+
+    document_routers._process_in_background(document.id)
+
+    assert document.status == "received"
+    mark_failed.assert_not_called()
+
+
 def test_admin_bulk_reprocess_is_idempotent_and_limited_to_five(monkeypatch):
     documents = [
         SimpleNamespace(

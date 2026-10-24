@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from decimal import Decimal
 
 from sqlalchemy import func
@@ -38,15 +39,7 @@ from src.services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
 )
-
-
-def _email_no_match_auto_reject_enabled() -> bool:
-    return os.getenv("EMAIL_NO_MATCH_AUTO_REJECT", "true").casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+from src.services.runtime_config_services import no_match_auto_reject
 
 
 def _suggested_purchase_orders(db: Session, invoice: Invoice, owner_id=None):
@@ -61,8 +54,8 @@ def _suggested_purchase_orders(db: Session, invoice: Invoice, owner_id=None):
         )
         .all()
     )
-    tax_id = (invoice.vendor_tax_id_raw or "").strip().casefold()
-    invoice_total = Decimal(str(invoice.total_amount or 0))
+    tax_id = (getattr(invoice, "vendor_tax_id_raw", None) or "").strip().casefold()
+    invoice_total = Decimal(str(getattr(invoice, "total_amount", None) or 0))
     invoice_terms = [
         str(line.item_code or line.description or "").casefold().strip()
         for line in invoice_lines
@@ -70,7 +63,8 @@ def _suggested_purchase_orders(db: Session, invoice: Invoice, owner_id=None):
     scored = []
     for po in po_rows:
         po_vendor = getattr(po, "vendor", None)
-        vendor_exact = bool(invoice.vendor_id and po.vendor_id == invoice.vendor_id)
+        invoice_vendor_id = getattr(invoice, "vendor_id", None)
+        vendor_exact = bool(invoice_vendor_id and po.vendor_id == invoice_vendor_id)
         tax_exact = bool(
             tax_id
             and po_vendor
@@ -241,6 +235,11 @@ def run_match_for_invoice(
     po_link_started = time.perf_counter()
     # Step 2: Evaluate current PO, receipt, currency, totals, and confidence evidence.
     decision = evaluate_invoice(db, invoice, owner_id=user_id)
+    matched_po_ids = decision["inputs_summary"].get("po_ids")
+    if matched_po_ids is not None:
+        invoice.po_id = (
+            uuid.UUID(matched_po_ids[0]) if len(matched_po_ids) == 1 else None
+        )
     fingerprint = hashlib.sha256(
         json.dumps(
             decision["inputs_summary"], sort_keys=True, separators=(",", ":")
@@ -313,6 +312,7 @@ def run_match_for_invoice(
         invoice_id=invoice.id,
         run_no=previous_no + 1,
         po_id=invoice.po_id,
+        exchange_rate_id=(decision["inputs_summary"].get("exchange_rate_id")),
         result=result,
         rules_used={
             "rule_set_version": decision["rule_set_version"],
@@ -404,7 +404,7 @@ def run_match_for_invoice(
                 {"name": "no_po_found", "reason": "No PO found", "severity": "error"}
             )
 
-    no_match_auto_reject = False
+    no_match_auto_reject_enabled = no_match_auto_reject()
     has_suggested_candidate = bool(candidates) if not invoice.po_id else False
     # Step 5: Keep suggested candidates in review; they are not a completed no-match.
     # A suggested PO is a review case. It is never classified as a completed no-match.
@@ -412,7 +412,7 @@ def run_match_for_invoice(
         result = "match_issues"
     auto_reject = (
         result == "no_match"
-        and no_match_auto_reject
+        and no_match_auto_reject_enabled
         and not preserve_final_status
         and original_workflow_status != "rejected"
     )
@@ -466,7 +466,6 @@ def run_match_for_invoice(
     if confidence_needs_review and not auto_reject:
         workflow_status = "verifying"
     if current_workflow_status not in {
-        "approved",
         "paid",
         "rejected",
         "on_hold",

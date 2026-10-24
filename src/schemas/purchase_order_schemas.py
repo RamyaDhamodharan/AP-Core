@@ -122,3 +122,37 @@ class PurchaseOrderVendorReassignmentRequest(BaseModel):
     Use: shared persistence or validation contract for this flow stage.
     """
     vendor_id: uuid.UUID
+
+
+class PurchaseOrderAmendmentLine(BaseModel):
+    item_code: str | None = Field(default=None, max_length=60)
+    description: str | None = Field(default=None, max_length=300)
+    uom: str | None = Field(default=None, max_length=10)
+    qty: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=3)
+    unit_price: Decimal | None = Field(
+        default=None, ge=0, max_digits=14, decimal_places=4
+    )
+    line_amount: Decimal | None = Field(
+        default=None, ge=0, max_digits=14, decimal_places=2
+    )
+
+
+class PurchaseOrderAmendmentRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+    po_date: date | None = None
+    currency: str | None = Field(default=None, pattern="^[A-Z]{3}$")
+    subtotal: Decimal | None = Field(
+        default=None, ge=0, max_digits=14, decimal_places=2
+    )
+    tax_amount: Decimal | None = Field(
+        default=None, ge=0, max_digits=14, decimal_places=2
+    )
+    tax_rate: Decimal | None = Field(default=None, ge=0, max_digits=7, decimal_places=4)
+    total_amount: Decimal | None = Field(
+        default=None, ge=0, max_digits=14, decimal_places=2
+    )
+    payment_terms: Any | None = None
+    delivery_details: Any | None = None
+    lines: list[PurchaseOrderAmendmentLine] | None = Field(
+        default=None, min_length=1, max_length=200
+    )

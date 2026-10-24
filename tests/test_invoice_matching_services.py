@@ -5,6 +5,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from src.models.email_draft_models import EmailDraft
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.match_run_models import MatchRun
@@ -189,7 +191,7 @@ def _no_match_fixture(monkeypatch, *, candidates=None, source="upload"):
 def test_completed_no_match_stays_in_review_without_auto_reject_or_draft(
     monkeypatch,
 ):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
 
@@ -202,10 +204,25 @@ def test_completed_no_match_stays_in_review_without_auto_reject_or_draft(
     assert not any(isinstance(row, EmailDraft) for row in added)
 
 
+@pytest.mark.parametrize(
+    ("setting", "expected_status"),
+    [("true", "rejected"), ("false", "needs_review")],
+)
+def test_no_match_flag_controls_automatic_rejection(
+    monkeypatch, setting, expected_status
+):
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", setting)
+    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch)
+    run = matching.run_match_for_invoice(db, invoice_id)
+    assert run.result == "no_match"
+    assert invoice.status == expected_status
+
+
 def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
     monkeypatch,
 ):
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
     matching.run_match_for_invoice(db, invoice_id)
     assert invoice.status == "needs_review"
@@ -213,7 +230,7 @@ def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
         isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
     )
 
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "false")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
     run = matching.run_match_for_invoice(db, invoice_id)
     assert run.result == "no_match"
@@ -222,7 +239,7 @@ def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
 
 
 def test_upload_no_match_stays_in_review_without_sender_notification(monkeypatch):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="upload")
 
@@ -236,6 +253,7 @@ def test_upload_no_match_stays_in_review_without_sender_notification(monkeypatch
 
 
 def test_missing_confidence_keeps_a_matched_invoice_in_verification(monkeypatch):
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         po_id=uuid.uuid4(),
@@ -272,7 +290,7 @@ def test_missing_confidence_keeps_a_matched_invoice_in_verification(monkeypatch)
 
 
 def test_suggested_candidate_is_review_not_no_match(monkeypatch):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "true")
     candidate = (SimpleNamespace(id=uuid.uuid4()), Decimal("80"))
     db, invoice, _document, invoice_id = _no_match_fixture(
         monkeypatch, candidates=[candidate]
@@ -288,7 +306,8 @@ def test_suggested_candidate_is_review_not_no_match(monkeypatch):
     )
 
 
-def test_new_match_downgrades_unpaid_approval_but_preserves_paid_invoice(monkeypatch):
+def test_new_match_invalidates_unpaid_approval_but_preserves_paid_invoice(monkeypatch):
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     for workflow_status, legacy_status in (
         ("approved", "needs_review"),
         ("paid", "paid"),
@@ -301,12 +320,17 @@ def test_new_match_downgrades_unpaid_approval_but_preserves_paid_invoice(monkeyp
         )
 
         assert matching.run_match_for_invoice(db, invoice_id) is not None
-        assert invoice.workflow_status == workflow_status
-        assert invoice.status == legacy_status
+        if workflow_status == "approved":
+            assert invoice.workflow_status == "no_match"
+            assert invoice.status == "needs_review"
+            assert invoice.final_status is None
+        else:
+            assert invoice.workflow_status == workflow_status
+            assert invoice.status == legacy_status
 
 
 def test_no_match_does_not_create_draft_or_auto_reject(monkeypatch, caplog):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
+    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
 

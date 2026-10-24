@@ -166,28 +166,39 @@ def test_case_7_mark_overdue_creates_history_alert_and_follow_up(
 
     changed = follow_up_services.mark_overdue(db_session, datetime.now(UTC))
     follow_up_services.run_follow_ups(db_session, datetime.now(UTC))
-    command_center = command_center_bills(
-        bucket="overdue", db=db_session, _user={}
-    )
+    command_center = command_center_bills(bucket="overdue", db=db_session, _user={})
 
     assert changed == 1
     assert invoice.workflow_status == "overdue"
-    assert next(
-        row for row in command_center["items"] if row["invoice_id"] == invoice.id
-    )["alert"] is True
-    assert db_session.query(InvoiceStateHistory).filter_by(
-        invoice_id=invoice.id, to_status="overdue"
-    ).count() == 1
-    assert db_session.query(AuditLog).filter_by(
-        entity_type="invoice", entity_id=invoice.id, action="invoice_overdue"
-    ).count() == 1
+    assert (
+        next(row for row in command_center["items"] if row["invoice_id"] == invoice.id)[
+            "alert"
+        ]
+        is True
+    )
+    assert (
+        db_session.query(InvoiceStateHistory)
+        .filter_by(invoice_id=invoice.id, to_status="overdue")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(AuditLog)
+        .filter_by(
+            entity_type="invoice", entity_id=invoice.id, action="invoice_overdue"
+        )
+        .count()
+        == 1
+    )
     notifications = db_session.query(Notification).filter_by(
         document_id=invoice.source_document_id
     )
     assert notifications.count() == 0
-    follow_up = db_session.query(FollowUp).filter_by(
-        entity_type="invoice", entity_id=invoice.id, kind="overdue"
-    ).one()
+    follow_up = (
+        db_session.query(FollowUp)
+        .filter_by(entity_type="invoice", entity_id=invoice.id, kind="overdue")
+        .one()
+    )
     assert follow_up.attempts >= 1
 
 
@@ -259,17 +270,17 @@ def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_r
         "order_number": po.po_number,
         "invoice_date": "2026-10-01",
         "currency": "EUR",
-        "subtotal": "100.00",
+        "subtotal": "90.90" if with_exchange_rate else "100.00",
         "tax": "0.00",
-        "total": "100.00",
+        "total": "90.90" if with_exchange_rate else "100.00",
         "line_items": [
             {
                 "item_code": po_line.item_code,
                 "description": po_line.description,
                 "uom": po_line.uom,
                 "qty": "10",
-                "unit_price": "10.00",
-                "line_amount": "100.00",
+                "unit_price": "9.09" if with_exchange_rate else "10.00",
+                "line_amount": "90.90" if with_exchange_rate else "100.00",
             }
         ],
         "field_confidence": _high_confidence(),
@@ -306,7 +317,7 @@ def test_currency_mismatch_persists_invoice_and_keeps_document_extracted(
     assert document.failure_message is None
 
 
-def test_currency_mismatch_with_exchange_rate_still_requires_review(
+def test_currency_mismatch_with_exchange_rate_converts_using_stored_rate(
     db_session, db_factories
 ):
     document, invoice, run, discrepancy = _run_currency_mismatch_pipeline(
@@ -314,13 +325,40 @@ def test_currency_mismatch_with_exchange_rate_still_requires_review(
     )
 
     assert db_session.get(Invoice, invoice.id) is invoice
-    assert run.result == "match_issues"
-    assert invoice.status == "needs_review"
-    assert discrepancy.reason == "Currency mismatch: invoice EUR, PO USD"
-    assert discrepancy.invoice_value == "EUR"
-    assert discrepancy.po_value == "USD"
+    assert run.result == "match_ok"
+    assert invoice.status == "ready_to_pay"
+    assert run.exchange_rate_id is not None
+    assert (
+        db_session.query(InvoiceDiscrepancy)
+        .filter_by(invoice_id=invoice.id, field="currency")
+        .count()
+        == 0
+    )
     assert document.status == "extracted"
     assert document.failure_message is None
+
+
+def test_currency_conversion_disabled_uses_currency_mismatch(
+    db_session, db_factories, monkeypatch
+):
+    monkeypatch.setenv("CURRENCY_CONVERSION", "false")
+    _, invoice, run, _ = _run_currency_mismatch_pipeline(
+        db_session, db_factories, with_exchange_rate=True
+    )
+    assert run.result == "match_issues"
+    assert invoice.status == "needs_review"
+    assert any(item["code"] == "CURRENCY_MISMATCH" for item in run.differences)
+
+
+def test_currency_conversion_enabled_by_default_uses_stored_rate(
+    db_session, db_factories, monkeypatch
+):
+    monkeypatch.delenv("CURRENCY_CONVERSION", raising=False)
+    _, invoice, run, _ = _run_currency_mismatch_pipeline(
+        db_session, db_factories, with_exchange_rate=True
+    )
+    assert run.result == "match_ok"
+    assert invoice.status == "ready_to_pay"
 
 
 def test_concurrent_canonical_invoice_number_insert_has_one_duplicate_winner(

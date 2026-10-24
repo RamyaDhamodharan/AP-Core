@@ -31,6 +31,7 @@ from src.schemas.vendor_schemas import (
     VendorResponse,
     VendorUpdate,
 )
+from src.services.invoice_state_services import transition_invoice
 from src.services.vendor_resolution_services import (
     find_active_alias_conflict,
     find_canonical_name_conflict,
@@ -270,6 +271,20 @@ def resolve_extracted_records_for_vendor(
         if invoice is not None and invoice.vendor_id is None:
             invoice.vendor_id = vendor.id
             invoice.updated_by = actor_id
+            if (
+                invoice.workflow_status == "rejected"
+                and invoice.final_status == "rejected"
+                and invoice.final_by is None
+            ):
+                transition_invoice(
+                    db,
+                    invoice,
+                    "matching",
+                    changed_by=actor_id,
+                    reason=(
+                        "Unknown vendor resolved; resume automatic no-match rejection"
+                    ),
+                )
             summary["invoices"] += 1
             rematch_ids.add(invoice.id)
         po = (

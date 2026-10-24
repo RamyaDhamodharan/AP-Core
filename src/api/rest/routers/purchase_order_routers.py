@@ -18,13 +18,17 @@ from src.api.rest.dependencies import get_current_user, require_role
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
-from src.models.purchase_order_models import PurchaseOrder
+from src.models.invoice_models import Invoice
+from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.models.vendor_models import Vendor
 from src.schemas.purchase_order_schemas import (
+    PurchaseOrderAmendmentRequest,
     PurchaseOrderListResponse,
     PurchaseOrderResponse,
     PurchaseOrderVendorReassignmentRequest,
 )
+from src.services.invoice_matching_services import run_match_for_invoice
+from src.services.po_matching_services import normalize_value
 
 router = APIRouter(
     prefix="/api/purchase-orders",
@@ -229,3 +233,173 @@ def reassign_purchase_order_vendor(
             _owner_filter(owner_id, current_user),
         )
     )
+
+
+@router.post(
+    "/{po_id}/amendments",
+    response_model=PurchaseOrderResponse,
+    status_code=201,
+    dependencies=[Depends(require_role("admin"))],
+)
+def amend_purchase_order(
+    po_id: uuid.UUID,
+    payload: PurchaseOrderAmendmentRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create an audited PO version and automatically re-match its invoices."""
+    try:
+        actor_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    order = db.scalar(
+        _query()
+        .where(PurchaseOrder.id == po_id, _owner_filter(actor_id, current_user))
+        .with_for_update()
+    )
+    if order is None:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    if not order.is_current:
+        raise HTTPException(
+            status_code=409, detail="Only the current purchase order can be amended"
+        )
+
+    old_snapshot = {
+        "version_no": order.version_no,
+        "vendor_id": str(order.vendor_id) if order.vendor_id else None,
+        "po_date": order.po_date.isoformat() if order.po_date else None,
+        "currency": order.currency,
+        "subtotal": str(order.subtotal) if order.subtotal is not None else None,
+        "tax_amount": str(order.tax_amount) if order.tax_amount is not None else None,
+        "total_amount": str(order.total_amount)
+        if order.total_amount is not None
+        else None,
+        "lines": [
+            {
+                "item_code": line.item_code,
+                "qty": str(line.qty) if line.qty is not None else None,
+                "unit_price": str(line.unit_price)
+                if line.unit_price is not None
+                else None,
+                "line_amount": str(line.line_amount)
+                if line.line_amount is not None
+                else None,
+            }
+            for line in order.lines
+        ],
+    }
+    previous_lines = list(order.lines)
+    order.is_current = False
+    db.flush()
+    amended = PurchaseOrder(
+        po_number=order.po_number,
+        version_no=order.version_no + 1,
+        is_current=True,
+        vendor_id=order.vendor_id,
+        source_document_id=None,
+        po_date=payload.po_date or order.po_date,
+        currency=payload.currency or order.currency,
+        subtotal=payload.subtotal if payload.subtotal is not None else order.subtotal,
+        tax_amount=(
+            payload.tax_amount if payload.tax_amount is not None else order.tax_amount
+        ),
+        tax_rate=payload.tax_rate if payload.tax_rate is not None else order.tax_rate,
+        total_amount=(
+            payload.total_amount
+            if payload.total_amount is not None
+            else order.total_amount
+        ),
+        payment_terms=payload.payment_terms or order.payment_terms,
+        delivery_details=payload.delivery_details or order.delivery_details,
+        field_confidence=order.field_confidence,
+        needs_verification=order.needs_verification,
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    db.add(amended)
+    db.flush()
+    if payload.lines is not None:
+        amended.lines = [
+            PurchaseOrderLine(**line.model_dump(), created_by=actor_id)
+            for line in payload.lines
+        ]
+    else:
+        amended.lines = [
+            PurchaseOrderLine(
+                item_code=line.item_code,
+                description=line.description,
+                uom=line.uom,
+                qty=line.qty,
+                unit_price=line.unit_price,
+                line_amount=line.line_amount,
+                field_confidence=line.field_confidence,
+                created_by=actor_id,
+            )
+            for line in previous_lines
+        ]
+    db.flush()
+    new_snapshot = {
+        **old_snapshot,
+        "version_no": amended.version_no,
+        "currency": amended.currency,
+        "subtotal": str(amended.subtotal) if amended.subtotal is not None else None,
+        "tax_amount": str(amended.tax_amount)
+        if amended.tax_amount is not None
+        else None,
+        "total_amount": str(amended.total_amount)
+        if amended.total_amount is not None
+        else None,
+        "lines": [
+            {
+                "item_code": line.item_code,
+                "qty": str(line.qty) if line.qty is not None else None,
+                "unit_price": str(line.unit_price)
+                if line.unit_price is not None
+                else None,
+                "line_amount": str(line.line_amount)
+                if line.line_amount is not None
+                else None,
+            }
+            for line in amended.lines
+        ],
+    }
+    db.add(
+        AuditLog(
+            action="purchase_order_amended",
+            actor=str(actor_id),
+            entity_type="purchase_order",
+            entity_id=amended.id,
+            old_value=old_snapshot,
+            new_value=new_snapshot,
+            result="success",
+            message=f"PO {order.po_number} amended to version {amended.version_no}",
+            reason=payload.reason,
+            created_by=actor_id,
+            updated_by=actor_id,
+        )
+    )
+    invoices = (
+        db.query(Invoice).filter(Invoice.is_current.is_(True)).with_for_update().all()
+    )
+    for invoice in invoices:
+        if normalize_value(invoice.po_number_raw) != normalize_value(order.po_number):
+            continue
+        run_match_for_invoice(
+            db,
+            invoice.id,
+            force=True,
+            idempotent=True,
+            trigger="po_amended",
+        )
+    db.commit()
+    result = db.scalar(
+        _query().where(
+            PurchaseOrder.id == amended.id,
+            _owner_filter(actor_id, current_user),
+        )
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Amended PO not found")
+    return result

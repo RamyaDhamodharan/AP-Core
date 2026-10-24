@@ -278,7 +278,8 @@ def test_admin_can_set_active_vendor_through_invoice_patch_and_matching_runs(
     )
     vendor = SimpleNamespace(id=vendor_id, is_active=True)
     query = MagicMock()
-    query.outerjoin.return_value.filter.return_value.first.return_value = invoice
+    invoice_query = query.outerjoin.return_value.filter.return_value
+    invoice_query.with_for_update.return_value.first.return_value = invoice
     db = MagicMock()
     db.query.return_value = query
     db.get.return_value = vendor
@@ -304,6 +305,9 @@ def test_admin_can_set_active_vendor_through_invoice_patch_and_matching_runs(
     assert invoice.vendor_id == vendor_id
     assert matched == [True]
     db.commit.assert_called_once()
+    query.outerjoin.return_value.filter.return_value.with_for_update.assert_called_once_with(
+        of=Invoice
+    )
 
 
 def test_associate_cannot_change_invoice_vendor(monkeypatch):
@@ -319,7 +323,8 @@ def test_associate_cannot_change_invoice_vendor(monkeypatch):
         source_document_id=None,
     )
     query = MagicMock()
-    query.outerjoin.return_value.filter.return_value.first.return_value = invoice
+    invoice_query = query.outerjoin.return_value.filter.return_value
+    invoice_query.with_for_update.return_value.first.return_value = invoice
     db = MagicMock()
     db.query.return_value = query
     monkeypatch.setattr(

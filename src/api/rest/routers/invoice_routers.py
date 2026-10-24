@@ -1598,16 +1598,22 @@ def approve_invoice_exception(
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required")
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
-    if invoice.final_status or invoice.status in {
-        "ready_to_pay",
-        "on_hold",
-        "rejected",
-    } or getattr(invoice, "workflow_status", None) in {
-        "approved",
-        "paid",
-        "on_hold",
-        "rejected",
-    }:
+    if (
+        invoice.final_status
+        or invoice.status
+        in {
+            "ready_to_pay",
+            "on_hold",
+            "rejected",
+        }
+        or getattr(invoice, "workflow_status", None)
+        in {
+            "approved",
+            "paid",
+            "on_hold",
+            "rejected",
+        }
+    ):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -2786,6 +2792,7 @@ def update_invoice(
         db.query(Invoice)
         .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(Invoice.id == invoice_id, _invoice_owner_filter(user_id))
+        .with_for_update(of=Invoice)
         .first()
     )
     if invoice is None:
@@ -2916,10 +2923,17 @@ def confirm_invoice_po(
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     po_id = uuid.UUID(str(payload.get("po_id")))
-    if db.get(PurchaseOrder, po_id) is None:
+    selected_po = db.get(PurchaseOrder, po_id)
+    if selected_po is None:
         raise HTTPException(status_code=404, detail="Purchase order not found")
+    if not selected_po.is_current:
+        raise HTTPException(
+            status_code=409,
+            detail="Only the current purchase order version can be confirmed",
+        )
     old = str(invoice.po_id) if invoice.po_id else None
     invoice.po_id = po_id
+    invoice.po_number_raw = selected_po.po_number
     if legacy_workflow_status(invoice) not in {
         "approved",
         "rejected",

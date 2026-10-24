@@ -1,4 +1,4 @@
-"""
+﻿"""
 Deterministic, Decimal-only AP matching decision rules.
 Flow: invoice-to-PO and goods-receipt matching.
 Called by: src/services/invoice_matching_services.py.
@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
@@ -20,6 +21,10 @@ from src.services.document_workflow_services import _owner_scope
 from src.services.invoice_confidence_services import overall_confidence_percent
 from src.services.invoice_number_services import find_duplicate_invoice
 from src.services.po_matching_services import normalize_value
+from src.services.runtime_config_services import (
+    currency_conversion_enabled,
+    require_goods_receipt,
+)
 
 RULE_SET_VERSION = os.getenv("AP_MATCH_RULE_SET_VERSION", "ap-match-v1")
 PRICE_TOLERANCE = Decimal(os.getenv("AP_PRICE_TOLERANCE_PERCENT", "2")) / 100
@@ -89,6 +94,44 @@ def _json_safe(value):
     return value
 
 
+def _stored_exchange_rate(db, invoice: Invoice, po: PurchaseOrder):
+    """Find the latest usable direct or inverse rate for the invoice date."""
+    from_currency = str(getattr(invoice, "currency", None) or "").strip().upper()
+    to_currency = str(getattr(po, "currency", None) or "").strip().upper()
+    if not from_currency or not to_currency or from_currency == to_currency:
+        return None
+    rate_date = getattr(invoice, "invoice_date", None)
+    date_filter = (ExchangeRate.rate_date <= rate_date,) if rate_date else ()
+    direct = (
+        db.query(ExchangeRate)
+        .filter(
+            ExchangeRate.from_currency == from_currency,
+            ExchangeRate.to_currency == to_currency,
+            *date_filter,
+        )
+        .order_by(ExchangeRate.rate_date.desc(), ExchangeRate.created_at.desc())
+        .first()
+    )
+    if direct is not None:
+        rate = _d(getattr(direct, "rate", None))
+        if rate is not None and rate > 0:
+            return direct, rate
+    inverse = (
+        db.query(ExchangeRate)
+        .filter(
+            ExchangeRate.from_currency == to_currency,
+            ExchangeRate.to_currency == from_currency,
+            *date_filter,
+        )
+        .order_by(ExchangeRate.rate_date.desc(), ExchangeRate.created_at.desc())
+        .first()
+    )
+    inverse_rate = _d(getattr(inverse, "rate", None)) if inverse is not None else None
+    if inverse is not None and inverse_rate is not None and inverse_rate > 0:
+        return inverse, Decimal("1") / inverse_rate
+    return None
+
+
 def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     """
     Return a complete saved-ready outcome; descriptions never auto-link lines.
@@ -104,7 +147,23 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
     po_ref = normalize_value(po_number_raw)
-    if po_ref:
+    linked_po_id = getattr(invoice, "po_id", None)
+    linked_po = (
+        db.query(PurchaseOrder)
+        .filter(
+            PurchaseOrder.id == linked_po_id,
+            PurchaseOrder.is_current.is_(True),
+            *_owner_scope(PurchaseOrder, owner_id),
+        )
+        .first()
+        if linked_po_id
+        else None
+    )
+    if linked_po is not None and (
+        not po_ref or normalize_value(linked_po.po_number) == po_ref
+    ):
+        po_rows = [linked_po]
+    if po_ref and not po_rows:
         po_rows = [
             po
             for po in db.query(PurchaseOrder)
@@ -161,7 +220,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         if po
         else []
     )
-    if not receipts:
+    require_receipt = require_goods_receipt()
+    if not receipts and require_receipt:
         issues.append(
             _issue(
                 "MISSING_GR",
@@ -195,20 +255,33 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
     currency = getattr(invoice, "currency", None)
+    exchange_rate = None
+    if (
+        po
+        and currency
+        and po.currency
+        and currency.upper() != po.currency.upper()
+        and currency_conversion_enabled()
+    ):
+        exchange_rate = _stored_exchange_rate(db, invoice, po)
     if po and (
-        not currency or not po.currency or currency.upper() != po.currency.upper()
+        not currency
+        or not po.currency
+        or (currency.upper() != po.currency.upper() and exchange_rate is None)
     ):
         issues.append(
             _issue(
                 "CURRENCY_MISMATCH",
-                "Invoice and PO currencies must match.",
+                "Invoice and PO currencies must match or have a stored exchange rate.",
                 currency,
                 po.currency,
-                action="Correct the currency; amounts are never converted.",
+                action="Correct the currency or add a stored exchange rate.",
             )
         )
 
     # Step 4: Compare each line; an exact 2 percent price difference passes tolerance.
+    conversion_factor = exchange_rate[1] if exchange_rate else Decimal(1)
+
     for index, line in enumerate(lines, 1):
         reference = line.item_code or line.description or str(index)
         qty, price = _d(line.qty), _d(line.unit_price)
@@ -249,7 +322,11 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             continue
         pl = candidates[0]
         po_price = _d(pl.unit_price)
-        if qty is not None and received.get(pl.id, Decimal(0)) < qty:
+        if (
+            qty is not None
+            and (receipts or require_receipt)
+            and received.get(pl.id, Decimal(0)) < qty
+        ):
             issues.append(
                 _issue(
                     "QUANTITY_VARIANCE",
@@ -273,16 +350,17 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 )
             )
         else:
-            delta = abs(price - po_price)
+            converted_price = price * conversion_factor
+            delta = abs(converted_price - po_price)
             allowed = abs(po_price) * PRICE_TOLERANCE
             if delta > allowed:
                 issues.append(
                     _issue(
                         "PRICE_VARIANCE",
                         "Invoice unit price is outside the allowed PO tolerance.",
-                        price,
+                        converted_price,
                         po_price,
-                        price - po_price,
+                        converted_price - po_price,
                         allowed,
                         reference,
                         "Review the invoice price or obtain PO approval.",
@@ -295,15 +373,17 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     if po and (
         expected_tax is None
         or actual_tax is None
-        or abs(actual_tax - expected_tax) > TAX_TOLERANCE
+        or abs(actual_tax * conversion_factor - expected_tax) > TAX_TOLERANCE
     ):
         issues.append(
             _issue(
                 "TAX_VARIANCE",
                 "Invoice tax differs from the PO tax beyond tolerance.",
-                actual_tax,
+                actual_tax * conversion_factor if actual_tax is not None else None,
                 expected_tax,
-                actual_tax - expected_tax if actual_tax is not None else None,
+                actual_tax * conversion_factor - expected_tax
+                if actual_tax is not None and expected_tax is not None
+                else None,
                 TAX_TOLERANCE,
                 action="Review tax amounts and tax treatment.",
             )
@@ -449,6 +529,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             "vendor_id": str(invoice_vendor_id) if invoice_vendor_id else None,
             "invoice_number": getattr(invoice, "invoice_no", None),
             "currency": currency,
+            "exchange_rate_id": str(exchange_rate[0].id) if exchange_rate else None,
+            "exchange_rate": str(exchange_rate[1]) if exchange_rate else None,
             "invoice_total": str(getattr(invoice, "total_amount", None)),
             "invoice_subtotal": str(getattr(invoice, "subtotal", None)),
             "invoice_tax": str(getattr(invoice, "tax_amount", None)),
