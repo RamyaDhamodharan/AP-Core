@@ -123,7 +123,11 @@ passwords. Outlook consumer accounts can use an app password when two-step
 verification is enabled; Microsoft 365 work accounts may require an admin to
 enable authenticated IMAP or app passwords. Never use a production mailbox for
 testing. Configure the interval with `EMAIL_POLL_INTERVAL_SECONDS` (default
-120) and the folder with `IMAP_FOLDER` (default `INBOX`).
+120) and the folder with `IMAP_FOLDER` (default `INBOX`). Supported document
+attachments are PDF, PNG, JPEG, and macro-free DOCX. DOCX files must have the
+Office Open XML MIME type and a valid, bounded package structure; legacy `.doc`
+and macro-enabled `.docm`/`.dotm` Word formats are rejected, as are packages
+containing VBA projects.
 
 ## Invoice verification and tax checks
 

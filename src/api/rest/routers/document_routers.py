@@ -216,7 +216,7 @@ def _auto_reject_unmatched_invoice(
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml", ".docx"}
 STALE_PARSE_TIMEOUT = timedelta(minutes=10)
 
 _PROCESS_SLOTS = threading.BoundedSemaphore(int(os.getenv("PROCESS_CONCURRENCY", "2")))
@@ -1084,6 +1084,11 @@ def _apply_email_po_hint(document: Document, data: dict) -> None:
 
 def _document_failure_message(error: Exception) -> str:
     failure_text = str(error).casefold()
+    if "docx_parse_failed" in failure_text:
+        return (
+            "This Word document could not be read; save it as a new .docx file "
+            "and upload it again."
+        )
     if OCR_MODELS_UNAVAILABLE_MESSAGE.casefold() in failure_text:
         return OCR_MODELS_UNAVAILABLE_MESSAGE
     if any(
@@ -2173,6 +2178,8 @@ def parse_document(
                 result = converter.convert(temp_path)
                 raw_text = result.document.export_to_markdown()
             except Exception as exc:
+                if Path(temp_path).suffix.casefold() == ".docx":
+                    raise ValueError("DOCX_PARSE_FAILED") from None
                 models_missing = _docling_models_missing()
                 if (
                     Path(temp_path).suffix.casefold() == ".pdf"
@@ -2194,6 +2201,8 @@ def parse_document(
                     raise
 
         if not raw_text or not raw_text.strip():
+            if Path(temp_path).suffix.casefold() == ".docx":
+                raise ValueError("DOCX_PARSE_FAILED")
             raise ValueError("No text could be extracted from the document")
 
         document.raw_text = raw_text
@@ -2803,6 +2812,9 @@ def get_document_file(
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
+        ".docx": (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
         ".eml": "message/rfc822",
         ".txt": "text/plain",
     }.get(extension, "application/octet-stream")

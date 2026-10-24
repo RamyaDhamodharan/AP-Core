@@ -7,7 +7,9 @@ import zlib
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage as MIMEMessage
 from email.utils import format_datetime
+from io import BytesIO
 from unittest.mock import MagicMock
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import jwt
 import pytest
@@ -24,6 +26,22 @@ from src.models.notification_models import Notification
 from src.models.user_models import User
 from src.models.vendor_models import Vendor, VendorAlias
 from src.services import document_ingest_services, email_polling_services
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _docx_bytes():
+    output = BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>",
+        )
+        archive.writestr("word/document.xml", "<w:document/>")
+    return output.getvalue()
 
 
 class FakeQuery:
@@ -772,6 +790,32 @@ def test_bad_magic_attachment_is_rejected(polling_setup):
     assert result["filtered"] == 1
     assert not _documents(db)
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
+
+
+def test_valid_docx_email_attachment_uses_shared_ingest(polling_setup):
+    db, uploads, _ = polling_setup
+    payload = _docx_bytes()
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                attachments=[
+                    (
+                        "bill.docx",
+                        payload,
+                        "application",
+                        "vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                ]
+            )
+        },
+    )
+
+    assert result["attachments"] == 1
+    child = next(row for row in _documents(db) if row.original_filename == "bill.docx")
+    assert child.mime == DOCX_MIME
+    assert child.status == "received"
+    assert any(body == payload and mime == DOCX_MIME for _, body, mime in uploads)
 
 
 @pytest.mark.parametrize("header_offset", [0, 16, 1023])
