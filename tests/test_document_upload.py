@@ -391,6 +391,9 @@ def test_upload_blocks_duplicate_file(monkeypatch):
 
 
 def test_upload_triggers_auto_processing(monkeypatch):
+    # This test covers the in-process fallback. Docker test stacks can enable
+    # Celery, where dispatch queues process_document.delay instead.
+    monkeypatch.setenv("USE_CELERY", "false")
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = None
     setup_db(monkeypatch, db)

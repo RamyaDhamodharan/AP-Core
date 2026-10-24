@@ -29,6 +29,9 @@ def _assert_no_purchase_order_persisted(db):
 @pytest.fixture(autouse=True)
 def fake_minio_moves(monkeypatch):
     monkeypatch.setattr(document_routers, "move_file", lambda *_: None)
+    monkeypatch.setattr(
+        document_routers, "find_duplicate_invoice", lambda *_args, **_kwargs: None
+    )
 
 
 def _save_invoice_for_matching(
@@ -738,7 +741,7 @@ def test_historical_invoice_versions_do_not_block_resubmission():
     assert invoice.is_current is True
 
 
-def test_identical_current_invoice_is_blocked_as_duplicate():
+def test_identical_current_invoice_is_blocked_as_duplicate(monkeypatch):
     vendor = SimpleNamespace(id=uuid.uuid4())
     duplicate = SimpleNamespace(
         id=uuid.uuid4(),
@@ -757,6 +760,11 @@ def test_identical_current_invoice_is_blocked_as_duplicate():
         po_number_raw="PO-101",
         po_id=None,
         match_status="waiting_for_po",
+    )
+    monkeypatch.setattr(
+        document_routers,
+        "find_duplicate_invoice",
+        lambda *_args, **_kwargs: duplicate,
     )
     with pytest.raises(document_routers.DuplicateInvoiceError):
         _save_invoice_for_matching(

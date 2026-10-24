@@ -138,6 +138,25 @@ def test_invoice_list_accepts_verification_filters_and_sorting():
     assert query.order_by.called
 
 
+def test_invoice_sort_direction_is_applied_and_invalid_value_is_rejected():
+    _db, _count_query, query, teardown = _setup_dashboard([], total=0)
+    try:
+        response = client.get(
+            "/api/invoices", params={"sort_by": "amount", "sort_dir": "asc"}
+        )
+        invalid = client.get("/api/invoices", params={"sort_dir": "sideways"})
+    finally:
+        teardown()
+    assert response.status_code == 200
+    assert query.order_by.called
+    ordering = str(
+        query.order_by.call_args.args[0].compile(dialect=postgresql.dialect())
+    )
+    assert "total_amount ASC" in ordering
+
+    assert invalid.status_code == 422
+
+
 def test_overdue_filter_excludes_approved_and_rejected_invoices():
 
     invoice = _invoice()

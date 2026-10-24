@@ -66,6 +66,10 @@ from ....services.invoice_confidence_services import (
     requires_verification,
 )
 from ....services.invoice_matching_services import run_match_for_invoice
+from ....services.invoice_number_services import (
+    find_duplicate_invoice,
+    normalize_invoice_no,
+)
 from ....services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
@@ -134,6 +138,11 @@ def _record_pipeline_step(
     db.add(
         AuditLog(
             action="pipeline_step",
+            actor=(
+                str(getattr(document, "created_by", None))
+                if getattr(document, "created_by", None)
+                else "system"
+            ),
             entity_type="document",
             entity_id=document.id,
             step_name=step_name,
@@ -181,31 +190,27 @@ def _auto_reject_unmatched_invoice(
             created_by=None,
         )
     )
-    if document is None:
+    if document is None or not getattr(document, "email_sender", None):
         return
-    sender = (getattr(document, "email_sender", None) or "").strip()
-    allowed = {
-        email.strip().casefold()
-        for email in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
-        if email.strip()
-    }
-    if sender and sender.casefold() in allowed and may_send_automatic_reply(document):
-        try:
-            with db.begin_nested():
-                db.add(
-                    Notification(
-                        document_id=document.id,
-                        recipient_email=sender,
-                        subject="Invoice needs attention",
-                        body=reason,
-                        status="queued",
-                    )
+    try:
+        from src.services.email_draft_services import create_no_match_draft
+
+        with db.begin_nested():
+            draft = create_no_match_draft(db, invoice, document.email_sender)
+            db.add(
+                AuditLog(
+                    action="draft_created",
+                    actor="system",
+                    entity_type="email_draft",
+                    entity_id=draft.id,
+                    result="success",
+                    message="No-match reply draft created for associate review",
+                    reason=reason,
+                    created_by=None,
                 )
-                db.flush()
-        except Exception as exc:
-            logger.warning(
-                "No-match notification could not be queued (%s)", type(exc).__name__
             )
+    except Exception:
+        logger.warning("No-match email draft could not be created", exc_info=True)
 
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
@@ -898,6 +903,7 @@ def _save_invoice_from_extraction(
 
     invoice_values = {
         "invoice_no": invoice_no,
+        "invoice_no_normalized": normalize_invoice_no(invoice_no),
         "vendor_id": vendor.id if vendor else None,
         "vendor_name_raw": vendor_name,
         "vendor_tax_id_raw": data.get("vendor_tax_id"),
@@ -917,11 +923,20 @@ def _save_invoice_from_extraction(
     if source_invoice is not None:
         if not source_invoice.is_current:
             return source_invoice
-        if not all(
-            getattr(source_invoice, field, None) == value
-            for field, value in invoice_values.items()
-            if field != "field_confidence"
-        ):
+        unchanged = True
+        for field, value in invoice_values.items():
+            if field == "field_confidence":
+                continue
+            existing_value = getattr(source_invoice, field, None)
+            if field == "invoice_no_normalized":
+                # Derived keys may be absent on legacy rows and lightweight fixtures.
+                existing_value = normalize_invoice_no(
+                    getattr(source_invoice, "invoice_no", None)
+                )
+            if existing_value != value:
+                unchanged = False
+                break
+        if not unchanged:
             raise ValueError(
                 "Invoice extraction differs from the previously saved record; "
                 "review required"
@@ -946,11 +961,23 @@ def _save_invoice_from_extraction(
     prior_versions = []
 
     if vendor is not None and invoice_no:
+        normalized_no = invoice_values["invoice_no_normalized"]
+        duplicate = find_duplicate_invoice(
+            db,
+            vendor.id,
+            normalized_no,
+            exclude_invoice_id=source_invoice.id if source_invoice else None,
+        )
+        if duplicate is not None:
+            raise DuplicateInvoiceError(
+                "Duplicate current invoice: same vendor and normalized number",
+                original_invoice_id=duplicate.id,
+            )
         prior_versions = (
             db.query(Invoice)
             .filter(
                 Invoice.vendor_id == vendor.id,
-                Invoice.invoice_no == invoice_no,
+                Invoice.invoice_no_normalized == normalized_no,
             )
             .order_by(Invoice.version_no.desc())
             .with_for_update()
@@ -1526,6 +1553,7 @@ def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
     if constraint_name in {
         "uq_invoice_version",
         "uq_current_vendor_invoice",
+        "uq_current_vendor_invoice_normalized",
     }:
         return True
 
@@ -1534,6 +1562,7 @@ def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
         "invoices.vendor_id, invoices.invoice_no, invoices.version_no" in error_message
         or "uq_invoice_version" in error_message
         or "uq_current_vendor_invoice" in error_message
+        or "uq_current_vendor_invoice_normalized" in error_message
     )
 
 
@@ -2483,9 +2512,30 @@ def parse_document(
                     ) from exc
 
                 document.extracted_json = extracted_data
-                validation_issues.append(
-                    "Invoice version conflict; document requires review"
+                constraint_name = getattr(
+                    getattr(exc.orig, "diag", None), "constraint_name", None
                 )
+                duplicate = None
+                if constraint_name == "uq_current_vendor_invoice_normalized":
+                    raced_vendor = resolve_vendor(
+                        db,
+                        str(extracted_data.get("vendor") or "").strip() or None,
+                        tax_id=extracted_data.get("vendor_tax_id"),
+                    )
+                    duplicate = find_duplicate_invoice(
+                        db,
+                        raced_vendor.id if raced_vendor else None,
+                        normalize_invoice_no(extracted_data.get("invoice_number")),
+                    )
+                if duplicate is not None:
+                    duplicate_invoice_id = duplicate.id
+                    validation_issues.append(
+                        "Duplicate current invoice: same vendor and normalized number"
+                    )
+                else:
+                    validation_issues.append(
+                        "Invoice version conflict; document requires review"
+                    )
             except DuplicateInvoiceError as exc:
                 validation_issues.append(str(exc))
                 duplicate_invoice_id = exc.original_invoice_id

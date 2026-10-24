@@ -48,6 +48,10 @@ from src.services.invoice_confidence_services import (
 )
 from src.services.invoice_issue_services import _assignment
 from src.services.invoice_matching_services import run_match_for_invoice
+from src.services.invoice_number_services import (
+    find_duplicate_invoice,
+    normalize_invoice_no,
+)
 from src.services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
@@ -73,6 +77,27 @@ def _owner_id(user: dict) -> uuid.UUID:
         raise HTTPException(
             status_code=401, detail="Authenticated user ID is invalid"
         ) from exc
+
+
+def _checked_invoice_number(db, vendor_id, invoice_no, *, exclude_invoice_id=None):
+    if vendor_id is not None and not isinstance(vendor_id, uuid.UUID):
+        try:
+            vendor_id = uuid.UUID(str(vendor_id))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid vendor ID") from exc
+    normalized = normalize_invoice_no(invoice_no)
+    duplicate = find_duplicate_invoice(
+        db,
+        vendor_id,
+        normalized,
+        exclude_invoice_id=exclude_invoice_id,
+    )
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="An invoice with this vendor and invoice number already exists",
+        )
+    return normalized
 
 
 def _invoice_owner_filter(owner_id: uuid.UUID):
@@ -227,6 +252,7 @@ def _invoice_dashboard_response(
     page_size: int,
     filters: list,
     sort_by: str = "received_date",
+    sort_dir: str | None = None,
 ) -> InvoiceDashboardResponse:
     total = (
         db.query(func.count(Invoice.id))
@@ -236,27 +262,28 @@ def _invoice_dashboard_response(
         .filter(*filters)
         .scalar()
     )
+    sort_columns = {
+        "received_date": Invoice.created_at,
+        "date_received": Invoice.created_at,
+        "amount": Invoice.total_amount,
+        "due_date": Invoice.due_date,
+        "days_overdue": Invoice.due_date,
+        "confidence": cast(
+            Invoice.field_confidence["total"]["confidence"].as_float(), Float
+        ),
+    }
+    sort_column = sort_columns.get(sort_by, Invoice.created_at)
+    default_desc = sort_by in {"received_date", "date_received", "amount"}
+    descending = (sort_dir == "desc") if sort_dir else default_desc
+    ordering = sort_column.desc() if descending else sort_column.asc()
+    if sort_by in {"amount", "due_date", "days_overdue", "confidence"}:
+        ordering = ordering.nullslast()
     rows = (
         db.query(Invoice, Vendor.name.label("vendor_name"), Document)
         .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
         .outerjoin(Document, Invoice.source_document_id == Document.id)
         .filter(*filters)
-        .order_by(
-            {
-                "received_date": Invoice.created_at.desc(),
-                "date_received": Invoice.created_at.desc(),
-                "amount": Invoice.total_amount.desc().nullslast(),
-                "due_date": Invoice.due_date.asc().nullslast(),
-                "days_overdue": Invoice.due_date.asc().nullslast(),
-                "confidence": cast(
-                    Invoice.field_confidence["total"]["confidence"].as_float(),
-                    Float,
-                )
-                .asc()
-                .nullslast(),
-            }.get(sort_by, Invoice.created_at.desc()),
-            Invoice.id,
-        )
+        .order_by(ordering, Invoice.id)
         .offset((page - 1) * page_size)
         .limit(page_size)
         .all()
@@ -426,9 +453,13 @@ def list_invoices(
     sort_by: Annotated[
         str,
         Query(
-            pattern="^(received_date|date_received|amount|due_date|days_overdue|confidence)$"
+            pattern=(
+                "^(received_date|date_received|amount|due_date|"
+                "days_overdue|confidence)$"
+            )
         ),
     ] = "date_received",
+    sort_dir: Literal["asc", "desc"] | None = None,
     workflow_status: InvoiceWorkflowStatus | None = None,
     bucket: Annotated[str | None, Query(max_length=40)] = None,
     amount_min: Decimal | None = None,
@@ -483,6 +514,7 @@ def list_invoices(
         page_size=page_size,
         filters=filters,
         sort_by=sort_by,
+        sort_dir=sort_dir,
     )
 
 
@@ -601,6 +633,16 @@ def verify_invoice_fields(
     line_edits = fields.get("line_items", [])
     if not isinstance(line_edits, list):
         raise HTTPException(status_code=422, detail="line_items must be a list")
+    candidate_vendor_id = invoice.vendor_id
+    if "vendor" in fields:
+        candidate_vendor = resolve_vendor(db, fields.get("vendor"))
+        candidate_vendor_id = candidate_vendor.id if candidate_vendor else None
+    normalized_invoice_no = _checked_invoice_number(
+        db,
+        candidate_vendor_id,
+        fields.get("invoice_number", invoice.invoice_no),
+        exclude_invoice_id=invoice.id,
+    )
     columns = {
         "invoice_number": "invoice_no",
         "invoice_date": "invoice_date",
@@ -662,6 +704,7 @@ def verify_invoice_fields(
                 created_by=actor_id,
             )
         )
+    invoice.invoice_no_normalized = normalized_invoice_no
     confidence = dict(invoice.field_confidence or {})
     for key, item in confidence.items():
         if key == "line_items":
@@ -1437,11 +1480,25 @@ def resubmit_invoice(
         raise HTTPException(
             status_code=422, detail="Unsupported corrected invoice fields"
         )
+    corrected_vendor_id = payload.get("vendor_id", old.vendor_id)
+    if corrected_vendor_id is not None:
+        try:
+            corrected_vendor_id = uuid.UUID(str(corrected_vendor_id))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid vendor ID") from exc
+    corrected_invoice_no = payload.get("invoice_no", old.invoice_no)
+    normalized_invoice_no = _checked_invoice_number(
+        db,
+        corrected_vendor_id,
+        corrected_invoice_no,
+        exclude_invoice_id=old.id,
+    )
     old.is_current = False
     new = Invoice(
         source_document_id=old.source_document_id,
         resubmitted_from_id=old.id,
         invoice_no=old.invoice_no,
+        invoice_no_normalized=normalize_invoice_no(old.invoice_no),
         version_no=old.version_no + 1,
         is_current=True,
         vendor_id=old.vendor_id,
@@ -1466,6 +1523,7 @@ def resubmit_invoice(
     )
     for key, value in payload.items():
         setattr(new, key, value)
+    new.invoice_no_normalized = normalized_invoice_no
     db.add(new)
     db.flush()
     from src.models.invoice_models import InvoiceLine
@@ -2065,16 +2123,31 @@ def update_invoice(
         raise HTTPException(
             status_code=422, detail="No editable invoice fields provided"
         )
+    normalized_invoice_no = _checked_invoice_number(
+        db,
+        changes.get("vendor_id", invoice.vendor_id),
+        changes.get("invoice_no", invoice.invoice_no),
+        exclude_invoice_id=invoice.id,
+    )
     old = {
         key: str(getattr(invoice, key)) if getattr(invoice, key) is not None else None
         for key in changes
     }
     for key, value in changes.items():
+        if key in {"owner_user_id", "vendor_id"} and value:
+            try:
+                value = uuid.UUID(str(value))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid {key.replace('_', ' ')}",
+                ) from exc
         setattr(
             invoice,
             key,
-            uuid.UUID(value) if key == "owner_user_id" and value else value,
+            value,
         )
+    invoice.invoice_no_normalized = normalized_invoice_no
     invoice.updated_by = user_id
     matching_fields = {
         "invoice_no",

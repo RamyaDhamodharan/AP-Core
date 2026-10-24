@@ -351,6 +351,9 @@ def test_rejected_invoice_resubmit_creates_new_version_and_keeps_history(monkeyp
     db = MagicMock()
     db.query.side_effect = [old_query, audit_query, lines_query]
     monkeypatch.setattr(
+        invoice_routers, "find_duplicate_invoice", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
         invoice_routers,
         "transition_invoice",
         lambda _db, invoice, status, **_kw: setattr(invoice, "workflow_status", status),
@@ -385,3 +388,44 @@ def test_rejected_invoice_resubmit_creates_new_version_and_keeps_history(monkeyp
     assert new_invoice.workflow_status == "matching"
     assert "Wrong invoice amount" in resubmit_audit.old_value["rejection_reason"]
     assert result["version_no"] == 4
+
+
+def test_resubmit_rejects_real_duplicate_invoice_number_with_409():
+    old_id = uuid.uuid4()
+    vendor_id = uuid.uuid4()
+    old = SimpleNamespace(
+        id=old_id,
+        workflow_status="rejected",
+        invoice_no="INV-1",
+        vendor_id=vendor_id,
+    )
+    duplicate = Invoice(
+        id=uuid.uuid4(),
+        invoice_no="INV/2",
+        invoice_no_normalized="INV2",
+        vendor_id=vendor_id,
+        is_current=True,
+    )
+    old_query = MagicMock()
+    old_query.filter.return_value.with_for_update.return_value.first.return_value = old
+    rejection_query = MagicMock()
+    rejection_query.filter.return_value.order_by.return_value.first.return_value = None
+    duplicate_query = MagicMock()
+    (
+        duplicate_query.filter.return_value.with_for_update.return_value.first.return_value
+    ) = duplicate
+    db = MagicMock()
+    db.query.side_effect = [old_query, rejection_query, duplicate_query]
+
+    with pytest.raises(HTTPException) as blocked:
+        invoice_routers.resubmit_invoice(
+            old_id,
+            {"invoice_no": "INV-2"},
+            db,
+            {"sub": str(uuid.uuid4()), "role": "associate"},
+        )
+
+    assert blocked.value.status_code == 409
+    assert blocked.value.detail == (
+        "An invoice with this vendor and invoice number already exists"
+    )

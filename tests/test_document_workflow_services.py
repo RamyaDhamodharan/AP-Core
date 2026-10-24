@@ -140,6 +140,7 @@ def _workflow_session(
         vendor_id=vendor_id,
         vendor_name_raw="Vendor A",
         invoice_no="INV-1",
+        invoice_no_normalized="INV1",
         po_number_raw="PO-1",
         po_id=po_id if with_po else None,
         currency="USD",

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -40,12 +41,13 @@ class Invoice(Base):
             name="uq_invoice_version",
         ),
         Index(
-            "uq_current_vendor_invoice",
+            "uq_current_vendor_invoice_normalized",
             "vendor_id",
-            "invoice_no",
+            "invoice_no_normalized",
             unique=True,
             postgresql_where=text(
-                "is_current AND vendor_id IS NOT NULL AND invoice_no IS NOT NULL"
+                "is_current AND vendor_id IS NOT NULL "
+                "AND invoice_no_normalized IS NOT NULL"
             ),
         ),
     )
@@ -77,6 +79,7 @@ class Invoice(Base):
         UUID(as_uuid=True), ForeignKey("invoices.id")
     )
     invoice_no: Mapped[str | None] = mapped_column(String(60))
+    invoice_no_normalized: Mapped[str | None] = mapped_column(String(180))
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_current: Mapped[bool] = mapped_column(
         Boolean,
@@ -224,3 +227,14 @@ class InvoiceLine(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+def _set_invoice_number_key(_mapper, _connection, target: Invoice) -> None:
+    """Keep the duplicate-detection key synchronized for every ORM write path."""
+    from src.services.invoice_number_services import normalize_invoice_no
+
+    target.invoice_no_normalized = normalize_invoice_no(target.invoice_no)
+
+
+event.listen(Invoice, "before_insert", _set_invoice_number_key)
+event.listen(Invoice, "before_update", _set_invoice_number_key)

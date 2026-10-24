@@ -1,13 +1,13 @@
 import re
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from src.models.document_models import Document
 from src.models.goods_receipt_models import GoodsReceipt
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
+from src.services.invoice_number_services import normalize_invoice_no
 
 
 def normalize_value(value: object) -> str:
@@ -137,7 +137,9 @@ def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
     function never changes invoice approval state.
     """
     issues: list[str] = []
-    invoice_no = normalize_value(invoice.invoice_no)
+    invoice_no = getattr(invoice, "invoice_no_normalized", None) or (
+        normalize_invoice_no(invoice.invoice_no)
+    )
     if not invoice_no or not invoice.vendor_id:
         issues.append("Invoice number or resolved vendor is missing; review required")
     else:
@@ -147,7 +149,7 @@ def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
                 Invoice.id != invoice.id,
                 Invoice.is_current.is_(True),
                 Invoice.vendor_id == invoice.vendor_id,
-                func.lower(func.trim(Invoice.invoice_no)) == invoice_no,
+                Invoice.invoice_no_normalized == invoice_no,
             )
             .first()
         )

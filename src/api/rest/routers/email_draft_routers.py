@@ -34,6 +34,10 @@ class EditDraft(BaseModel):
     cc_addresses: list[str] | None = None
 
 
+class SendDraftRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 def _user_id(current_user: dict) -> uuid.UUID:
     try:
         return uuid.UUID(str(current_user["sub"]))
@@ -214,6 +218,7 @@ def send_email_draft(
     draft_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    request: SendDraftRequest | None = None,
 ):
     draft = db.query(EmailDraft).filter_by(id=draft_id).with_for_update().first()
     if draft is None:
@@ -222,7 +227,22 @@ def send_email_draft(
         raise HTTPException(
             status_code=409, detail="This email draft has already been sent"
         )
-    success = send_draft(db, draft, _user_id(current_user))
+    user_id = _user_id(current_user)
+    success = send_draft(db, draft, user_id)
+    if success:
+        db.add(
+            AuditLog(
+                action="draft_sent",
+                actor=str(user_id),
+                entity_type="email_draft",
+                entity_id=draft.id,
+                result="success",
+                message="Email draft sent",
+                reason=(request.reason.strip() if request and request.reason else None)
+                or "Associate reviewed and sent the draft",
+                created_by=user_id,
+            )
+        )
     if not success and draft.blocked_by_allowlist:
         db.add(
             AuditLog(

@@ -11,7 +11,9 @@ from src.api.rest.routers import document_routers
 from src.api.rest.routers.invoice_routers import _invoice_dashboard_filters
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
-from src.models.notification_models import Notification
+from src.models.document_models import Document
+from src.models.email_draft_models import EmailDraft
+from src.models.invoice_models import Invoice
 from src.services.document_workflow_services import compare_available_records
 from src.services.invoice_confidence_services import (
     confidence_level,
@@ -108,6 +110,10 @@ def test_verify_edits_audit_old_new_reason_and_associate_can_continue(monkeypatc
         "src.api.rest.routers.invoice_routers.run_match_for_invoice",
         lambda *_args: None,
     )
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.find_duplicate_invoice",
+        lambda *_args, **_kwargs: None,
+    )
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/verify",
@@ -143,6 +149,58 @@ def test_verify_edits_audit_old_new_reason_and_associate_can_continue(monkeypatc
     )
     assert line_audit.created_by == owner_id
     assert line_audit.new_value["unit_price"] == "11"
+
+
+def test_verify_rejects_real_duplicate_invoice_number_with_409(monkeypatch):
+    from src.models.invoice_models import Invoice
+
+    owner_id = uuid.uuid4()
+    vendor_id = uuid.uuid4()
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        source_document_id=None,
+        workflow_status="verifying",
+        match_status="needs_vendor_review",
+        invoice_no="INV-1",
+        vendor_id=vendor_id,
+        vendor_name_raw="Vendor",
+    )
+    duplicate = Invoice(
+        id=uuid.uuid4(),
+        invoice_no="INV/2",
+        invoice_no_normalized="INV2",
+        vendor_id=vendor_id,
+        is_current=True,
+    )
+    invoice_query = MagicMock()
+    (
+        invoice_query.outerjoin.return_value.filter.return_value.with_for_update
+        .return_value.first.return_value
+    ) = invoice
+    duplicate_query = MagicMock()
+    (
+        duplicate_query.filter.return_value.with_for_update.return_value.first.return_value
+    ) = duplicate
+    db = MagicMock()
+    db.query.side_effect = [invoice_query, duplicate_query]
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.run_match_for_invoice",
+        lambda *_args: None,
+    )
+    try:
+        response = client.post(
+            f"/api/invoices/{invoice.id}/verify",
+            json={"values": {"invoice_number": "INV-2"}, "reason": "Confirm number"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "An invoice with this vendor and invoice number already exists"
+    )
 
 
 def test_get_verification_returns_values_confidence_and_gl_warning(monkeypatch):
@@ -185,24 +243,40 @@ def test_get_verification_returns_values_confidence_and_gl_warning(monkeypatch):
     assert result["gl_code_warning"] == "Unknown GL code: 9999"
 
 
-def test_unmatched_invoice_is_rejected_with_reason_and_allowlisted_notice(monkeypatch):
-    invoice = SimpleNamespace(
+def test_unmatched_invoice_is_rejected_with_reason_and_reply_draft(monkeypatch):
+    source_document_id = uuid.uuid4()
+    invoice = Invoice(
         id=uuid.uuid4(),
+        source_document_id=source_document_id,
         workflow_status="received",
         match_status="pending",
         final_status=None,
         vendor_id=None,
     )
-    document = SimpleNamespace(id=uuid.uuid4(), email_sender="test@example.com")
+    document = Document(
+        id=source_document_id,
+        original_filename="invoice.eml",
+        file_hash="a" * 64,
+        status="received",
+        source="email",
+        email_sender="test@example.com",
+    )
     db = MagicMock()
+    def add_with_model_defaults(obj):
+        if isinstance(obj, EmailDraft) and obj.id is None:
+            obj.id = uuid.uuid4()
+
+    db.add.side_effect = add_with_model_defaults
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "test@example.com")
     document_routers._auto_reject_unmatched_invoice(db, invoice, document)
     assert invoice.workflow_status == "rejected"
     objects = [obj for call in db.add.call_args_list for obj in call.args]
     assert any(isinstance(obj, AuditLog) for obj in objects)
-    notice = next(obj for obj in objects if isinstance(obj, Notification))
-    assert notice.recipient_email == "test@example.com"
-    assert notice.body == "No purchase order / unknown vendor"
+    draft = next(obj for obj in objects if isinstance(obj, EmailDraft))
+    assert draft.to_addresses == ["test@example.com"]
+    assert draft.status == "draft"
+    assert draft.blocked_by_allowlist is False
+    assert draft.document_id == source_document_id
 
 
 def test_verification_edit_requires_reason():

@@ -296,6 +296,36 @@ def create_invoice_draft(
     return draft
 
 
+def create_no_match_draft(db: Session, invoice: Invoice, sender: str) -> EmailDraft:
+    """Create a reviewable no-match email draft; never send during processing."""
+    reason = "No purchase order / unknown vendor"
+    recipient = sender.strip()
+    recipients = [recipient] if recipient else []
+    draft = EmailDraft(
+        kind="no_match",
+        invoice_id=invoice.id,
+        document_id=invoice.source_document_id,
+        to_addresses=recipients,
+        cc_addresses=[],
+        subject="Invoice needs attention",
+        body=f"We could not match this invoice to a purchase order. {reason}.",
+        status="draft",
+        blocked_by_allowlist=not bool(recipients)
+        or any(
+            address.casefold() not in allowed_recipients()
+            for address in recipients
+        ),
+        created_by=None,
+        generated_by="template",
+        thread_key=f"[AP-{str(invoice.id).replace('-', '')[:8].upper()}]",
+    )
+    db.add(draft)
+    db.flush()
+    _event(db, draft, "created", None, new={"kind": draft.kind, "to": recipients,
+        "blocked_by_allowlist": draft.blocked_by_allowlist})
+    return draft
+
+
 def create_issue_draft(
     db: Session,
     *,
