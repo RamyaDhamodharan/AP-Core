@@ -104,6 +104,7 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "workflow_status": "received",
             "gl_code": None,
             "confidence": None,
+            "confidence_level": "low",
             "can_resubmit": False,
             "status": "processing",
         }
@@ -215,6 +216,7 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
         app.dependency_overrides.pop(get_current_user, None)
     assert response.status_code == 200
     assert response.json()["low_confidence_fields"] == ["invoice_no"]
+    assert response.json()["confidence_level"] == "low"
     assert response.json()["supporting_documents_count"] == 0
 
 

@@ -153,6 +153,7 @@ def list_goods_receipts(
         str, Query(pattern="^(receipt_date|receipt_number|gr_number|created_at)$")
     ] = "receipt_date",
     sort_dir: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
+    # Retained for compatibility with older clients; GR confidence is not a filter.
     status: Literal["all", "needs_verification", "verified"] = "all",
     vendor_id: uuid.UUID | None = None,
     date_from: date | None = None,
@@ -186,18 +187,6 @@ def list_goods_receipts(
         filters.append(GoodsReceipt.receipt_date >= date_from)
     if date_to:
         filters.append(GoodsReceipt.receipt_date <= date_to)
-    if status == "needs_verification":
-        filters.append(
-            or_(
-                GoodsReceipt.needs_verification.is_(True),
-                GoodsReceipt.vendor_id.is_(None),
-            )
-        )
-    elif status == "verified":
-        filters.append(
-            GoodsReceipt.needs_verification.is_(False),
-            GoodsReceipt.vendor_id.is_not(None),
-        )
     sort_column = (
         GoodsReceipt.gr_number
         if sort_by == "receipt_number"
@@ -221,25 +210,7 @@ def list_goods_receipts(
     response.headers["X-Status-Counts"] = __import__("json").dumps(
         {
             "all": db.scalar(select(func.count(GoodsReceipt.id)).where(*base_filters))
-            or 0,
-            "needs_verification": db.scalar(
-                select(func.count(GoodsReceipt.id)).where(
-                    *base_filters,
-                    or_(
-                        GoodsReceipt.needs_verification.is_(True),
-                        GoodsReceipt.vendor_id.is_(None),
-                    ),
-                )
-            )
-            or 0,
-            "verified": db.scalar(
-                select(func.count(GoodsReceipt.id)).where(
-                    *base_filters,
-                    GoodsReceipt.needs_verification.is_(False),
-                    GoodsReceipt.vendor_id.is_not(None),
-                )
-            )
-            or 0,
+            or 0
         }
     )
     query = (

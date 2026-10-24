@@ -55,6 +55,7 @@ def list_purchase_orders(
     source_document_id: uuid.UUID | None = None,
     search: Annotated[str | None, Query(max_length=200)] = None,
     current_only: bool = False,
+    # Retained for compatibility with older clients; PO confidence is not a filter.
     status: Literal["all", "needs_verification", "verified"] = "all",
     date_from: date | None = None,
     date_to: date | None = None,
@@ -92,19 +93,6 @@ def list_purchase_orders(
         filters.append(PurchaseOrder.po_date >= date_from)
     if date_to:
         filters.append(PurchaseOrder.po_date <= date_to)
-    if status == "needs_verification":
-        filters.append(
-            or_(
-                PurchaseOrder.needs_verification.is_(True),
-                PurchaseOrder.vendor_id.is_(None),
-            )
-        )
-    elif status == "verified":
-        filters.append(
-            PurchaseOrder.needs_verification.is_(False),
-            PurchaseOrder.vendor_id.is_not(None),
-        )
-
     total = db.scalar(select(func.count(PurchaseOrder.id)).where(*filters)) or 0
     count_filters = [_owner_filter(owner_id, current_user)]
     if current_only:
@@ -121,25 +109,7 @@ def list_purchase_orders(
         count_filters.append(PurchaseOrder.po_date <= date_to)
     counts = {
         "all": db.scalar(select(func.count(PurchaseOrder.id)).where(*count_filters))
-        or 0,
-        "needs_verification": db.scalar(
-            select(func.count(PurchaseOrder.id)).where(
-                *count_filters,
-                or_(
-                    PurchaseOrder.needs_verification.is_(True),
-                    PurchaseOrder.vendor_id.is_(None),
-                ),
-            )
-        )
-        or 0,
-        "verified": db.scalar(
-            select(func.count(PurchaseOrder.id)).where(
-                *count_filters,
-                PurchaseOrder.needs_verification.is_(False),
-                PurchaseOrder.vendor_id.is_not(None),
-            )
-        )
-        or 0,
+        or 0
     }
     sort_column = getattr(PurchaseOrder, sort_by)
     sort_order = sort_column.asc() if sort_dir == "asc" else sort_column.desc()

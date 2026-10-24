@@ -670,37 +670,6 @@ def _extracted_field_confidence(data: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _confidence_needs_verification(confidence: dict) -> bool:
-    if not confidence:
-        return True
-    for raw in confidence.values():
-        score = raw.get("confidence") if isinstance(raw, dict) else raw
-        try:
-            score = Decimal(str(score)) if score is not None else None
-            if score is not None and Decimal(0) <= score <= Decimal(1):
-                score *= 100
-            if score is None or score < Decimal("85"):
-                return True
-        except Exception:
-            return True
-    return False
-
-
-def _extraction_needs_verification(data: dict, validation_issues=None) -> bool:
-    if validation_issues or _confidence_needs_verification(
-        _extracted_field_confidence(data)
-    ):
-        return True
-    for line in data.get("line_items") or []:
-        if not isinstance(line, dict) or _confidence_needs_verification(
-            line.get("field_confidence")
-            if isinstance(line.get("field_confidence"), dict)
-            else {}
-        ):
-            return True
-    return False
-
-
 def _parse_document_date(value: object) -> date | None:
     if not value:
         return None
@@ -1702,8 +1671,11 @@ def _save_goods_receipt_from_extraction(
     receipt.vendor_id = vendor.id if vendor else receipt.vendor_id
     receipt.receipt_date = receipt_date or receipt.receipt_date
     receipt.field_confidence = _extracted_field_confidence(data)
+    # Confidence is informational for procurement records. Only concrete
+    # validation/linking issues should require review; low confidence alone
+    # must not block or flag a usable PO/GR record.
     receipt.needs_verification = (
-        _extraction_needs_verification(data, validation_issues)
+        bool(validation_issues)
         or receipt.po_id is None
         or receipt.vendor_id is None
     )
@@ -1881,9 +1853,9 @@ def _save_purchase_order_from_extraction(
         if existing.vendor_id is None and vendor is not None:
             existing.vendor_id = vendor.id
         existing.field_confidence = _extracted_field_confidence(data)
-        existing.needs_verification = _extraction_needs_verification(
-            data, validation_issues
-        )
+        # Invoice confidence gates apply to invoices only. Procurement records
+        # remain usable for matching even when extracted confidence is low.
+        existing.needs_verification = bool(validation_issues)
         return existing
 
     purchase_order = PurchaseOrder(
@@ -1901,7 +1873,7 @@ def _save_purchase_order_from_extraction(
         payment_terms=data.get("payment_terms"),
         delivery_details=delivery_details,
         field_confidence=_extracted_field_confidence(data),
-        needs_verification=_extraction_needs_verification(data, validation_issues),
+        needs_verification=bool(validation_issues),
         created_by=getattr(document, "created_by", None),
         updated_by=document.created_by,
     )

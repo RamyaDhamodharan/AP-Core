@@ -2,7 +2,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -117,9 +117,27 @@ def _normalize_tax_id(value: object) -> str:
     return "".join(char for char in str(value or "").casefold() if char.isalnum())
 
 
+def _duplicate_tax_id(
+    db: Session,
+    tax_id: str | None,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> Vendor | None:
+    normalized = _normalize_tax_id(tax_id)
+    if not normalized:
+        return None
+    query = db.query(Vendor).filter(
+        func.lower(func.regexp_replace(Vendor.tax_id, r"[^[:alnum:]]", "", "g"))
+        == normalized
+    )
+    if exclude_id is not None:
+        query = query.filter(Vendor.id != exclude_id)
+    return query.first()
+
+
 @router.post(
     "/{vendor_id}/resolve-extracted",
-    dependencies=[Depends(require_role("admin"))],
+    dependencies=[Depends(get_current_user)],
 )
 def resolve_extracted_records_for_vendor(
     vendor_id: uuid.UUID,
@@ -301,11 +319,12 @@ def get_vendor(
     "",
     response_model=VendorResponse,
     status_code=201,
-    dependencies=[Depends(require_role("admin"))],
+    dependencies=[Depends(get_current_user)],
 )
 def create_vendor(
     payload: VendorCreate,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> Vendor:
     if _duplicate_vendor(db, payload.name):
         raise HTTPException(
@@ -313,6 +332,18 @@ def create_vendor(
             detail="A vendor with this name already exists",
         )
     _ensure_name_not_another_vendors_alias(db, payload.name)
+    if _duplicate_tax_id(db, payload.tax_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A vendor with this tax ID already exists",
+        )
+
+    try:
+        actor_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
 
     vendor = Vendor(
         name=payload.name,
@@ -321,10 +352,26 @@ def create_vendor(
         contact_name=payload.contact_name,
         contact_email=(str(payload.contact_email) if payload.contact_email else None),
         contact_phone=payload.contact_phone,
+        created_by=actor_id,
+        updated_by=actor_id,
     )
 
     db.add(vendor)
     try:
+        db.flush()
+        db.add(
+            AuditLog(
+                action="vendor_created",
+                entity_type="vendor",
+                entity_id=vendor.id,
+                new_value={
+                    "name": vendor.name,
+                    "tax_id": vendor.tax_id,
+                },
+                created_by=actor_id,
+                updated_by=actor_id,
+            )
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()

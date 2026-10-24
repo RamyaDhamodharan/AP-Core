@@ -1014,6 +1014,33 @@ def test_parse_document_persists_incomplete_purchase_order_for_verification(
     assert purchase_order.po_date is None
 
 
+def test_parse_document_keeps_low_confidence_purchase_order_usable(monkeypatch):
+    data = {
+        "vendor": "ABC Supplies",
+        "po_number": "PO-LOW-CONF",
+        "po_date": "2026-10-01",
+        "currency": "USD",
+        "subtotal": "100.00",
+        "tax": "10.00",
+        "total": "110.00",
+        "field_confidence": {"po_number": {"confidence": 40}},
+    }
+    response, _document, db = _run_purchase_order_parse(
+        monkeypatch,
+        data,
+        vendor=SimpleNamespace(id=uuid.uuid4()),
+    )
+    from src.models.purchase_order_models import PurchaseOrder
+
+    purchase_order = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], PurchaseOrder)
+    )
+    assert response.json()["status"] == "extracted"
+    assert purchase_order.needs_verification is False
+
+
 def test_parse_document_flags_duplicate_current_purchase_order(
     monkeypatch,
 ):

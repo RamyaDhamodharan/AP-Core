@@ -80,6 +80,17 @@ def _owner_id(user: dict) -> uuid.UUID:
         ) from exc
 
 
+def _overall_invoice_confidence(confidence: dict | None) -> str:
+    """Return the display level using the minimum invoice field confidence.
+
+    Missing or derived confidence is deliberately exposed as ``low`` for the
+    invoice UI; the decision engine still treats it as unverified and applies
+    its existing 85-point gate.
+    """
+    level = confidence_level(confidence or {})
+    return level if level in {"high", "medium", "low"} else "low"
+
+
 def _checked_invoice_number(db, vendor_id, invoice_no, *, exclude_invoice_id=None):
     if vendor_id is not None and not isinstance(vendor_id, uuid.UUID):
         try:
@@ -405,6 +416,9 @@ def _invoice_dashboard_response(
                     (getattr(invoice, "field_confidence", None) or {})
                     .get("total", {})
                     .get("confidence")
+                ),
+                confidence_level=_overall_invoice_confidence(
+                    getattr(invoice, "field_confidence", None) or {}
                 ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
@@ -949,6 +963,20 @@ def get_invoice_detail(
         normalized_confidence[field] = value
         if value < confidence_threshold():
             low_confidence_fields.append(field)
+    line_confidence = (
+        confidence.get("line_items", []) if isinstance(confidence, dict) else []
+    )
+    for index, line in enumerate(line_confidence, start=1):
+        if not isinstance(line, dict):
+            continue
+        for field, raw in line.items():
+            value = raw.get("confidence") if isinstance(raw, dict) else raw
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value < confidence_threshold():
+                low_confidence_fields.append(f"line_{index}.{field}")
     saved_run = (
         db.get(MatchRun, invoice.final_run_id)
         if getattr(invoice, "final_run_id", None)
@@ -1203,7 +1231,7 @@ def get_invoice_detail(
         "needs_verification": requires_verification(
             getattr(invoice, "field_confidence", None) or {}
         ),
-        "confidence_level": confidence_level(
+        "confidence_level": _overall_invoice_confidence(
             getattr(invoice, "field_confidence", None) or {}
         ),
         "low_confidence_fields": low_confidence_fields,
