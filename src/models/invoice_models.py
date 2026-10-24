@@ -12,6 +12,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -226,3 +227,14 @@ class InvoiceLine(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+def _set_invoice_number_key(_mapper, _connection, target: Invoice) -> None:
+    """Keep the duplicate-detection key synchronized for every ORM write path."""
+    from src.services.invoice_number_services import normalize_invoice_no
+
+    target.invoice_no_normalized = normalize_invoice_no(target.invoice_no)
+
+
+event.listen(Invoice, "before_insert", _set_invoice_number_key)
+event.listen(Invoice, "before_update", _set_invoice_number_key)

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import Index
 
-from src.models.invoice_models import Invoice
+from src.models.invoice_models import Invoice, _set_invoice_number_key
 from src.services.invoice_number_services import (
     find_duplicate_invoice,
     normalize_invoice_no,
@@ -54,3 +54,14 @@ def test_current_invoice_number_unique_index_uses_normalized_key():
         "invoice_no_normalized",
     ]
     assert index.unique
+
+
+def test_invoice_mapper_hooks_synchronize_normalized_key_on_insert_and_update():
+    invoice = Invoice(invoice_no="INV-001", invoice_no_normalized="WRONG")
+
+    _set_invoice_number_key(None, None, invoice)
+    assert invoice.invoice_no_normalized == "INV001"
+
+    invoice.invoice_no = "inv 002"
+    _set_invoice_number_key(None, None, invoice)
+    assert invoice.invoice_no_normalized == "INV002"

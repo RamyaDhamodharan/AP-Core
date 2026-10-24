@@ -2512,9 +2512,30 @@ def parse_document(
                     ) from exc
 
                 document.extracted_json = extracted_data
-                validation_issues.append(
-                    "Invoice version conflict; document requires review"
+                constraint_name = getattr(
+                    getattr(exc.orig, "diag", None), "constraint_name", None
                 )
+                duplicate = None
+                if constraint_name == "uq_current_vendor_invoice_normalized":
+                    raced_vendor = resolve_vendor(
+                        db,
+                        str(extracted_data.get("vendor") or "").strip() or None,
+                        tax_id=extracted_data.get("vendor_tax_id"),
+                    )
+                    duplicate = find_duplicate_invoice(
+                        db,
+                        raced_vendor.id if raced_vendor else None,
+                        normalize_invoice_no(extracted_data.get("invoice_number")),
+                    )
+                if duplicate is not None:
+                    duplicate_invoice_id = duplicate.id
+                    validation_issues.append(
+                        "Duplicate current invoice: same vendor and normalized number"
+                    )
+                else:
+                    validation_issues.append(
+                        "Invoice version conflict; document requires review"
+                    )
             except DuplicateInvoiceError as exc:
                 validation_issues.append(str(exc))
                 duplicate_invoice_id = exc.original_invoice_id
