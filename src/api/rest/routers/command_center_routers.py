@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Float, cast, exists, func, or_, select
+from sqlalchemy import Float, and_, cast, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from src.api.rest.dependencies import get_current_user
@@ -15,6 +15,7 @@ from src.db.session_db import get_db
 from src.models.document_models import Document
 from src.models.invoice_issue_models import InvoiceIssue
 from src.models.invoice_models import Invoice
+from src.models.match_run_models import MatchRun
 from src.models.vendor_models import Vendor
 
 router = APIRouter(prefix="/api/command-center", tags=["Command center"])
@@ -28,12 +29,27 @@ def _bucket_conditions(today: date):
             InvoiceIssue.status.in_(ACTIVE_ISSUES),
         )
     )
+    saved_ready_match = exists(
+        select(MatchRun.id).where(
+            MatchRun.id == Invoice.final_run_id,
+            MatchRun.rules_used["match_outcome"]["outcome"].as_string()
+            == "ready_to_pay",
+        )
+    )
     return {
         "ready_to_pay": (
-            Invoice.workflow_status == "approved",
-            Invoice.final_status == "approved",
+            Invoice.status == "ready_to_pay",
+            saved_ready_match,
             Invoice.paid_at.is_(None),
             or_(Invoice.due_date.is_(None), Invoice.due_date >= today),
+        ),
+        "needs_review": (
+            or_(
+                Invoice.status == "needs_review",
+                and_(Invoice.status == "ready_to_pay", ~saved_ready_match),
+            ),
+            Invoice.paid_at.is_(None),
+            Invoice.final_status != "rejected",
         ),
         "overdue": (
             Invoice.due_date < today,
@@ -47,6 +63,7 @@ def _bucket_conditions(today: date):
         ),
         "needs_attention": (
             or_(
+                Invoice.status == "needs_review",
                 Invoice.workflow_status == "verifying",
                 issue_exists,
                 Invoice.owner_user_id.is_(None),
@@ -76,6 +93,7 @@ def command_center_summary(
         "ready_to_pay",
         "overdue",
         "rejected",
+        "needs_review",
         "needs_attention",
         "all",
     ):
@@ -98,7 +116,10 @@ def command_center_summary(
 @router.get("/bills")
 def command_center_bills(
     bucket: Annotated[
-        str, Query(pattern="^(ready_to_pay|overdue|rejected|needs_attention|all)$")
+        str,
+        Query(
+            pattern="^(ready_to_pay|needs_review|overdue|rejected|needs_attention|all)$"
+        ),
     ] = "all",
     vendor_id: uuid.UUID | None = None,
     workflow_status: str | None = None,
@@ -170,9 +191,7 @@ def command_center_bills(
         "date_received": Invoice.created_at,
     }[sort_by]
     descending = (
-        (sort_dir == "desc")
-        if sort_dir
-        else sort_by in {"amount", "date_received"}
+        (sort_dir == "desc") if sort_dir else sort_by in {"amount", "date_received"}
     )
     ordering = sort_column.desc() if descending else sort_column.asc()
     if sort_by != "date_received":
@@ -237,6 +256,7 @@ def command_center_bills(
                 "vendor_id": invoice.vendor_id,
                 "vendor_name": vendor_name or invoice.vendor_name_raw,
                 "workflow_status": status,
+                "status": getattr(invoice, "status", status),
                 "final_status": invoice.final_status,
                 "due_date": invoice.due_date,
                 "total_amount": invoice.total_amount,

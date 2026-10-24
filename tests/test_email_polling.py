@@ -7,7 +7,9 @@ import zlib
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage as MIMEMessage
 from email.utils import format_datetime
+from io import BytesIO
 from unittest.mock import MagicMock
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import jwt
 import pytest
@@ -24,6 +26,22 @@ from src.models.notification_models import Notification
 from src.models.user_models import User
 from src.models.vendor_models import Vendor, VendorAlias
 from src.services import document_ingest_services, email_polling_services
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _docx_bytes():
+    output = BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>",
+        )
+        archive.writestr("word/document.xml", "<w:document/>")
+    return output.getvalue()
 
 
 class FakeQuery:
@@ -774,6 +792,32 @@ def test_bad_magic_attachment_is_rejected(polling_setup):
     assert not any(key.startswith("incoming/") for key, _, _ in uploads)
 
 
+def test_valid_docx_email_attachment_uses_shared_ingest(polling_setup):
+    db, uploads, _ = polling_setup
+    payload = _docx_bytes()
+    result, _ = _poll(
+        db,
+        {
+            1: _mail(
+                attachments=[
+                    (
+                        "bill.docx",
+                        payload,
+                        "application",
+                        "vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                ]
+            )
+        },
+    )
+
+    assert result["attachments"] == 1
+    child = next(row for row in _documents(db) if row.original_filename == "bill.docx")
+    assert child.mime == DOCX_MIME
+    assert child.status == "received"
+    assert any(body == payload and mime == DOCX_MIME for _, body, mime in uploads)
+
+
 @pytest.mark.parametrize("header_offset", [0, 16, 1023])
 def test_pdf_header_within_allowed_preamble_is_accepted(header_offset):
     part = MIMEMessage()
@@ -1070,6 +1114,7 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
         source="email",
         email_message_id="<stuck@vendor.test>",
         updated_at=old,
+        retry_count=3,
     )
     message = EmailMessageRecord(
         message_id="<stuck@vendor.test>",
@@ -1091,10 +1136,10 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
         )
     )
     monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
-    monkeypatch.setenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "1")
     assert sweep_stuck_documents(db) == 1
     assert document.status == "failed"
-    assert "recovery attempts" in document.failure_message
+    assert document.failure_class == "retry_exhausted"
+    assert "three automatic retries" in document.failure_message
     assert message.status == "failed_final"
     assert message.failure_reason == document.failure_message
 
@@ -1123,8 +1168,17 @@ def test_sweep_requeues_old_received_document_on_documents_queue(
     )
     monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
     assert sweep_stuck_documents(db) == 1
-    assert document.status == "parsing"
-    assert queued == [{"args": [str(document.id)], "queue": "documents"}]
+    assert document.status == "failed"
+    assert document.failure_class == "retryable"
+    assert document.retry_count == 1
+    assert document.next_retry_at is not None
+    assert queued == [
+        {
+            "args": [str(document.id)],
+            "queue": "documents",
+            "countdown": 30,
+        }
+    ]
 
 
 def test_stuck_raw_email_without_attachment_gets_attention_reason(

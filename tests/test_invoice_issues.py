@@ -182,7 +182,7 @@ def test_resolve_and_dismiss_write_status_and_audit(monkeypatch):
         db.reset_mock()
 
 
-def test_approval_requires_issue_override_and_audits_override(monkeypatch):
+def test_issue_override_does_not_bypass_saved_match_rules(monkeypatch):
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         source_document_id=None,
@@ -214,35 +214,16 @@ def test_approval_requires_issue_override_and_audits_override(monkeypatch):
     db.reset_mock()
     invoice.final_status = None
     db.query.side_effect = [invoice_query, issue_query]
-    monkeypatch.setattr(
-        invoice_routers,
-        "recommend_invoice_review",
-        lambda *_a, **_kw: SimpleNamespace(checks=[]),
-    )
-    monkeypatch.setattr(
-        invoice_routers,
-        "transition_invoice",
-        lambda _db, obj, status, **_kw: (
-            setattr(obj, "workflow_status", status),
-            setattr(obj, "final_status", status),
-        ),
-    )
-    result = invoice_routers.review_invoice(
-        invoice.id,
-        InvoiceReviewRequest(
-            decision="approved", override_reason="Business owner accepted risk"
-        ),
-        db,
-        {"sub": str(user_id), "role": "associate"},
-    )
-    override = next(
-        call.args[0]
-        for call in db.add.call_args_list
-        if isinstance(call.args[0], AuditLog)
-        and call.args[0].action == "invoice_issue_override"
-    )
-    assert result.final_status == "approved"
-    assert override.reason == "Business owner accepted risk"
+    with pytest.raises(HTTPException) as blocked:
+        invoice_routers.review_invoice(
+            invoice.id,
+            InvoiceReviewRequest(
+                decision="approved", override_reason="Business owner accepted risk"
+            ),
+            db,
+            {"sub": str(user_id), "role": "associate"},
+        )
+    assert blocked.value.status_code == 409
 
 
 def test_escalation_notifies_allowlisted_associates(monkeypatch):

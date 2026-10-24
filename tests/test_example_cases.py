@@ -70,6 +70,7 @@ def test_case_1_match_approved_to_ready_to_pay(monkeypatch):
         final_status=None,
         final_by=None,
         final_at=None,
+        final_run_id=uuid.uuid4(),
         owner_user_id=None,
         created_by=None,
     )
@@ -82,6 +83,9 @@ def test_case_1_match_approved_to_ready_to_pay(monkeypatch):
         invoice_routers,
         "recommend_invoice_review",
         lambda *_args, **_kwargs: SimpleNamespace(checks=[]),
+    )
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
     )
     _api(db)
     try:
@@ -137,6 +141,24 @@ def _recommendation_api(monkeypatch, invoice_id, *, name, expected, actual, reas
     )
     monkeypatch.setattr(
         invoice_routers, "recommend_invoice_review", lambda *_a, **_k: recommendation
+    )
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_a, **_k: SimpleNamespace(
+            id=uuid.uuid4(),
+            rules_used={
+                "match_outcome": {
+                    "outcome": "needs_review",
+                    "discrepancies": [
+                        {
+                            "code": name.upper(),
+                            "message": reason,
+                        }
+                    ],
+                }
+            },
+        ),
     )
     _api(db)
     return client.post(f"/api/invoices/{invoice_id}/three-way-match")

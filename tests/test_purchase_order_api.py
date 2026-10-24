@@ -9,10 +9,14 @@ from fastapi.testclient import TestClient
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import document_routers
+from src.api.rest.routers.purchase_order_routers import reassign_purchase_order_vendor
 from src.db.session_db import get_db
 from src.models.document_models import Document
 from src.models.purchase_order_models import PurchaseOrder
-from src.schemas.purchase_order_schemas import PurchaseOrderVendorResolutionRequest
+from src.schemas.purchase_order_schemas import (
+    PurchaseOrderVendorReassignmentRequest,
+    PurchaseOrderVendorResolutionRequest,
+)
 
 client = TestClient(app)
 
@@ -81,6 +85,29 @@ def test_purchase_order_detail_hides_another_uploaders_order():
         _clear_overrides()
 
     assert response.status_code == 404
+
+
+def test_reassign_purchase_order_vendor_updates_owner_scoped_record():
+    owner_id, po_id, old_vendor_id, vendor_id = (
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    )
+    order = SimpleNamespace(id=po_id, vendor_id=old_vendor_id)
+    vendor = SimpleNamespace(id=vendor_id, name="New Vendor", is_active=True)
+    db = MagicMock()
+    db.scalar.return_value = order
+    db.get.return_value = vendor
+
+    result = reassign_purchase_order_vendor(
+        po_id,
+        PurchaseOrderVendorReassignmentRequest(vendor_id=vendor_id),
+        db,
+        {"sub": str(owner_id), "role": "admin"},
+    )
+
+    assert result is order
+    assert order.vendor_id == vendor_id
+    assert "purchase_orders.created_by" in str(db.scalar.call_args.args[0])
+    db.commit.assert_called_once()
 
 
 def test_resolve_po_vendor_persists_selected_vendor_atomically(monkeypatch):

@@ -243,7 +243,7 @@ def test_goods_receipt_extraction_rejects_duplicate_number():
     db.add.assert_not_called()
 
 
-def test_goods_receipt_extraction_does_not_choose_ambiguous_purchase_order():
+def test_goods_receipt_extraction_persists_without_ambiguous_purchase_order():
     po_id = uuid.uuid4()
     candidates = [
         SimpleNamespace(id=po_id, vendor_id=uuid.uuid4()),
@@ -251,18 +251,15 @@ def test_goods_receipt_extraction_does_not_choose_ambiguous_purchase_order():
     ]
     db, document, data, vendor, _ = _extraction_case(po_candidates=candidates)
 
-    with pytest.raises(ValueError, match="purchase order is ambiguous"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
-def test_goods_receipt_extraction_rejects_non_object_line_item():
+def test_goods_receipt_extraction_skips_malformed_line_but_persists_header():
     db, document, data, vendor, _ = _extraction_case()
     data["line_items"] = [None]
-    with pytest.raises(ValueError, match="Goods receipt line item must be an object"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -318,18 +315,17 @@ def test_goods_receipt_update_rejects_empty_lines_without_mutating_receipt():
     db.flush.assert_not_called()
 
 
-def test_goods_receipt_extraction_rejects_vendor_po_mismatch():
+def test_goods_receipt_extraction_persists_vendor_po_mismatch_for_review():
     db, document, data, vendor, _ = _extraction_case(vendor_mismatch=True)
-    with pytest.raises(ValueError, match="vendor does not match purchase order"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
 @pytest.mark.parametrize(
     ("received", "accepted", "rejected"),
     [("0", "0", "0"), ("5", "4", "0"), ("5", "-1", "6")],
 )
-def test_goods_receipt_extraction_rejects_invalid_quantities(
+def test_goods_receipt_extraction_persists_invalid_quantities_for_review(
     received, accepted, rejected
 ):
     db, document, data, vendor, _ = _extraction_case()
@@ -338,12 +334,11 @@ def test_goods_receipt_extraction_rejects_invalid_quantities(
         accepted_qty=accepted,
         rejected_qty=rejected,
     )
-    with pytest.raises(ValueError, match="quantities are missing or invalid"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
-def test_goods_receipt_extraction_rejects_ambiguous_po_line():
+def test_goods_receipt_extraction_persists_with_unmatched_ambiguous_po_line():
     line = SimpleNamespace(
         id=uuid.uuid4(),
         item_code="SKU-1",
@@ -361,29 +356,25 @@ def test_goods_receipt_extraction_rejects_ambiguous_po_line():
             ),
         ]
     )
-    with pytest.raises(ValueError, match="cannot be uniquely matched"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
-def test_goods_receipt_extraction_rejects_po_line_outside_order():
+def test_goods_receipt_extraction_persists_with_unmatched_po_line_id():
     db, document, data, vendor, _ = _extraction_case()
     data["line_items"][0]["po_line_id"] = str(uuid.uuid4())
-    with pytest.raises(ValueError, match="outside its purchase order"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
-def test_goods_receipt_extraction_rejects_po_line_id_without_item_evidence():
+def test_goods_receipt_extraction_persists_po_line_id_without_item_evidence():
     db, document, data, vendor, _ = _extraction_case()
     data["line_items"][0].pop("item_code")
     data["line_items"][0].pop("description")
     data["line_items"][0]["po_line_id"] = str(uuid.uuid4())
 
-    with pytest.raises(ValueError, match="needs an item code or description"):
-        _save_goods_receipt_from_extraction(db, document, data, vendor)
-
-    db.add.assert_not_called()
+    _save_goods_receipt_from_extraction(db, document, data, vendor)
+    db.add.assert_called_once()
 
 
 def test_goods_receipt_extraction_rejects_incompatible_unit():
@@ -431,6 +422,20 @@ def test_three_way_match_endpoint_does_not_change_invoice_approval(monkeypatch):
         "recommend_invoice_review",
         lambda _db, _invoice, owner_id: recommendation,
     )
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            id=uuid.uuid4(),
+            rules_used={
+                "match_outcome": {
+                    "outcome": "ready_to_pay",
+                    "rule_set_version": "ap-match-v1",
+                    "discrepancies": [],
+                }
+            },
+        ),
+    )
     db.add = MagicMock()
     user_id = uuid.uuid4()
     app.dependency_overrides[get_db] = lambda: db
@@ -443,4 +448,4 @@ def test_three_way_match_endpoint_does_not_change_invoice_approval(monkeypatch):
     assert response.status_code == 200
     assert response.json()["matched"] is True
     assert invoice.final_status == "approved"
-    db.commit.assert_not_called()
+    db.commit.assert_called_once()

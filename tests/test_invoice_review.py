@@ -54,6 +54,10 @@ def _invoice(match_status="pending"):
 def test_review_invoice_approves_and_audits_decision():
     invoice = _invoice()
     reviewer_id, db, teardown = _setup_review(invoice)
+    invoice.final_run_id = uuid.uuid4()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
 
     try:
         response = client.post(
@@ -170,7 +174,7 @@ def test_review_invoice_blocks_critical_finding_even_if_match_status_is_ready(
         teardown()
 
     assert response.status_code == 409
-    assert "critical findings" in response.json()["detail"]
+    assert "matching rules pass" in response.json()["detail"]
     assert invoice.final_status is None
     db.add.assert_not_called()
     db.commit.assert_not_called()
@@ -213,6 +217,10 @@ def test_review_invoice_rejects_invalid_decision():
 def test_review_invoice_rolls_back_decision_and_audit_on_commit_failure():
     invoice = _invoice()
     _, db, teardown = _setup_review(invoice)
+    invoice.final_run_id = uuid.uuid4()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     db.commit.side_effect = RuntimeError("audit insert failed")
 
     try:

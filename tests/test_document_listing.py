@@ -228,8 +228,23 @@ def test_document_detail_includes_evidence_and_audit_history():
     audit_results.return_value = [event]
     invoice_query = MagicMock()
     invoice_query.filter.return_value.first.return_value = None
+    po_query = MagicMock()
+    po_id = uuid.uuid4()
+    po_query.filter.return_value.first.return_value = SimpleNamespace(id=po_id)
+    gr_query = MagicMock()
+    gr_id = uuid.uuid4()
+    gr_query.filter.return_value.first.return_value = SimpleNamespace(id=gr_id)
+    nested_document_query = MagicMock()
     db = MagicMock()
-    db.query.side_effect = [document_query, audit_query, invoice_query]
+    db.query.side_effect = [
+        document_query,
+        audit_query,
+        invoice_query,
+        po_query,
+        nested_document_query,
+        gr_query,
+        nested_document_query,
+    ]
     _override(owner_id, db)
 
     try:
@@ -244,3 +259,5 @@ def test_document_detail_includes_evidence_and_audit_history():
     assert body["email_sender"] == "billing@example.com"
     assert body["email_subject"] == "Invoice INV-1"
     assert body["audit_history"][0]["action"] == ("document_processing_retry_requested")
+    assert body["linked_po_id"] == str(po_id)
+    assert body["linked_gr_id"] == str(gr_id)

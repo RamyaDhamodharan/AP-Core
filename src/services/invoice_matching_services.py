@@ -16,9 +16,9 @@ from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.match_run_models import MatchRun
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
+from src.services.ap_decision_engine import evaluate_invoice
 from src.services.document_workflow_services import (
     _owner_scope,
-    recommend_invoice_review,
 )
 from src.services.invoice_confidence_services import (
     confidence_unavailable,
@@ -111,7 +111,8 @@ def _status_after_match(
 
 
 def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
-    po = db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None
+    invoice_po_id = getattr(invoice, "po_id", None)
+    po = db.get(PurchaseOrder, invoice_po_id) if invoice_po_id else None
     invoice_lines = (
         db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
     )
@@ -185,8 +186,16 @@ def _invoice_state_fingerprint(db: Session, invoice: Invoice) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
-def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | None:
-    """Run and persist matching once per distinct invoice/PO state."""
+def run_match_for_invoice(
+    db: Session,
+    invoice_id,
+    user_id=None,
+    *,
+    force: bool = False,
+    idempotent: bool = False,
+    trigger: str | None = None,
+) -> MatchRun | None:
+    """Persist the initial match or an explicitly requested rerun."""
     unit_price_tolerance = f"{os.getenv('INVOICE_UNIT_PRICE_TOLERANCE_PCT', '2')}%"
     total_tolerance = f"{os.getenv('INVOICE_TOTAL_TOLERANCE_PCT', '1')}%"
     invoice = db.get(Invoice, invoice_id)
@@ -194,23 +203,36 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         return None
 
     match_started = time.perf_counter()
-    fingerprint = _invoice_state_fingerprint(db, invoice)
     previous = (
         db.query(MatchRun)
         .filter(MatchRun.invoice_id == invoice.id)
         .order_by(MatchRun.run_no.desc())
         .first()
     )
-    if previous and (previous.rules_used or {}).get("state_fingerprint") == fingerprint:
+    if previous and not force and (previous.rules_used or {}).get("rule_set_version"):
         return previous
     original_workflow_status = getattr(
         invoice, "workflow_status", None
     ) or legacy_workflow_status(invoice)
     preserve_final_status = original_workflow_status in {
-        "approved", "paid", "rejected"
-    } or getattr(invoice, "status", None) in {"ready_to_pay", "paid", "rejected"}
+        "paid",
+        "rejected",
+        "on_hold",
+    } or getattr(invoice, "status", None) in {"paid", "rejected", "on_hold"}
     po_link_started = time.perf_counter()
-    recommendation = recommend_invoice_review(db, invoice, owner_id=user_id)
+    decision = evaluate_invoice(db, invoice, owner_id=user_id)
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            decision["inputs_summary"], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    if (
+        idempotent
+        and previous is not None
+        and (previous.rules_used or {}).get("state_fingerprint") == fingerprint
+    ):
+        return previous
+    run_actor_id = None if trigger else user_id
     db.add(
         AuditLog(
             action="pipeline_step",
@@ -218,24 +240,26 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
             entity_id=invoice.id,
             step_name="po_link",
             duration_ms=max(0, int((time.perf_counter() - po_link_started) * 1000)),
-            input_ref=str(invoice.po_id or invoice.po_number_raw or invoice.id),
-            output_summary={"po_linked": bool(invoice.po_id)},
-            result="success" if invoice.po_id else "warning",
+            input_ref=str(
+                getattr(invoice, "po_id", None)
+                or getattr(invoice, "po_number_raw", None)
+                or invoice.id
+            ),
+            output_summary={"po_linked": bool(getattr(invoice, "po_id", None))},
+            result=("success" if getattr(invoice, "po_id", None) else "warning"),
             message="Purchase order link evaluated",
-            created_by=user_id,
+            created_by=run_actor_id,
         )
     )
-    if not invoice.po_id:
-        result = "no_match"
-    elif any(
-        check.outcome == "not_possible"
-        or (check.outcome == "mismatch" and check.severity == "error")
-        for check in recommendation.checks
-    ):
-        result = "match_issues"
-    else:
-        # Missing goods-receipt evidence is a warning in the two-way AP workflow.
-        result = "match_ok"
+    result = (
+        "match_ok"
+        if decision["outcome"] == "ready_to_pay"
+        else (
+            "no_match"
+            if any(item["code"] == "MISSING_PO" for item in decision["discrepancies"])
+            else "match_issues"
+        )
+    )
 
     previous_no = (
         db.query(func.max(MatchRun.run_no))
@@ -243,18 +267,26 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         .scalar()
         or 0
     )
-    checks = [check.model_dump(mode="json") for check in recommendation.checks]
-    differences = [
-        check
-        for check in checks
-        if check.get("outcome") in {"mismatch", "not_possible"}
+    differences = list(decision["discrepancies"])
+    issue_checks = [
+        {
+            "outcome": "mismatch",
+            "name": item["code"].casefold(),
+            "reason": item["message"],
+            "expected": item.get("expected_value"),
+            "actual": item.get("invoice_value"),
+            "severity": "error",
+        }
+        for item in differences
     ]
     sync_invoice_issues(
         db,
         invoice,
-        differences,
-        user_id,
-        getattr(recommendation, "missing_document_types", []),
+        issue_checks,
+        run_actor_id,
+        ["goods_receipt"]
+        if any(item["code"] == "MISSING_GR" for item in differences)
+        else [],
     )
     run = MatchRun(
         invoice_id=invoice.id,
@@ -262,12 +294,16 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         po_id=invoice.po_id,
         result=result,
         rules_used={
+            "rule_set_version": decision["rule_set_version"],
+            "match_outcome": decision,
+            "inputs_summary": decision["inputs_summary"],
             "unit_price_tolerance_pct": unit_price_tolerance,
             "total_tolerance_pct": total_tolerance,
             "state_fingerprint": fingerprint,
+            "trigger": trigger or "requested",
         },
         differences=differences,
-        created_by=user_id,
+        created_by=run_actor_id,
     )
     db.add(run)
     db.flush()
@@ -302,7 +338,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
                 match_type="3-way" if receipt else "2-way",
                 score=Decimal("100"),
                 status="confirmed",
-                confirmed_by=user_id,
+                confirmed_by=run_actor_id,
             )
             db.add(match)
         else:
@@ -346,7 +382,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
                 {"name": "no_po_found", "reason": "No PO found", "severity": "error"}
             )
 
-    no_match_auto_reject = _email_no_match_auto_reject_enabled()
+    no_match_auto_reject = False
     has_suggested_candidate = bool(candidates) if not invoice.po_id else False
     # A suggested PO is a review case. It is never classified as a completed no-match.
     if result == "no_match" and has_suggested_candidate:
@@ -358,41 +394,22 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         and original_workflow_status != "rejected"
     )
 
-    workspace_checks = checks + [
-        row
-        for row in differences
-        if row.get("name") in {"suggested_po_match", "no_po_found"}
-    ]
-    for difference in workspace_checks:
-        field_name = str(difference.get("name", "matching"))[:80]
-        outcome = difference.get("outcome")
-        severity = (
-            "match"
-            if outcome == "passed"
-            else "within_tolerance"
-            if difference.get("severity") != "error"
-            else "error"
-        )
+    for difference in differences:
+        field_name = str(difference.get("code", "matching")).casefold()[:80]
         db.add(
             InvoiceDiscrepancy(
                 invoice_id=invoice.id,
                 field=field_name,
-                invoice_value=difference.get("actual"),
-                po_value=difference.get("expected"),
+                invoice_value=difference.get("invoice_value"),
+                po_value=difference.get("expected_value"),
                 gr_value=(
-                    difference.get("expected")
-                    if field_name == "invoice_vs_accepted_quantity"
-                    else difference.get("actual")
-                    if field_name == "partial_receipt"
+                    difference.get("expected_value")
+                    if field_name == "quantity_variance"
                     else None
                 ),
-                severity=severity,
-                resolved=outcome == "passed",
-                reason=str(
-                    difference.get("reason")
-                    or difference.get("description")
-                    or field_name
-                ),
+                severity="error",
+                resolved=False,
+                reason=str(difference.get("message") or field_name),
             )
         )
     run.differences = differences
@@ -418,9 +435,7 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         "match_issues": "match_issues",
         "no_match": "no_match",
     }[result]
-    confidence_needs_review = requires_verification(
-        getattr(invoice, "field_confidence", None) or {}
-    )
+    confidence_needs_review = bool(decision["low_confidence_fields"])
     confidence_missing = confidence_unavailable(
         getattr(invoice, "field_confidence", None) or {}
     )
@@ -463,22 +478,15 @@ def run_match_for_invoice(db: Session, invoice_id, user_id=None) -> MatchRun | N
         "result": result,
     }
     invoice.final_run_id = run.id
-    missing_receipt = "goods_receipt" in getattr(
-        recommendation, "missing_document_types", []
-    )
-    has_discrepancies = bool(differences) or result != "match_ok" or missing_receipt
     if not preserve_final_status:
         invoice.status = (
             "rejected"
             if auto_reject
             else "needs_review"
             if requires_verification(getattr(invoice, "field_confidence", None) or {})
-            else _status_after_match(
-                po_linked=bool(invoice.po_id),
-                result=result,
-                has_discrepancies=has_discrepancies,
-                missing_receipt=missing_receipt,
-            )
+            else "ready_to_pay"
+            if decision["outcome"] == "ready_to_pay"
+            else "needs_review"
         )
     if not preserve_final_status and invoice.status == "ready_to_pay":
         db.add(

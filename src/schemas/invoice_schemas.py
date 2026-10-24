@@ -68,6 +68,10 @@ class InvoiceDashboardItem(BaseModel):
     workflow_status: InvoiceWorkflowStatus = "received"
     gl_code: str | None = None
     confidence: float | None = None
+    # Display-only overall level derived from the minimum invoice field
+    # confidence (unavailable values are treated as low).
+    confidence_level: str = "low"
+    overall_confidence_percent: int = 0
     can_resubmit: bool = False
     status: InvoiceStatus = "processing"
 

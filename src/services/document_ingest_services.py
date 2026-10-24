@@ -14,11 +14,12 @@ from sqlalchemy.exc import IntegrityError
 
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
+from src.services.docx_validation_services import is_valid_docx
 from src.storage.minio_storage import delete_file, upload_file
 from src.worker.dispatch import dispatch_document_processing
 
 logger = logging.getLogger(__name__)
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml"}
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".eml", ".docx"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
 
@@ -65,6 +66,13 @@ def ingest_file(
         else:
             limit_label = f"{max_size} byte"
         return IngestResult("failed", None, f"File exceeds {limit_label} limit")
+
+    if extension == ".docx" and not is_valid_docx(
+        filename, content_type, content_bytes
+    ):
+        return IngestResult(
+            "failed", None, "Invalid Word document; upload a valid .docx file"
+        )
 
     file_hash = hashlib.sha256(content_bytes).hexdigest()
     existing = db.query(Document).filter_by(file_hash=file_hash).first()
@@ -170,16 +178,18 @@ def ingest_file(
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 
     if extension != ".eml":
-        from src.api.rest.routers.document_routers import _process_in_background
+        from src.api.rest.routers.document_routers import (
+            _process_document_with_retries,
+        )
 
         if background_tasks is not None:
             dispatch_document_processing(
-                background_tasks, document.id, _process_in_background
+                background_tasks, document.id, _process_document_with_retries
             )
         elif os.getenv("USE_CELERY", "false").lower() == "true":
             dispatch_document_processing(
-                BackgroundTasks(), document.id, _process_in_background
+                BackgroundTasks(), document.id, _process_document_with_retries
             )
         else:
-            _process_in_background(document.id)
+            _process_document_with_retries(document.id)
     return IngestResult("received", document.id, "File received")

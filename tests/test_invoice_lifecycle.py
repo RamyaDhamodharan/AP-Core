@@ -33,8 +33,12 @@ def test_transition_writes_history_and_legacy_statuses():
         workflow_status="match_approved",
         match_status="pending",
         final_status=None,
+        final_run_id=uuid.uuid4(),
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     user_id = uuid.uuid4()
 
     history = transition_invoice(
@@ -132,8 +136,12 @@ def test_associate_can_record_payment_once_without_external_payment():
         payment_reference=None,
         updated_by=None,
         total_amount=Decimal("125.50"),
+        final_run_id=uuid.uuid4(),
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     (
         db.query.return_value.filter_by.return_value.with_for_update.return_value.first.return_value
     ) = invoice
@@ -173,6 +181,7 @@ def test_void_payment_requires_reason_and_restores_ready_to_pay_state():
         payment_method="upi",
         payment_reference="UPI-REF",
         updated_by=None,
+        final_run_id=uuid.uuid4(),
     )
     payment = SimpleNamespace(
         id=uuid.uuid4(),
@@ -184,6 +193,9 @@ def test_void_payment_requires_reason_and_restores_ready_to_pay_state():
         void_reason=None,
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     invoice_query, payment_query = MagicMock(), MagicMock()
     db.query.side_effect = [invoice_query, payment_query]
     invoice_lock = invoice_query.filter_by.return_value.with_for_update.return_value
@@ -232,9 +244,7 @@ def test_payment_unique_index_conflict_returns_clear_conflict():
     db.rollback.assert_called_once()
 
 
-def test_document_retry_classifies_transient_and_uses_exponential_backoff(monkeypatch):
-    monkeypatch.setenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "3")
-    monkeypatch.setenv("DOCUMENT_RETRY_BASE_SECONDS", "2")
+def test_document_retry_classifies_transient_and_leaves_scheduling_to_worker():
     attempts = 0
     delays = []
 
@@ -247,9 +257,10 @@ def test_document_retry_classifies_transient_and_uses_exponential_backoff(monkey
 
     assert is_transient_document_error(ConnectionError("socket reset"))
     assert not is_transient_document_error(ValueError("corrupt PDF"))
-    assert with_transient_retries(operation, sleep=delays.append) == "done"
-    assert attempts == 3
-    assert delays == [2.0, 4.0]
+    with pytest.raises(ConnectionError, match="temporarily unavailable"):
+        with_transient_retries(operation, sleep=delays.append)
+    assert attempts == 1
+    assert delays == []
 
 
 def test_document_retry_does_not_retry_permanent_failures(monkeypatch):
@@ -299,9 +310,18 @@ def test_step_log_records_elapsed_milliseconds_and_compact_output():
     ],
 )
 def test_document_failure_messages_are_plain_and_actionable(technical, message):
-    result = _document_failure_message(RuntimeError(technical))
+    result = _document_failure_message(
+        RuntimeError(technical),
+        parse_failed=technical in {"corrupt PDF", "no text could be extracted"},
+    )
     assert message in result
     assert technical not in result
+
+
+def test_empty_parse_is_reported_as_damaged_only_at_parse_stage():
+    error = RuntimeError("No text could be extracted from the document")
+    assert "damaged" in _document_failure_message(error, parse_failed=True)
+    assert "damaged" not in _document_failure_message(error, parse_failed=False)
 
 
 def test_audit_search_supports_filters_paging_and_hides_technical_detail():

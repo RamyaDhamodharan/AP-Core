@@ -1,9 +1,12 @@
 import sys
 import uuid
+from io import BytesIO
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
@@ -15,6 +18,23 @@ from src.models.user_models import User
 from src.services import document_ingest_services
 
 client = TestClient(app)
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _docx_bytes(*, extra_entries=None, document=b"<w:document/>"):
+    output = BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>",
+        )
+        archive.writestr("word/document.xml", document)
+        for name, value in (extra_entries or {}).items():
+            archive.writestr(name, value)
+    return output.getvalue()
 
 
 def setup_db(monkeypatch, db):
@@ -32,11 +52,67 @@ def setup_db(monkeypatch, db):
         "_process_in_background",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        document_routers,
+        "_process_document_with_retries",
+        lambda *args, **kwargs: None,
+    )
 
 
 def teardown_db():
     app.dependency_overrides.pop(get_db, None)
     app.dependency_overrides.pop(get_current_user, None)
+
+
+def _request_document_file(monkeypatch, *, disposition=None, filename="invoice.pdf"):
+    document_id = uuid.uuid4()
+    document = SimpleNamespace(
+        id=document_id,
+        storage_path=f"documents/invoice/original/{filename}",
+        original_filename=filename,
+        mime="application/octet-stream",
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = document
+    setup_db(monkeypatch, db)
+    monkeypatch.setattr(document_routers, "download_file", lambda _path: b"%PDF")
+    params = {"disposition": disposition} if disposition else None
+    try:
+        return client.get(f"/api/documents/{document_id}/file", params=params)
+    finally:
+        teardown_db()
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_disposition"),
+    [(None, "attachment"), ("inline", "inline")],
+)
+def test_original_file_disposition_and_content_type(
+    monkeypatch, disposition, expected_disposition
+):
+    response = _request_document_file(monkeypatch, disposition=disposition)
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].startswith(
+        f"{expected_disposition};"
+    )
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_original_file_rejects_unknown_disposition(monkeypatch):
+    response = _request_document_file(monkeypatch, disposition="preview")
+
+    assert response.status_code == 422
+
+
+def test_original_docx_file_uses_word_content_type(monkeypatch):
+    response = _request_document_file(monkeypatch, filename="invoice.docx")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == DOCX_MIME
+    assert response.headers["content-disposition"].startswith("attachment;")
 
 
 def test_upload_valid_pdf(monkeypatch):
@@ -68,7 +144,34 @@ def test_upload_valid_pdf(monkeypatch):
     db.commit.assert_called_once()
 
 
-def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monkeypatch):
+def test_upload_rejects_more_than_five_files_before_ingest(monkeypatch):
+    db = MagicMock()
+    setup_db(monkeypatch, db)
+    files = [
+        ("file", (f"invoice-{index}.pdf", b"%PDF-1.4", "application/pdf"))
+        for index in range(6)
+    ]
+
+    try:
+        response = client.post("/api/documents/upload", files=files)
+    finally:
+        teardown_db()
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "You can upload up to 5 files at a time"
+    db.add.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "content_type"),
+    [
+        ("invoice.pdf", b"PDF", "application/pdf"),
+        ("invoice.docx", _docx_bytes(), DOCX_MIME),
+    ],
+)
+def test_upload_extract_pipeline_matches_and_approves_without_manual_route(
+    monkeypatch, filename, content, content_type
+):
     from src.models.document_models import Document
     from src.models.goods_receipt_models import GoodsReceipt
     from src.models.invoice_match_models import InvoiceDiscrepancy, InvoiceMatch
@@ -249,8 +352,14 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
     )
     monkeypatch.setattr(
         invoice_matching_services,
-        "recommend_invoice_review",
-        lambda *_args, **_kwargs: SimpleNamespace(checks=[]),
+        "evaluate_invoice",
+        lambda *_args, **_kwargs: {
+            "rule_set_version": "ap-match-v1",
+            "outcome": "ready_to_pay",
+            "discrepancies": [],
+            "low_confidence_fields": [],
+            "inputs_summary": {},
+        },
     )
 
     def process_document(document_id):
@@ -262,10 +371,13 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
         )
 
     monkeypatch.setattr(document_routers, "_process_in_background", process_document)
+    monkeypatch.setattr(
+        document_routers, "_process_document_with_retries", process_document
+    )
     try:
         response = client.post(
             "/api/documents/upload",
-            files={"file": ("invoice.pdf", b"PDF", "application/pdf")},
+            files={"file": (filename, content, content_type)},
         )
     finally:
         app.dependency_overrides.pop(get_db, None)
@@ -280,6 +392,116 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monke
         isinstance(call.args[0], MatchRun) and call.args[0].result == "match_ok"
         for call in db.add.call_args_list
     )
+
+
+def test_upload_accepts_valid_docx(monkeypatch):
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = None
+    setup_db(monkeypatch, db)
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.docx", _docx_bytes(), DOCX_MIME)},
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "received"
+    assert response.json()["original_filename"] == "invoice.docx"
+    assert response.json()["id"]
+    stored = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], Document)
+    )
+    assert stored.mime == DOCX_MIME
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "mime", "expected_message"),
+    [
+        (
+            "invoice.docx",
+            b"not a zip file",
+            DOCX_MIME,
+            "Invalid Word document; upload a valid .docx file",
+        ),
+        ("invoice.docm", _docx_bytes(), DOCX_MIME, "Unsupported file type"),
+        ("invoice.doc", _docx_bytes(), DOCX_MIME, "Unsupported file type"),
+        ("template.dotm", _docx_bytes(), DOCX_MIME, "Unsupported file type"),
+        (
+            "invoice.docx",
+            _docx_bytes(extra_entries={"word/vbaProject.bin": b"macro"}),
+            DOCX_MIME,
+            "Invalid Word document; upload a valid .docx file",
+        ),
+        (
+            "invoice.docx",
+            _docx_bytes(),
+            "application/zip",
+            "Invalid Word document; upload a valid .docx file",
+        ),
+    ],
+)
+def test_upload_rejects_invalid_or_macro_enabled_docx(
+    monkeypatch, filename, payload, mime, expected_message
+):
+    db = MagicMock()
+    setup_db(monkeypatch, db)
+    try:
+        response = client.post(
+            "/api/documents/upload", files={"file": (filename, payload, mime)}
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "failed"
+    assert response.json()["id"] is None
+    assert response.json()["message"] == expected_message
+    db.add.assert_not_called()
+
+
+def test_docx_zip_bomb_entry_count_is_rejected():
+    from src.services.docx_validation_services import is_valid_docx
+
+    bomb = _docx_bytes(
+        extra_entries={f"word/extra-{index}.xml": b"x" for index in range(1000)}
+    )
+    assert not is_valid_docx("invoice.docx", DOCX_MIME, bomb)
+
+
+def test_docx_zip_bomb_uncompressed_size_is_rejected(monkeypatch):
+    from src.services import docx_validation_services
+
+    monkeypatch.setattr(docx_validation_services, "DOCX_MAX_UNCOMPRESSED_BYTES", 10)
+    payload = _docx_bytes(extra_entries={"word/expanded.xml": b"x" * 11})
+    assert not docx_validation_services.is_valid_docx(
+        "invoice.docx", DOCX_MIME, payload
+    )
+
+
+def test_valid_docx_duplicate_hash_is_blocked(monkeypatch):
+    existing_id = uuid.uuid4()
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = SimpleNamespace(
+        id=existing_id
+    )
+    setup_db(monkeypatch, db)
+    try:
+        response = client.post(
+            "/api/documents/upload",
+            files={"file": ("invoice.docx", _docx_bytes(), DOCX_MIME)},
+        )
+    finally:
+        teardown_db()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "duplicate_blocked"
+    assert response.json()["id"] == str(existing_id)
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
 
 
 def test_upload_rejects_unsupported_extension(monkeypatch):
@@ -401,7 +623,7 @@ def test_upload_triggers_auto_processing(monkeypatch):
     started = []
     monkeypatch.setattr(
         document_routers,
-        "_process_in_background",
+        "_process_document_with_retries",
         lambda document_id: started.append(document_id),
     )
     try:

@@ -1,5 +1,13 @@
 FROM python:3.12-slim
 
+# LibreOffice is installed at image build time for offline DOCX previews.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        libreoffice-writer \
+        fonts-liberation \
+        fonts-dejavu \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1

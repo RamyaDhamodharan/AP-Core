@@ -7,10 +7,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.api.rest.routers.command_center_routers import command_center_bills
+from src.api.rest.routers.document_routers import _save_invoice_from_extraction
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.email_draft_models import EmailDraft
+from src.models.exchange_rate_models import ExchangeRate
 from src.models.follow_up_models import FollowUp
+from src.models.invoice_match_models import InvoiceDiscrepancy
 from src.models.invoice_models import Invoice
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.notification_models import Notification
@@ -186,6 +189,138 @@ def test_case_7_mark_overdue_creates_history_alert_and_follow_up(
         entity_type="invoice", entity_id=invoice.id, kind="overdue"
     ).one()
     assert follow_up.attempts >= 1
+
+
+def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_rate):
+    user = db_factories["associate"]()
+    vendor = db_factories["vendor"]()
+    po = db_factories["purchase_order"](
+        vendor,
+        po_number=f"PO-CURRENCY-{uuid.uuid4()}",
+        currency="USD",
+        created_by=user.id,
+        subtotal=Decimal("100.00"),
+        tax_amount=Decimal("0.00"),
+        total_amount=Decimal("100.00"),
+        lines=[
+            {
+                "item_code": "CURRENCY-ITEM",
+                "description": "Currency test item",
+                "uom": "EA",
+                "qty": Decimal("10"),
+                "unit_price": Decimal("10.00"),
+                "line_amount": Decimal("100.00"),
+                "created_by": user.id,
+            }
+        ],
+    )
+    po_line = db_session.query(PurchaseOrderLine).filter_by(po_id=po.id).one()
+    db_factories["goods_receipt"](
+        po,
+        created_by=user.id,
+        lines=[
+            {
+                "po_line_id": po_line.id,
+                "item_code": po_line.item_code,
+                "description": po_line.description,
+                "uom": po_line.uom,
+                "received_qty": Decimal("10"),
+                "accepted_qty": Decimal("10"),
+                "rejected_qty": Decimal("0"),
+                "created_by": user.id,
+            }
+        ],
+    )
+    document = Document(
+        original_filename="currency-mismatch.pdf",
+        file_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        status="extracted",
+        doc_type="invoice",
+        source="upload",
+        created_by=user.id,
+    )
+    db_session.add(document)
+    db_session.flush()
+    if with_exchange_rate:
+        db_session.add(
+            ExchangeRate(
+                from_currency="EUR",
+                to_currency="USD",
+                rate=Decimal("1.100000"),
+                rate_date=date.today(),
+                created_by=user.id,
+            )
+        )
+        db_session.flush()
+
+    extracted = {
+        "vendor": vendor.name,
+        "invoice_number": f"INV-CURRENCY-{uuid.uuid4()}",
+        "order_number": po.po_number,
+        "invoice_date": "2026-10-01",
+        "currency": "EUR",
+        "subtotal": "100.00",
+        "tax": "0.00",
+        "total": "100.00",
+        "line_items": [
+            {
+                "item_code": po_line.item_code,
+                "description": po_line.description,
+                "uom": po_line.uom,
+                "qty": "10",
+                "unit_price": "10.00",
+                "line_amount": "100.00",
+            }
+        ],
+        "field_confidence": _high_confidence(),
+    }
+    invoice = _save_invoice_from_extraction(db_session, document, extracted)
+    db_session.flush()
+
+    run = invoice_matching_services.run_match_for_invoice(
+        db_session, invoice.id, user.id
+    )
+    db_session.flush()
+    discrepancy = (
+        db_session.query(InvoiceDiscrepancy)
+        .filter_by(invoice_id=invoice.id, field="currency")
+        .one()
+    )
+    return document, invoice, run, discrepancy
+
+
+def test_currency_mismatch_persists_invoice_and_keeps_document_extracted(
+    db_session, db_factories
+):
+    document, invoice, run, discrepancy = _run_currency_mismatch_pipeline(
+        db_session, db_factories, with_exchange_rate=False
+    )
+
+    assert db_session.get(Invoice, invoice.id) is invoice
+    assert run.result == "match_issues"
+    assert invoice.status == "needs_review"
+    assert discrepancy.reason == "Currency mismatch: invoice EUR, PO USD"
+    assert discrepancy.invoice_value == "EUR"
+    assert discrepancy.po_value == "USD"
+    assert document.status == "extracted"
+    assert document.failure_message is None
+
+
+def test_currency_mismatch_with_exchange_rate_still_requires_review(
+    db_session, db_factories
+):
+    document, invoice, run, discrepancy = _run_currency_mismatch_pipeline(
+        db_session, db_factories, with_exchange_rate=True
+    )
+
+    assert db_session.get(Invoice, invoice.id) is invoice
+    assert run.result == "match_issues"
+    assert invoice.status == "needs_review"
+    assert discrepancy.reason == "Currency mismatch: invoice EUR, PO USD"
+    assert discrepancy.invoice_value == "EUR"
+    assert discrepancy.po_value == "USD"
+    assert document.status == "extracted"
+    assert document.failure_message is None
 
 
 def test_concurrent_canonical_invoice_number_insert_has_one_duplicate_winner(

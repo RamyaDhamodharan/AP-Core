@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 
+from sqlalchemy import and_, or_
+
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.email_models import EmailMessage
@@ -24,10 +26,7 @@ def recover_raw_email_document(document_id: uuid.UUID) -> None:
     db = SessionLocal()
     try:
         document = (
-            db.query(Document)
-            .filter_by(id=document_id)
-            .with_for_update()
-            .first()
+            db.query(Document).filter_by(id=document_id).with_for_update().first()
         )
         if document is None:
             return
@@ -208,13 +207,26 @@ def _recover_raw_email(db, document: Document) -> str:
 def sweep_stuck_documents(db, *, now: datetime | None = None) -> int:
     current = now or datetime.now(UTC)
     timeout_minutes = max(1, int(os.getenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")))
-    max_attempts = max(1, int(os.getenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "3")))
+    from src.services.document_retry_services import MAX_AUTOMATIC_RETRIES
+
+    max_attempts = MAX_AUTOMATIC_RETRIES
     cutoff = current - timedelta(minutes=timeout_minutes)
     stuck = (
         db.query(Document)
         .filter(
-            Document.status.in_(["received", "parsing", "parsed", "classified"]),
-            Document.updated_at < cutoff,
+            or_(
+                and_(
+                    Document.status.in_(
+                        ["received", "parsing", "parsed", "classified"]
+                    ),
+                    Document.updated_at < cutoff,
+                ),
+                and_(
+                    Document.status == "failed",
+                    Document.failure_class == "retryable",
+                    Document.next_retry_at <= current,
+                ),
+            )
         )
         .with_for_update(skip_locked=True)
         .all()
@@ -311,44 +323,78 @@ def sweep_stuck_documents(db, *, now: datetime | None = None) -> int:
             )
             continue
 
-        attempts = _document_attempts(db, document.id)
-        if attempts >= max_attempts:
+        due_retry = document.status == "failed"
+        attempts = max(int(getattr(document, "retry_count", 0) or 0), 0)
+        if due_retry:
+            document.status = "received"
+            document.next_retry_at = None
+            delay = 0
+            outcomes["requeued"] += 1
+            outcome = "retry_recovered"
+        elif attempts >= max_attempts:
             reason = (
-                f"Processing did not start after {attempts} recovery attempts. "
-                "Retry processing."
+                "Document processing stopped unexpectedly after three automatic "
+                "retries. Use Retry to try again."
             )
             document.status = "failed"
+            document.failure_class = "retry_exhausted"
+            document.next_retry_at = None
             document.failure_message = reason
             outcomes["failed"] += 1
             outcome = "failed_max_attempts"
         else:
-            document.status = "parsing"
-            document.failure_message = None
+            from src.services.document_retry_services import retry_delay_seconds
+
+            delay = retry_delay_seconds(attempts)
+            document.retry_count = attempts + 1
+            document.failure_class = "retryable"
+            document.next_retry_at = current + timedelta(seconds=delay)
+            document.failure_message = (
+                "Document processing stopped unexpectedly; an automatic retry "
+                "has been scheduled."
+            )
+            document.status = "failed"
             outcomes["requeued"] += 1
             outcome = "requeued"
         db.add(
             AuditLog(
                 action="document_stuck_requeued"
-                if outcome == "requeued"
+                if outcome in {"requeued", "retry_recovered"}
                 else "document_stuck_failed",
                 entity_type="document",
                 entity_id=document.id,
-                result="success" if outcome == "requeued" else "error",
+                result="success"
+                if outcome in {"requeued", "retry_recovered"}
+                else "error",
                 message="Stuck document recovery processed",
                 reason=document.failure_message,
-                new_value={"outcome": outcome, "attempt": attempts + 1},
+                new_value={
+                    "outcome": outcome,
+                    "attempt": attempts + 1,
+                    "next_retry_at": (
+                        document.next_retry_at.isoformat()
+                        if document.next_retry_at
+                        else None
+                    ),
+                },
             )
         )
         db.commit()
-        if outcome == "requeued":
+        if outcome in {"requeued", "retry_recovered"}:
             try:
                 from src.worker.tasks import process_document
 
-                process_document.apply_async(args=[str(document.id)], queue="documents")
+                process_document.apply_async(
+                    args=[str(document.id)],
+                    queue="documents",
+                    countdown=delay,
+                )
             except Exception as exc:
                 reason = f"Could not queue document recovery: {type(exc).__name__}"
                 document.status = "failed"
+                document.failure_class = "retryable"
                 document.failure_message = reason
+                document.next_retry_at = current + timedelta(seconds=60)
                 outcomes["requeued"] -= 1
                 outcomes["failed"] += 1
                 outcome = "queue_failed"

@@ -356,7 +356,7 @@ def test_workflow_tax_difference_is_issue():
     assert next(check for check in checks if check.name == "tax").outcome == "mismatch"
 
 
-def test_workflow_currency_conversion_uses_exchange_rate():
+def test_workflow_currency_mismatch_is_error_even_with_exchange_rate():
     from datetime import date
 
     invoice, po, receipt, po_line, invoice_line = _records()
@@ -374,9 +374,12 @@ def test_workflow_currency_conversion_uses_exchange_rate():
         po_lines=[po_line],
         invoice_lines=[invoice_line],
     )
-    assert (
-        next(check for check in checks if check.name == "currency").outcome == "passed"
-    )
+    currency_check = next(check for check in checks if check.name == "currency")
+    assert currency_check.outcome == "mismatch"
+    assert currency_check.severity == "error"
+    assert currency_check.reason == "Currency mismatch: invoice EUR, PO USD"
+    assert currency_check.actual == "EUR"
+    assert currency_check.expected == "USD"
 
 
 def test_invoice_item_code_mismatch_is_not_linked_by_matching_description():

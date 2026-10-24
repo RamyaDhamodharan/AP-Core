@@ -27,7 +27,6 @@ def _token(monkeypatch, role, user_id=None):
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
-        ("post", "/api/vendors", {"name": "Vendor"}),
         (
             "patch",
             "/api/vendors/00000000-0000-0000-0000-000000000001",
@@ -47,6 +46,12 @@ def _token(monkeypatch, role, user_id=None):
             "delete",
             "/api/vendors/00000000-0000-0000-0000-000000000001/aliases/00000000-0000-0000-0000-000000000002",
             None,
+        ),
+        ("delete", "/api/vendors/00000000-0000-0000-0000-000000000001", None),
+        (
+            "patch",
+            "/api/purchase-orders/00000000-0000-0000-0000-000000000001/vendor",
+            {"vendor_id": "00000000-0000-0000-0000-000000000002"},
         ),
     ],
 )
@@ -98,6 +103,35 @@ def test_admin_token_can_create_vendor(monkeypatch, user_stub):
             headers={
                 "Authorization": f"Bearer {_token(monkeypatch, 'admin', user_stub.id)}"
             },
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+    assert response.status_code == 201
+
+
+def test_associate_token_can_create_vendor(monkeypatch, user_stub):
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+    (
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value
+    ) = None
+    db.scalars.return_value.first.return_value = None
+
+    def refresh(vendor):
+        vendor.id = uuid.uuid4()
+        vendor.is_active = True
+
+    db.refresh.side_effect = refresh
+    db.get.side_effect = lambda model, _id: user_stub if model is User else None
+    app.dependency_overrides[get_db] = lambda: db
+    headers = {
+        "Authorization": f"Bearer {_token(monkeypatch, 'associate', user_stub.id)}"
+    }
+    try:
+        response = client.post(
+            "/api/vendors",
+            json={"name": "Associate vendor"},
+            headers=headers,
         )
     finally:
         app.dependency_overrides.pop(get_db, None)

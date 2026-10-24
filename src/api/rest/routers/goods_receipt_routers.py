@@ -1,8 +1,9 @@
 import uuid
-from typing import Annotated
+from datetime import date
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -26,14 +27,43 @@ _GR_NUMBER_CONSTRAINTS = {
 }
 
 
+def _owner_filter(owner_id: uuid.UUID, current_user: dict | None = None):
+    if current_user and current_user.get("role") == "admin":
+        return true()
+    return or_(
+        GoodsReceipt.created_by == owner_id,
+        GoodsReceipt.source_document_id.in_(
+            select(Document.id).where(
+                or_(
+                    Document.created_by == owner_id,
+                    Document.source.in_(["email", "email_poll"]),
+                )
+            )
+        ),
+        GoodsReceipt.po_id.in_(
+            select(PurchaseOrder.id).where(
+                or_(
+                    PurchaseOrder.created_by == owner_id,
+                    PurchaseOrder.source_document_id.in_(
+                        select(Document.id).where(
+                            or_(
+                                Document.created_by == owner_id,
+                                Document.source.in_(["email", "email_poll"]),
+                            )
+                        )
+                    ),
+                )
+            )
+        ),
+    )
+
+
 def _is_goods_receipt_number_conflict(exc: IntegrityError) -> bool:
     diagnostic = getattr(exc.orig, "diag", None)
     return getattr(diagnostic, "constraint_name", None) in _GR_NUMBER_CONSTRAINTS
 
 
-def _handle_goods_receipt_integrity_error(
-    db: Session, exc: IntegrityError
-) -> None:
+def _handle_goods_receipt_integrity_error(db: Session, exc: IntegrityError) -> None:
     db.rollback()
     if _is_goods_receipt_number_conflict(exc):
         raise HTTPException(
@@ -112,18 +142,83 @@ def _load(db: Session, receipt_id: uuid.UUID) -> GoodsReceipt:
     dependencies=[Depends(get_current_user)],
 )
 def list_goods_receipts(
+    response: Response,
     db: Session = Depends(get_db),
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     po_id: uuid.UUID | None = None,
+    source_document_id: uuid.UUID | None = None,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    sort_by: Annotated[
+        str, Query(pattern="^(receipt_date|receipt_number|gr_number|created_at)$")
+    ] = "receipt_date",
+    sort_dir: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
+    # Retained for compatibility with older clients; GR confidence is not a filter.
+    status: Literal["all", "needs_verification", "verified"] = "all",
+    vendor_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    current_user: dict = Depends(get_current_user),
 ) -> list[GoodsReceipt]:
+    try:
+        owner_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    try:
+        from src.services.procurement_backfill_services import (
+            backfill_procurement_documents,
+        )
+
+        backfill_procurement_documents(db, owner_id)
+    except Exception:
+        db.rollback()
+    filters = [_owner_filter(owner_id, current_user)]
+    if po_id:
+        filters.append(GoodsReceipt.po_id == po_id)
+    if source_document_id:
+        filters.append(GoodsReceipt.source_document_id == source_document_id)
+    if search:
+        filters.append(GoodsReceipt.gr_number.ilike(f"%{search.strip()}%"))
+    if vendor_id:
+        filters.append(GoodsReceipt.vendor_id == vendor_id)
+    if date_from:
+        filters.append(GoodsReceipt.receipt_date >= date_from)
+    if date_to:
+        filters.append(GoodsReceipt.receipt_date <= date_to)
+    sort_column = (
+        GoodsReceipt.gr_number
+        if sort_by == "receipt_number"
+        else getattr(GoodsReceipt, sort_by)
+    )
+    sort_order = sort_column.asc() if sort_dir == "asc" else sort_column.desc()
+    total = db.scalar(select(func.count(GoodsReceipt.id)).where(*filters)) or 0
+    response.headers["X-Total-Count"] = str(total)
+    base_filters = [_owner_filter(owner_id, current_user)]
+    for extra in (
+        po_id and [GoodsReceipt.po_id == po_id] or [],
+        source_document_id
+        and [GoodsReceipt.source_document_id == source_document_id]
+        or [],
+        search and [GoodsReceipt.gr_number.ilike(f"%{search.strip()}%")] or [],
+        vendor_id and [GoodsReceipt.vendor_id == vendor_id] or [],
+        date_from and [GoodsReceipt.receipt_date >= date_from] or [],
+        date_to and [GoodsReceipt.receipt_date <= date_to] or [],
+    ):
+        base_filters.extend(extra)
+    response.headers["X-Status-Counts"] = __import__("json").dumps(
+        {
+            "all": db.scalar(select(func.count(GoodsReceipt.id)).where(*base_filters))
+            or 0
+        }
+    )
     query = (
         select(GoodsReceipt)
         .options(selectinload(GoodsReceipt.lines))
-        .order_by(GoodsReceipt.receipt_date.desc(), GoodsReceipt.id)
+        .where(*filters)
+        .order_by(sort_order, GoodsReceipt.id)
     )
-    if po_id:
-        query = query.where(GoodsReceipt.po_id == po_id)
     return list(db.scalars(query.offset((page - 1) * page_size).limit(page_size)).all())
 
 
@@ -133,9 +228,24 @@ def list_goods_receipts(
     dependencies=[Depends(get_current_user)],
 )
 def get_goods_receipt(
-    receipt_id: uuid.UUID, db: Session = Depends(get_db)
+    receipt_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> GoodsReceipt:
-    return _load(db, receipt_id)
+    try:
+        owner_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    receipt = db.scalar(
+        select(GoodsReceipt)
+        .options(selectinload(GoodsReceipt.lines))
+        .where(GoodsReceipt.id == receipt_id, _owner_filter(owner_id, current_user))
+    )
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Goods receipt not found")
+    return receipt
 
 
 @router.post(

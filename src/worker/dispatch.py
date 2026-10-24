@@ -14,7 +14,7 @@ def dispatch_document_processing(
     document_id: uuid.UUID,
     fallback,
 ) -> str:
-    """Queue processing on Celery when enabled, else run in-process."""
+    """Queue processing on Celery or use the same bounded retry fallback."""
     if os.getenv("USE_CELERY", "false").lower() == "true":
         try:
             from src.worker.tasks import process_document

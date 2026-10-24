@@ -104,6 +104,8 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "workflow_status": "received",
             "gl_code": None,
             "confidence": None,
+            "confidence_level": "low",
+                "overall_confidence_percent": 0,
             "can_resubmit": False,
             "status": "processing",
         }
@@ -111,6 +113,18 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
     query.offset.assert_called_once_with(20)
     query.limit.assert_called_once_with(10)
     assert db.query.call_count == 2
+
+
+def test_invoice_list_can_filter_by_purchase_order():
+    po_id = uuid.uuid4()
+    _, _, query, teardown = _setup_dashboard(total=0)
+    try:
+        response = client.get("/api/invoices", params={"po_id": str(po_id)})
+    finally:
+        teardown()
+
+    assert response.status_code == 200
+    assert any("invoices.po_id" in str(item) for item in query.filter.call_args.args)
 
 
 def test_invoice_list_accepts_verification_filters_and_sorting():
@@ -203,6 +217,7 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
         app.dependency_overrides.pop(get_current_user, None)
     assert response.status_code == 200
     assert response.json()["low_confidence_fields"] == ["invoice_no"]
+    assert response.json()["confidence_level"] == "low"
     assert response.json()["supporting_documents_count"] == 0
 
 

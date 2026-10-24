@@ -23,6 +23,7 @@ from src.models.email_models import EmailMessage, EmailPollState
 from src.models.notification_models import Notification
 from src.models.vendor_models import Vendor, VendorAlias
 from src.services.document_ingest_services import ingest_file
+from src.services.docx_validation_services import DOCX_MIME_TYPE, is_valid_docx
 from src.services.email_sender_services import is_automated_sender
 from src.services.vendor_resolution_services import normalize_vendor_name
 
@@ -893,7 +894,13 @@ def _safe_filename(filename: str, fallback_extension: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
     if not name:
         name = f"attachment{fallback_extension}"
-    if PurePath(name).suffix.lower() not in {".pdf", ".png", ".jpg", ".jpeg"}:
+    if PurePath(name).suffix.lower() not in {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".docx",
+    }:
         stem = PurePath(name).stem or "attachment"
         name = f"{stem}{fallback_extension}"
     return name[:180]
@@ -901,6 +908,13 @@ def _safe_filename(filename: str, fallback_extension: str) -> str:
 
 def _attachment_format(part: Message, payload: bytes) -> tuple[str, str] | None:
     content_type = part.get_content_type().casefold()
+    filename = part.get_filename() or "attachment"
+    if PurePath(PureWindowsPath(filename).name).suffix.casefold() == ".docx":
+        if content_type != DOCX_MIME_TYPE or not is_valid_docx(
+            filename, content_type, payload
+        ):
+            return None
+        return ".docx", filename
     if payload.startswith(b"\x89PNG\r\n\x1a\n"):
         extension = ".png"
     elif payload.startswith(b"\xff\xd8\xff"):
@@ -919,7 +933,7 @@ def _attachment_format(part: Message, payload: bytes) -> tuple[str, str] | None:
         "image/jpg" if extension == ".jpg" else expected_content_type,
     }:
         return None
-    filename = part.get_filename() or f"attachment{extension}"
+    filename = filename if part.get_filename() else f"attachment{extension}"
     suffix = PurePath(PureWindowsPath(filename).name).suffix.casefold()
     expected_extensions = {".jpg", ".jpeg"} if extension == ".jpg" else {extension}
     if suffix and suffix not in expected_extensions:

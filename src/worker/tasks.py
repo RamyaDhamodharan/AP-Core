@@ -8,16 +8,26 @@ from src.worker.celery_app import celery_app
 @celery_app.task(
     name="ap.process_document",
     bind=True,
-    autoretry_for=(ConnectionError, TimeoutError),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 3},
+    max_retries=3,
+    reject_on_worker_lost=False,
 )
 def process_document(self, document_id: str) -> None:
     """Parse, classify and extract one document (idempotent)."""
-    # Imported lazily so the worker boots without loading the web app.
-    from src.api.rest.routers.document_routers import _process_in_background
+    from src.services.document_retry_services import (
+        classify_document_failure,
+        process_document_attempt,
+        retry_delay_seconds,
+    )
 
-    _process_in_background(uuid.UUID(document_id))
+    try:
+        delay = process_document_attempt(uuid.UUID(document_id))
+    except Exception as exc:
+        if self.request.retries >= 3 or classify_document_failure(exc) != "retryable":
+            raise
+        delay = retry_delay_seconds(self.request.retries)
+        raise self.retry(exc=exc, countdown=delay, max_retries=3) from exc
+    if delay is not None:
+        raise self.retry(countdown=delay, max_retries=3)
 
 
 @celery_app.task(name="ap.recover_raw_email", bind=True, max_retries=0)
