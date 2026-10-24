@@ -89,7 +89,8 @@ def test_case_1_match_approved_to_ready_to_pay(monkeypatch):
     _api(db)
     try:
         response = client.post(
-            f"/api/invoices/{invoice.id}/review", json={"decision": "approved"}
+            f"/api/invoices/{invoice.id}/review",
+            json={"decision": "approved", "reason": "Review passed"},
         )
     finally:
         _teardown()

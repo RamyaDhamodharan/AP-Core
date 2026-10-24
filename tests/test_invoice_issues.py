@@ -205,7 +205,7 @@ def test_issue_override_does_not_bypass_saved_match_rules(monkeypatch):
     with pytest.raises(HTTPException) as blocked:
         invoice_routers.review_invoice(
             invoice.id,
-            InvoiceReviewRequest(decision="approved"),
+            InvoiceReviewRequest(decision="approved", reason="Review invoice"),
             db,
             {"sub": str(user_id), "role": "associate"},
         )
@@ -218,7 +218,9 @@ def test_issue_override_does_not_bypass_saved_match_rules(monkeypatch):
         invoice_routers.review_invoice(
             invoice.id,
             InvoiceReviewRequest(
-                decision="approved", override_reason="Business owner accepted risk"
+                decision="approved",
+                reason="Review invoice",
+                override_reason="Business owner accepted risk",
             ),
             db,
             {"sub": str(user_id), "role": "associate"},

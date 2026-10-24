@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from src.services.po_matching_services import (
     match_invoice_to_po,
     normalize_amount,
+    normalize_po_reference,
     normalize_value,
 )
 
@@ -29,6 +30,11 @@ def setup_db(po):
 
 def test_normalize_value():
     assert normalize_value("  ABC   Supplies ") == "abc supplies"
+
+
+def test_normalize_po_reference_ignores_prefix_and_numeric_zero_padding():
+    assert normalize_po_reference(" PO - 00123 ") == normalize_po_reference("123")
+    assert normalize_po_reference("po-ab-0007") == normalize_po_reference("AB7")
 
 
 def test_normalize_amount():

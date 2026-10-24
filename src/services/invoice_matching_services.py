@@ -27,16 +27,16 @@ from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.match_run_models import MatchRun
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.ap_decision_engine import evaluate_invoice
-from src.services.invoice_confidence_services import (
-    confidence_unavailable,
-    requires_verification,
-)
+from src.services.invoice_confidence_services import requires_verification
 from src.services.invoice_issue_services import sync_invoice_issues
 from src.services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
 )
-from src.services.po_matching_services import normalize_po_number
+from src.services.po_matching_services import (
+    normalize_po_number,
+    normalize_po_reference,
+)
 from src.services.runtime_config_services import (
     PO_SUGGESTION_WEIGHTS,
     SIMILARITY_HIGH,
@@ -369,7 +369,9 @@ def run_match_for_invoice(
         invoice.po_id = (
             uuid.UUID(matched_po_ids[0]) if len(matched_po_ids) == 1 else None
         )
-    has_po_number = bool(normalize_po_number(getattr(invoice, "po_number_raw", None)))
+    has_po_number = bool(
+        normalize_po_reference(getattr(invoice, "po_number_raw", None))
+    )
     invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
     requested_decision = getattr(invoice, "po_decision", None)
     suggestions = (
@@ -641,11 +643,27 @@ def run_match_for_invoice(
         else "match_issues"
     )
     confidence_needs_review = bool(decision["low_confidence_fields"])
-    confidence_missing = confidence_unavailable(
-        getattr(invoice, "field_confidence", None) or {}
-    )
     if confidence_needs_review:
         workflow_status = "verifying"
+    blocking_reasons = [
+        item
+        for item in decision["discrepancies"]
+        if item.get("severity") != "info"
+    ]
+    decision_reason = (
+        f"Waiting: PO {getattr(invoice, 'po_number_raw', '')} not found"
+        if decision_state == "waiting_for_po"
+        else "Waiting: choose a purchase order suggestion"
+        if decision_state == "awaiting_confirmation"
+        else "Waiting: invoice-only approval is required"
+        if decision_state == "invoice_only"
+        else (
+            f"{blocking_reasons[0].get('code')}: "
+            f"{blocking_reasons[0].get('message')}"
+        )
+        if blocking_reasons
+        else "Invoice match completed"
+    )
     if current_workflow_status not in {
         "paid",
         "rejected",
@@ -657,19 +675,7 @@ def run_match_for_invoice(
             invoice,
             workflow_status,
             changed_by=run_actor_id,
-            reason=(
-                "PO number is not in the received purchase orders"
-                if decision_state == "waiting_for_po"
-                else "A purchase order confirmation is required"
-                if decision_state == "awaiting_confirmation"
-                else "Invoice-only approval is required"
-                if decision_state == "invoice_only"
-                else "Confidence unavailable, please verify"
-                if confidence_missing
-                else "One or more extracted fields need verification"
-                if confidence_needs_review
-                else "Invoice match completed"
-            ),
+            reason=decision_reason,
         )
     new = {
         "match_status": invoice.match_status,
@@ -713,19 +719,7 @@ def run_match_for_invoice(
                 entity_id=invoice.id,
                 old_value={"status": old.get("status", "processing")},
                 new_value={"status": "needs_review", "actor": "system"},
-                reason=(
-                    "PO number is not in the received purchase orders"
-                    if decision_state == "waiting_for_po"
-                    else "A purchase order confirmation is required"
-                    if decision_state == "awaiting_confirmation"
-                    else "Invoice-only approval is required"
-                    if decision_state == "invoice_only"
-                    else "Confidence unavailable, please verify"
-                    if confidence_missing
-                    else "One or more extracted fields need verification"
-                    if confidence_needs_review
-                    else "Matching produced discrepancy records or missing evidence"
-                ),
+                reason=decision_reason,
                 message="Matching requires human review",
                 created_by=None,
             )

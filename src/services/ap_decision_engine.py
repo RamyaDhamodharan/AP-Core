@@ -13,14 +13,16 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from src.models.document_models import Document
 from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from src.models.invoice_match_models import InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
+from src.services.invoice_comparison_services import build_comparison_snapshot
 from src.services.invoice_confidence_services import overall_confidence_percent
 from src.services.invoice_number_services import find_duplicate_invoice
-from src.services.po_matching_services import normalize_po_number, normalize_value
+from src.services.po_matching_services import normalize_po_reference, normalize_value
 from src.services.runtime_config_services import (
     currency_conversion_enabled,
     invoice_only_requires_approval,
@@ -148,7 +150,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     issues = []
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
-    po_ref = normalize_po_number(po_number_raw)
+    po_ref = normalize_po_reference(po_number_raw)
     invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
     if po_ref and not invoice_only:
         po_rows = [
@@ -156,7 +158,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             for po in db.query(PurchaseOrder)
             .filter(PurchaseOrder.is_current.is_(True))
             .all()
-            if normalize_po_number(po.po_number) == po_ref
+            if normalize_po_reference(po.po_number) == po_ref
         ]
         confirmed_match = (
             db.query(PurchaseOrder)
@@ -237,12 +239,14 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
     received = {}
+    receipt_lines = []
     if receipts:
-        for grline in (
+        receipt_lines = (
             db.query(GoodsReceiptLine)
             .filter(GoodsReceiptLine.goods_receipt_id.in_([g.id for g in receipts]))
             .all()
-        ):
+        )
+        for grline in receipt_lines:
             received[grline.po_line_id] = received.get(
                 grline.po_line_id, Decimal(0)
             ) + _d(grline.accepted_qty)
@@ -253,6 +257,16 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         getattr(invoice, "vendor_tax_id_raw", None)
     )
     po_vendor = getattr(po, "vendor", None) if po is not None else None
+    if not invoice_vendor_id:
+        issues.append(
+            _issue(
+                "VENDOR_UNRESOLVED",
+                "Invoice vendor is not resolved to an active vendor record.",
+                getattr(invoice, "vendor_name_raw", None),
+                None,
+                action="Resolve the invoice vendor before payment.",
+            )
+        )
     vendor_matches = bool(
         po and invoice_vendor_id and invoice_vendor_id == po.vendor_id
     )
@@ -261,7 +275,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         and invoice_tax_id
         and normalize_vendor_tax_id(po_vendor.tax_id) == invoice_tax_id
     )
-    if po and not vendor_matches:
+    if po and invoice_vendor_id and not vendor_matches:
         issues.append(
             _issue(
                 "VENDOR_MISMATCH",
@@ -548,6 +562,26 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         if any(value == "medium" for value in confidence_levels.values())
         else "high"
     )
+    source_document = (
+        db.get(Document, invoice.source_document_id)
+        if getattr(invoice, "source_document_id", None)
+        else None
+    )
+    extracted = getattr(source_document, "extracted_json", None) or {}
+    payment_terms = (
+        extracted.get("payment_terms") if isinstance(extracted, dict) else None
+    )
+    comparison = build_comparison_snapshot(
+        invoice,
+        po,
+        receipts,
+        lines,
+        po_lines,
+        receipt_lines,
+        issues,
+        require_receipt=require_receipt,
+        invoice_payment_terms=payment_terms,
+    )
     blocking_issues = [item for item in issues if item.get("severity") != "info"]
     outcome = "ready_to_pay" if not blocking_issues else "needs_review"
     if invoice_only and not blocking_issues and invoice_only_requires_approval():
@@ -570,6 +604,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         "confidence_levels": confidence_levels,
         "low_confidence_fields": low_fields,
         "discrepancies": _json_safe(issues),
+        "comparison": _json_safe(comparison),
         "inputs_summary": {
             "invoice_id": str(invoice.id),
             "po_number": po_number_raw,

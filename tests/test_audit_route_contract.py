@@ -43,6 +43,7 @@ ROUTE_AUDIT_TESTS = {
     "invoice_routers.py:escalate_invoice": "test_invoice_lifecycle.py",
     "invoice_routers.py:reassign_invoice": "test_invoice_lifecycle.py",
     "invoice_routers.py:run_invoice_match": "test_invoice_matching_services.py",
+    "invoice_routers.py:rerun_invoice_flow_admin": "test_invoice_matching_services.py",
     "invoice_routers.py:update_invoice": "test_invoice_verification.py",
     "invoice_routers.py:confirm_invoice_po": "test_invoice_lifecycle.py",
     "issue_routers.py:comment_issue": "test_invoice_issues.py",

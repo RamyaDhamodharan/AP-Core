@@ -87,7 +87,7 @@ def test_associate_can_reach_approval_validation():
     with pytest.raises(HTTPException) as error:
         review_invoice(
             invoice.id,
-            InvoiceReviewRequest(decision="approved"),
+            InvoiceReviewRequest(decision="approved", reason="Review invoice"),
             db,
             {"sub": str(uuid.uuid4()), "role": "associate"},
         )

@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from src.api.rest.routers.invoice_routers import rerun_invoice_flow_admin
 from src.models.audit_models import AuditLog
 from src.models.match_run_models import MatchRun
 from src.services import invoice_matching_services as matching
@@ -339,3 +340,30 @@ def test_rematch_preserves_paid_invoice(monkeypatch):
     matching.run_match_for_invoice(db, invoice_id, force=True)
     assert invoice.workflow_status == "paid"
     assert invoice.status == "paid"
+
+
+def test_admin_rerun_returns_new_invoice_status(monkeypatch):
+    invoice = SimpleNamespace(id=uuid.uuid4(), status="ready_to_pay")
+    run = SimpleNamespace(
+        id=uuid.uuid4(), result="match_ok", differences=[]
+    )
+    db = MagicMock()
+    query = db.query.return_value
+    query.filter.return_value.with_for_update.return_value.first.return_value = invoice
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.run_match_for_invoice",
+        lambda *_args, **_kwargs: run,
+    )
+    response = rerun_invoice_flow_admin(
+        invoice.id,
+        db,
+        {"sub": str(uuid.uuid4()), "role": "admin"},
+    )
+    assert response == {
+        "invoice_id": str(invoice.id),
+        "status": "ready_to_pay",
+        "match_run_id": str(run.id),
+        "result": "match_ok",
+        "differences": [],
+    }
+    db.commit.assert_called_once()

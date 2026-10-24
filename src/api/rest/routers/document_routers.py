@@ -79,19 +79,11 @@ from ....services.document_retry_services import (
 )
 from ....services.document_workflow_services import refresh_related_workflows
 from ....services.email_sender_services import may_send_automatic_reply
-from ....services.invoice_confidence_services import (
-    confidence_unavailable,
-    normalize_invoice_confidence,
-    requires_verification,
-)
+from ....services.invoice_confidence_services import normalize_invoice_confidence
 from ....services.invoice_matching_services import run_match_for_invoice
 from ....services.invoice_number_services import (
     find_duplicate_invoice,
     normalize_invoice_no,
-)
-from ....services.invoice_state_services import (
-    legacy_workflow_status,
-    transition_invoice,
 )
 from ....services.llm_pipeline_services import (
     _to_decimal,
@@ -101,7 +93,7 @@ from ....services.llm_pipeline_services import (
     is_e2e_stub_enabled,
     validate_extracted_data,
 )
-from ....services.po_matching_services import normalize_po_number
+from ....services.po_matching_services import normalize_po_reference
 from ....services.vendor_resolution_services import (
     find_active_alias_conflict,
     find_canonical_name_conflict,
@@ -1567,8 +1559,8 @@ def _save_goods_receipt_from_extraction(
         po_candidates = (
             [selected_po]
             if selected_po is not None
-            and normalize_po_number(selected_po.po_number)
-            == normalize_po_number(po_number)
+            and normalize_po_reference(selected_po.po_number)
+            == normalize_po_reference(po_number)
             else []
         )
     else:
@@ -1577,8 +1569,8 @@ def _save_goods_receipt_from_extraction(
             for row in db.query(PurchaseOrder)
             .filter(PurchaseOrder.is_current.is_(True))
             .all()
-            if normalize_po_number(getattr(row, "po_number", po_number))
-            == normalize_po_number(po_number)
+            if normalize_po_reference(getattr(row, "po_number", po_number))
+            == normalize_po_reference(po_number)
         ]
     po = po_candidates[0] if len(po_candidates) == 1 else None
     if po and vendor and po.vendor_id and po.vendor_id != vendor.id:
@@ -1715,7 +1707,7 @@ def _rematch_waiting_invoices_for_po(
     po: PurchaseOrder,
 ) -> int:
     """Rematch current invoices waiting for this purchase order."""
-    po_number = normalize_po_number(getattr(po, "po_number", None))
+    po_number = normalize_po_reference(getattr(po, "po_number", None))
     if not po_number:
         return 0
 
@@ -1726,9 +1718,9 @@ def _rematch_waiting_invoices_for_po(
     rematched = 0
 
     for invoice in invoices:
-        number_matches = normalize_po_number(invoice.po_number_raw) == po_number
+        number_matches = normalize_po_reference(invoice.po_number_raw) == po_number
         no_number_waiting = (
-            not normalize_po_number(invoice.po_number_raw)
+            not normalize_po_reference(invoice.po_number_raw)
             and getattr(invoice, "po_decision", None) == "waiting_for_po"
             and (
                 (invoice.vendor_id is not None and invoice.vendor_id == po.vendor_id)
@@ -1797,7 +1789,9 @@ def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
         referenced_po = str(
             data.get("order_number") or data.get("po_number") or ""
         ).strip()
-        if normalize_po_number(referenced_po) != normalize_po_number(po.po_number):
+        if normalize_po_reference(referenced_po) != normalize_po_reference(
+            po.po_number
+        ):
             continue
         vendor_name = str(data.get("vendor") or "").strip()
         vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
@@ -2652,27 +2646,9 @@ def parse_document(
                         db, saved_invoice, validation_issues
                     )
                     saved_invoice.status = "needs_review"
-                if saved_invoice is not None and requires_verification(
-                    getattr(saved_invoice, "field_confidence", None) or {}
-                ):
-                    if legacy_workflow_status(saved_invoice) != "verifying":
-                        transition_invoice(
-                            db,
-                            saved_invoice,
-                            "verifying",
-                            reason=(
-                                "Confidence unavailable, please verify"
-                                if confidence_unavailable(
-                                    getattr(saved_invoice, "field_confidence", None)
-                                    or {}
-                                )
-                                else (
-                                    "One or more extracted fields need associate "
-                                    "verification"
-                                )
-                            ),
-                        )
-                elif saved_invoice is not None:
+                if saved_invoice is not None:
+                    # Always save a match run and comparison snapshot. The decision
+                    # engine applies the confidence gate and records LOW_CONFIDENCE.
                     run_match_for_invoice(
                         db, saved_invoice.id, getattr(document, "created_by", None)
                     )

@@ -22,7 +22,7 @@ from sqlalchemy import Float, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from src.api.rest.dependencies import get_current_user
+from src.api.rest.dependencies import get_current_user, require_role
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
@@ -54,6 +54,7 @@ from src.schemas.invoice_schemas import (
 from src.services.document_workflow_services import (  # noqa: F401
     recommend_invoice_review,
 )
+from src.services.invoice_comparison_services import saved_comparison_checks
 from src.services.invoice_confidence_services import (
     confidence_level,
     confidence_threshold,
@@ -70,6 +71,7 @@ from src.services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
 )
+from src.services.runtime_config_services import require_goods_receipt
 from src.services.vendor_resolution_services import resolve_vendor
 from src.worker.dispatch import dispatch_queued_notifications
 
@@ -605,7 +607,7 @@ def list_invoices(
         le=100)]), match_status (InvoiceMatchStatus | None), status (InvoiceStatus |
         None), source (Literal["email", "upload"] | None), final_status
         (InvoiceFinalStatus | None), vendor_id (uuid.UUID | None), po_id (uuid.UUID |
-        None), invoice_date_from (date | None), ….
+        None), invoice_date_from (date | None), ...
     Output: InvoiceDashboardResponse.
     Effects: reads database rows.
     Results: statuses approved, rejected.
@@ -1030,97 +1032,22 @@ def get_invoice_detail(
                 .order_by(GoodsReceipt.receipt_date.desc().nullslast())
             ).all()
         )
-    outcome_codes = {
-        item.get("code")
-        for item in (saved_match_outcome or {}).get("discrepancies", [])
-        if isinstance(item, dict)
-    }
-    match_checks = [
-        {
-            "code": code,
-            "label": label,
-            "status": "fail" if code in outcome_codes else "pass",
-            "invoice_value": invoice_value,
-            "expected_value": expected_value,
-        }
-        for code, label, invoice_value, expected_value in (
-            (
-                "PO_NOT_RECEIVED",
-                "Purchase order",
-                invoice.po_number_raw,
-                linked_po.po_number if linked_po else None,
-            ),
-            (
-                "VENDOR_MISMATCH",
-                "Vendor",
-                invoice.vendor_id,
-                linked_po.vendor_id if linked_po else None,
-            ),
-            (
-                "MISSING_GR",
-                "Goods receipt",
-                len(linked_goods_receipts),
-                "At least one receipt",
-            ),
-            (
-                "LINE_NOT_ON_PO",
-                "Invoice lines",
-                len(invoice.line_items)
-                if hasattr(invoice, "line_items")
-                else len(
-                    db.query(InvoiceLine)
-                    .filter(InvoiceLine.invoice_id == invoice.id)
-                    .all()
-                ),
-                "All invoice lines matched",
-            ),
-            (
-                "QUANTITY_VARIANCE",
-                "Received quantity",
-                "Invoice quantities",
-                "Accepted receipt quantities",
-            ),
-            ("PRICE_VARIANCE", "Unit price", "Invoice prices", "PO prices within 2%"),
-            (
-                "LINE_TOTAL_VARIANCE",
-                "Line totals",
-                "Quantity × price",
-                "Invoice line totals",
-            ),
-            (
-                "TAX_VARIANCE",
-                "Tax",
-                invoice.tax_amount,
-                linked_po.tax_amount if linked_po else None,
-            ),
-            (
-                "HEADER_TOTAL_VARIANCE",
-                "Header total",
-                invoice.total_amount,
-                invoice.subtotal + invoice.tax_amount
-                if invoice.subtotal is not None and invoice.tax_amount is not None
-                else None,
-            ),
-            (
-                "CURRENCY_MISMATCH",
-                "Currency",
-                invoice.currency,
-                linked_po.currency if linked_po else None,
-            ),
-            (
-                "POSSIBLE_DUPLICATE",
-                "Duplicate invoice",
-                invoice.invoice_no,
-                "No matching invoice",
-            ),
-            (
-                "LOW_CONFIDENCE",
-                "Field confidence",
-                "Saved field levels",
-                "At least 85%",
-            ),
-        )
-    ]
+    invoice_lines = (
+        db.query(InvoiceLine)
+        .filter(InvoiceLine.invoice_id == invoice.id)
+        .order_by(InvoiceLine.id)
+        .all()
+    )
+    saved_comparison = (
+        (saved_run.rules_used or {}).get("match_outcome", {}).get("comparison", {})
+        if saved_run
+        else {}
+    )
+    match_review = saved_comparison.get("headers", [])
+    line_comparisons = saved_comparison.get("lines", [])
+    match_checks = saved_comparison_checks(
+        saved_comparison, saved_match_outcome, require_goods_receipt()
+    )
     return {
         "invoice_id": str(invoice.id),
         "match_run_id": str(saved_run.id) if saved_run else None,
@@ -1160,10 +1087,9 @@ def get_invoice_detail(
                 "unit_price": line.unit_price,
                 "amount": line.line_amount,
             }
-            for line in db.query(InvoiceLine)
-            .filter(InvoiceLine.invoice_id == invoice.id)
-            .all()
+            for line in invoice_lines
         ],
+        "match_review": match_review,
         "discrepancies": [
             {
                 "id": str(item.id),
@@ -1186,6 +1112,8 @@ def get_invoice_detail(
         ],
         "match_outcome": saved_match_outcome,
         "match_checks": match_checks,
+        "line_comparisons": line_comparisons,
+        "comparison_reason_codes": saved_comparison.get("reason_codes", []),
         "payment_status": "Paid" if getattr(invoice, "paid_at", None) else "Not paid",
         "linked_purchase_order": (
             {
@@ -1276,6 +1204,31 @@ def _review_invoice_or_404(db: Session, invoice_id: uuid.UUID, user: dict):
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return invoice, owner_id
+
+
+def _require_invoice_decision_role(user: dict) -> None:
+    if user.get("role") not in {"admin", "associate"}:
+        raise HTTPException(status_code=403, detail="Insufficient role")
+
+
+def _check_invoice_decision_snapshot(invoice, expected_run_id, expected_updated_at):
+    changed = (
+        "This invoice changed while you were reviewing it. "
+        "Refresh and review the latest data."
+    )
+    if expected_run_id is not None:
+        saved_run_id = getattr(invoice, "final_run_id", None)
+        if saved_run_id is None or saved_run_id != expected_run_id:
+            raise HTTPException(status_code=409, detail=changed)
+    if expected_updated_at is not None:
+        current = getattr(invoice, "updated_at", None)
+        if current is None:
+            raise HTTPException(status_code=409, detail=changed)
+        expected = expected_updated_at
+        current = current.replace(tzinfo=UTC) if current.tzinfo is None else current
+        expected = expected.replace(tzinfo=UTC) if expected.tzinfo is None else expected
+        if current.astimezone(UTC) != expected.astimezone(UTC):
+            raise HTTPException(status_code=409, detail=changed)
 
 
 @router.get("/{invoice_id:uuid}/match-candidates")
@@ -1583,8 +1536,10 @@ def approve_invoice_exception(
         ),
     }
     reason = str(payload.get("reason") or "").strip()
+    comment = str(payload.get("comment") or "").strip()
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required")
+    _require_invoice_decision_role(current_user)
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
     if (
         invoice.final_status
@@ -1612,7 +1567,10 @@ def approve_invoice_exception(
     if getattr(invoice, "vendor_id", None) is None:
         raise HTTPException(
             status_code=409,
-            detail="Resolve the invoice vendor before approving an exception.",
+            detail=(
+                "This invoice's vendor is unresolved. Resolve the vendor before "
+                "approving an exception."
+            ),
         )
     invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
     if invoice_only:
@@ -1631,16 +1589,10 @@ def approve_invoice_exception(
             expected_run_id = uuid.UUID(str(expected_run_id))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="Invalid match run ID") from exc
-        if saved_run is None or saved_run.id != expected_run_id:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "This invoice changed while you were reviewing it. "
-                    "Refresh and review the latest data."
-                ),
-            )
     expected_updated_at = payload.get("expected_updated_at")
-    if expected_updated_at is not None:
+    if expected_updated_at is not None and not isinstance(
+        expected_updated_at, datetime
+    ):
         try:
             expected_updated_at = datetime.fromisoformat(
                 str(expected_updated_at).replace("Z", "+00:00")
@@ -1649,15 +1601,7 @@ def approve_invoice_exception(
             raise HTTPException(
                 status_code=422, detail="Invalid invoice timestamp"
             ) from exc
-        current_updated_at = getattr(invoice, "updated_at", None)
-        if current_updated_at is not None and current_updated_at != expected_updated_at:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "This invoice changed while you were reviewing it. "
-                    "Refresh and review the latest data."
-                ),
-            )
+    _check_invoice_decision_snapshot(invoice, expected_run_id, expected_updated_at)
     discrepancies = (
         saved_outcome.get("discrepancies", [])
         if isinstance(saved_outcome, dict)
@@ -1722,6 +1666,10 @@ def approve_invoice_exception(
             new_value={
                 "status": "ready_to_pay",
                 "reason_codes": reason_codes,
+                "reason": reason,
+                "comment": comment or None,
+                "final_by": str(actor_id),
+                "final_at": invoice.final_at.isoformat(),
             },
             reason=reason,
             message="Approved with exception by reviewer",
@@ -1729,7 +1677,14 @@ def approve_invoice_exception(
         )
     )
     db.commit()
-    return {"invoice_id": str(invoice.id), "status": invoice.status, "reason": reason}
+    return {
+        "invoice_id": str(invoice.id),
+        "status": invoice.status,
+        "reason": reason,
+        "comment": comment or None,
+        "final_by": str(invoice.final_by),
+        "final_at": invoice.final_at.isoformat(),
+    }
 
 
 @router.get(
@@ -1758,7 +1713,7 @@ def list_invoice_review_queue(
         le=100)]), match_status (InvoiceMatchStatus | None), final_status
         (InvoiceFinalStatus | None), vendor_id (uuid.UUID | None), invoice_date_from
         (date | None), invoice_date_to (date | None), due_date (date | None),
-        due_date_from (date | None), ….
+        due_date_from (date | None), â€¦.
     Output: InvoiceDashboardResponse.
     Effects: reads database rows.
     Results: no workflow status or reason code directly.
@@ -1803,6 +1758,7 @@ def review_invoice(
         entries; may add invoice timeline entries.
     Results: statuses approved, on_hold, ready_to_pay, rejected.
     """
+    _require_invoice_decision_role(current_user)
     reviewer_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -1818,6 +1774,10 @@ def review_invoice(
             detail="Invoice not found",
         )
 
+    _check_invoice_decision_snapshot(
+        invoice, payload.expected_match_run_id, payload.expected_updated_at
+    )
+
     invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
     if (
         payload.decision == "approved"
@@ -1828,6 +1788,8 @@ def review_invoice(
             status_code=422,
             detail="A reason is required to approve invoice-only processing",
         )
+    if not (payload.reason or "").strip():
+        raise HTTPException(status_code=422, detail="A reason is required")
 
     open_issues = 0
     if payload.decision == "approved":
@@ -1898,12 +1860,6 @@ def review_invoice(
                 detail="Invoice cannot be approved until all matching rules pass",
             )
 
-    if (
-        payload.decision in {"rejected", "on_hold"}
-        and not (payload.reason or "").strip()
-    ):
-        raise HTTPException(status_code=422, detail="A reason is required")
-
     old_workflow_status = getattr(
         invoice, "workflow_status", None
     ) or legacy_workflow_status(invoice)
@@ -1945,6 +1901,7 @@ def review_invoice(
                 "final_by": str(reviewer_id),
                 "final_at": decided_at.isoformat(),
             },
+            reason=payload.reason or payload.comment,
             message=f"Invoice {payload.decision} by reviewer {reviewer_id}",
             result="success",
             created_by=reviewer_id,
@@ -1989,6 +1946,8 @@ def approve_invoice(
             comment=(payload or {}).get("comment"),
             reason=(payload or {}).get("reason"),
             override_reason=(payload or {}).get("override_reason"),
+            expected_match_run_id=(payload or {}).get("expected_match_run_id"),
+            expected_updated_at=(payload or {}).get("expected_updated_at"),
         ),
         db,
         current_user,
@@ -2011,7 +1970,12 @@ def reject_invoice(
     """
     return review_invoice(
         invoice_id,
-        InvoiceReviewRequest(decision="rejected", reason=payload.get("reason")),
+        InvoiceReviewRequest(
+            decision="rejected",
+            reason=payload.get("reason"),
+            expected_match_run_id=payload.get("expected_match_run_id"),
+            expected_updated_at=payload.get("expected_updated_at"),
+        ),
         db,
         current_user,
     )
@@ -2033,7 +1997,12 @@ def hold_invoice(
     """
     return review_invoice(
         invoice_id,
-        InvoiceReviewRequest(decision="on_hold", reason=payload.get("reason")),
+        InvoiceReviewRequest(
+            decision="on_hold",
+            reason=payload.get("reason"),
+            expected_match_run_id=payload.get("expected_match_run_id"),
+            expected_updated_at=payload.get("expected_updated_at"),
+        ),
         db,
         current_user,
     )
@@ -2773,6 +2742,39 @@ def run_invoice_match(
     return {
         "match_run_id": str(run.id),
         "run_no": run.run_no,
+        "result": run.result,
+        "differences": run.differences,
+    }
+
+
+@router.post("/admin/{invoice_id}/rerun-flow")
+def rerun_invoice_flow_admin(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Re-run matching from an invoice's saved extraction and return its status."""
+    invoice = (
+        db.query(Invoice)
+        .filter(Invoice.id == invoice_id)
+        .with_for_update()
+        .first()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    run = run_match_for_invoice(
+        db,
+        invoice.id,
+        uuid.UUID(str(current_user["sub"])),
+        force=True,
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "status": invoice.status,
+        "match_run_id": str(run.id),
         "result": run.result,
         "differences": run.differences,
     }

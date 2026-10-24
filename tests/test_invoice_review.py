@@ -62,7 +62,11 @@ def test_review_invoice_approves_and_audits_decision():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "approved", "reviewer_id": str(uuid.uuid4())},
+            json={
+                "decision": "approved",
+                "reason": "Review passed",
+                "reviewer_id": str(uuid.uuid4()),
+            },
         )
     finally:
         teardown()
@@ -137,7 +141,7 @@ def test_review_invoice_blocks_approval_with_match_issues():
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "approved"},
+            json={"decision": "approved", "reason": "Attempt approval"},
         )
     finally:
         teardown()
@@ -168,7 +172,7 @@ def test_review_invoice_blocks_critical_finding_even_if_match_status_is_ready(
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/review",
-            json={"decision": "approved"},
+            json={"decision": "approved", "reason": "Attempt approval"},
         )
     finally:
         teardown()
@@ -227,7 +231,7 @@ def test_review_invoice_rolls_back_decision_and_audit_on_commit_failure():
         with pytest.raises(RuntimeError, match="audit insert failed"):
             client.post(
                 f"/api/invoices/{invoice.id}/review",
-                json={"decision": "approved"},
+                json={"decision": "approved", "reason": "Review passed"},
             )
     finally:
         teardown()

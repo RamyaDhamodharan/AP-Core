@@ -269,6 +269,7 @@ def test_parse_document_success(monkeypatch):
     saved_invoice = SimpleNamespace(
         id=uuid.uuid4(), po_id=uuid.uuid4(), final_status=None
     )
+    matched_invoice_ids = []
     monkeypatch.setattr(
         document_routers,
         "_save_invoice_from_extraction",
@@ -277,6 +278,7 @@ def test_parse_document_success(monkeypatch):
 
     def auto_match(_db, invoice_id, user_id):
         assert invoice_id == saved_invoice.id
+        matched_invoice_ids.append(invoice_id)
         saved_invoice.workflow_status = "match_approved"
 
     monkeypatch.setattr(document_routers, "run_match_for_invoice", auto_match)
@@ -372,6 +374,7 @@ def test_parse_document_success(monkeypatch):
         "line_items": [],
     }
     assert saved_invoice.final_status is None
+    assert matched_invoice_ids == [saved_invoice.id]
 
 
 def test_invoice_persistence_defers_po_link_and_status_to_match_engine():

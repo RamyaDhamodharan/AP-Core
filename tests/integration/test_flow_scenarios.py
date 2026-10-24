@@ -9,6 +9,12 @@ from decimal import Decimal
 import pytest
 from fastapi import BackgroundTasks
 
+from src.api.rest.routers.invoice_routers import (
+    approve_invoice,
+    approve_invoice_exception,
+    hold_invoice,
+    reject_invoice,
+)
 from src.api.rest.routers.purchase_order_routers import amend_purchase_order
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
@@ -798,6 +804,161 @@ def test_suggestions_exclude_other_vendors_and_near_ties_have_no_best(
     assert near_results[0][1] == near_results[1][1]
     assert near_results[0][2]["best"] is False
     assert near_results[1][2]["best"] is False
+
+
+def _decision_fixture(action, db_session, db_factories):
+    from src.models.invoice_models import InvoiceLine
+
+    user, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
+    if action == "approve_exception":
+        line = db_session.query(InvoiceLine).filter_by(invoice_id=invoice.id).one()
+        line.unit_price = Decimal("103.00")
+        line.line_amount = Decimal("103.00")
+        invoice.subtotal = invoice.total_amount = Decimal("103.00")
+    run = run_match_for_invoice(db_session, invoice.id, user.id, force=True)
+    return user, invoice, run
+
+
+@pytest.mark.parametrize(
+    ("action", "endpoint"),
+    [
+        ("hold", hold_invoice),
+        ("reject", reject_invoice),
+        ("approve", approve_invoice),
+        ("approve_exception", approve_invoice_exception),
+    ],
+)
+def test_invoice_decision_succeeds_with_saved_snapshot(
+    action, endpoint, db_session, db_factories
+):
+    user, invoice, run = _decision_fixture(action, db_session, db_factories)
+    response = endpoint(
+        invoice.id,
+        {
+            "reason": "Reviewed against current evidence",
+            "expected_match_run_id": str(run.id),
+            "expected_updated_at": invoice.updated_at.isoformat(),
+        },
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert response.status in {"on_hold", "rejected", "ready_to_pay"}
+    assert invoice.final_by == user.id
+    assert invoice.final_at is not None
+    assert db_session.query(AuditLog).filter_by(entity_id=invoice.id).count() >= 1
+    assert (
+        db_session.query(InvoiceStateHistory)
+        .filter_by(invoice_id=invoice.id, reason="Reviewed against current evidence")
+        .count()
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "endpoint"),
+    [
+        ("hold", hold_invoice),
+        ("reject", reject_invoice),
+        ("approve", approve_invoice),
+        ("approve_exception", approve_invoice_exception),
+    ],
+)
+def test_invoice_decisions_reject_empty_reason(
+    action, endpoint, db_session, db_factories
+):
+    from fastapi import HTTPException
+
+    user, invoice, _run = _decision_fixture(action, db_session, db_factories)
+    with pytest.raises(HTTPException) as error:
+        endpoint(
+            invoice.id,
+            {"reason": "   "},
+            db_session,
+            {"sub": str(user.id), "role": "associate"},
+        )
+    assert error.value.status_code == 422
+    assert error.value.detail == "A reason is required"
+
+
+@pytest.mark.parametrize(
+    ("action", "endpoint"),
+    [
+        ("hold", hold_invoice),
+        ("reject", reject_invoice),
+        ("approve", approve_invoice),
+        ("approve_exception", approve_invoice_exception),
+    ],
+)
+def test_invoice_decisions_reject_stale_snapshot(
+    action, endpoint, db_session, db_factories
+):
+    from fastapi import HTTPException
+
+    user, invoice, _run = _decision_fixture(action, db_session, db_factories)
+    with pytest.raises(HTTPException) as error:
+        endpoint(
+            invoice.id,
+            {"reason": "Reviewed", "expected_match_run_id": str(uuid.uuid4())},
+            db_session,
+            {"sub": str(user.id), "role": "associate"},
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail.startswith(
+        "This invoice changed while you were reviewing it."
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "endpoint"),
+    [
+        ("hold", hold_invoice),
+        ("reject", reject_invoice),
+        ("approve", approve_invoice),
+        ("approve_exception", approve_invoice_exception),
+    ],
+)
+def test_invoice_decisions_reject_wrong_role(
+    action, endpoint, db_session, db_factories
+):
+    from fastapi import HTTPException
+
+    user, invoice, _run = _decision_fixture(action, db_session, db_factories)
+    with pytest.raises(HTTPException) as error:
+        endpoint(
+            invoice.id,
+            {"reason": "Reviewed"},
+            db_session,
+            {"sub": str(user.id), "role": "auditor"},
+        )
+    assert error.value.status_code == 403
+    assert error.value.detail == "Insufficient role"
+
+
+@pytest.mark.parametrize(
+    ("action", "endpoint"),
+    [
+        ("hold", hold_invoice),
+        ("reject", reject_invoice),
+        ("approve", approve_invoice),
+        ("approve_exception", approve_invoice_exception),
+    ],
+)
+def test_invoice_decisions_reject_second_decision(
+    action, endpoint, db_session, db_factories
+):
+    from fastapi import HTTPException
+
+    user, invoice, run = _decision_fixture(action, db_session, db_factories)
+    args = (
+        invoice.id,
+        {"reason": "Reviewed", "expected_match_run_id": str(run.id)},
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    endpoint(*args)
+    with pytest.raises(HTTPException) as error:
+        endpoint(*args)
+    assert error.value.status_code == 409
 
 
 def test_quantity_and_price_failures_reduce_suggestion_score(db_session, db_factories):

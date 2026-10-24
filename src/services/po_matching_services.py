@@ -40,6 +40,18 @@ def normalize_po_number(value: object) -> str:
     return re.sub(r"[\s\-\u2010-\u2015]+", "", str(value or "")).casefold()
 
 
+def normalize_po_reference(value: object) -> str:
+    """Normalize a PO reference, ignoring an optional PO prefix and zero padding."""
+    normalized = normalize_po_number(value)
+    if normalized.startswith("po"):
+        normalized = normalized[2:]
+    return re.sub(
+        r"\d+",
+        lambda match: str(int(match.group())) if match.group().strip("0") else "0",
+        normalized,
+    )
+
+
 def normalize_amount(value: object) -> Decimal | None:
     """
     Convert a monetary value to Decimal safely.

@@ -29,7 +29,7 @@ from src.schemas.purchase_order_schemas import (
     PurchaseOrderVendorReassignmentRequest,
 )
 from src.services.invoice_matching_services import run_match_for_invoice
-from src.services.po_matching_services import normalize_po_number
+from src.services.po_matching_services import normalize_po_reference
 
 router = APIRouter(
     prefix="/api/purchase-orders",
@@ -229,7 +229,7 @@ def reassign_purchase_order_vendor(
     )
     invoices = db.query(Invoice).filter(Invoice.is_current.is_(True)).all()
     for invoice in invoices:
-        if normalize_po_number(invoice.po_number_raw) != normalize_po_number(
+        if normalize_po_reference(invoice.po_number_raw) != normalize_po_reference(
             order.po_number
         ):
             continue
@@ -399,7 +399,7 @@ def amend_purchase_order(
         db.query(Invoice).filter(Invoice.is_current.is_(True)).with_for_update().all()
     )
     for invoice in invoices:
-        if normalize_po_number(invoice.po_number_raw) != normalize_po_number(
+        if normalize_po_reference(invoice.po_number_raw) != normalize_po_reference(
             order.po_number
         ):
             continue

@@ -60,6 +60,8 @@ class InvoiceReviewRequest(BaseModel):
     comment: str | None = None
     reason: str | None = None
     override_reason: str | None = None
+    expected_match_run_id: UUID | None = None
+    expected_updated_at: datetime | None = None
 
 
 class InvoiceReviewResponse(BaseModel):

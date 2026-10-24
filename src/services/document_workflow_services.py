@@ -34,7 +34,7 @@ from src.services.invoice_confidence_services import (
     requires_verification,
 )
 from src.services.invoice_number_services import normalize_invoice_no
-from src.services.po_matching_services import normalize_po_number, normalize_value
+from src.services.po_matching_services import normalize_po_reference, normalize_value
 from src.services.tolerance_config_services import (
     read_nonnegative_decimal,
     tolerance_fraction,
@@ -793,7 +793,8 @@ def evaluate_document_workflow(
         candidates = [
             po
             for po in candidates
-            if normalize_po_number(po.po_number) == normalize_po_number(po_number)
+            if normalize_po_reference(po.po_number)
+            == normalize_po_reference(po_number)
         ]
     else:
         candidates = [purchase_order] if purchase_order is not None else []
@@ -811,7 +812,8 @@ def evaluate_document_workflow(
         invoice_candidates = [
             row
             for row in invoice_candidates
-            if normalize_po_number(row.po_number_raw) == normalize_po_number(po_number)
+            if normalize_po_reference(row.po_number_raw)
+            == normalize_po_reference(po_number)
         ]
         invoice = invoice_candidates[0] if len(invoice_candidates) == 1 else None
         ambiguous = ambiguous or len(invoice_candidates) > 1
@@ -825,8 +827,8 @@ def evaluate_document_workflow(
             row
             for row in invoice_candidates
             if row.po_id == purchase_order.id
-            or normalize_po_number(row.po_number_raw)
-            == normalize_po_number(purchase_order.po_number)
+            or normalize_po_reference(row.po_number_raw)
+            == normalize_po_reference(purchase_order.po_number)
         ]
         invoice = invoice_candidates[0] if len(invoice_candidates) == 1 else None
         ambiguous = ambiguous or len(invoice_candidates) > 1
@@ -1597,8 +1599,8 @@ def recommend_invoice_review(
                     PurchaseOrder.is_current.is_(True),
                 )
                 .all()
-                if normalize_po_number(row.po_number)
-                == normalize_po_number(invoice.po_number_raw)
+                if normalize_po_reference(row.po_number)
+                == normalize_po_reference(invoice.po_number_raw)
             ]
         po = po_candidates[0] if len(po_candidates) == 1 else None
         receipts = (

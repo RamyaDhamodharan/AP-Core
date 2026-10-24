@@ -220,6 +220,136 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
     assert response.json()["low_confidence_fields"] == ["invoice_no"]
     assert response.json()["confidence_level"] == "low"
     assert response.json()["supporting_documents_count"] == 0
+    assert response.json()["subtotal"] is None
+    assert response.json()["tax_amount"] is None
+    assert response.json()["total_amount"] == 125.5
+    assert response.json()["match_review"] == []
+
+
+def test_invoice_detail_match_review_includes_po_and_receipt_comparisons():
+    owner_id = uuid.uuid4()
+    po_id = uuid.uuid4()
+    po_line_id = uuid.uuid4()
+    invoice_line = SimpleNamespace(
+        id=uuid.uuid4(),
+        item_code="SKU-1",
+        description="Widget",
+        qty=Decimal("2"),
+        unit_price=Decimal("2.05"),
+        line_amount=Decimal("4.10"),
+        po_line_id=po_line_id,
+    )
+    po_line = SimpleNamespace(
+        id=po_line_id,
+        item_code="SKU-1",
+        description="Widget",
+        qty=Decimal("3"),
+        unit_price=Decimal("2.00"),
+        line_amount=Decimal("6.00"),
+    )
+    receipt_line = SimpleNamespace(
+        po_line_id=po_line_id,
+        item_code="SKU-1",
+        description="Widget",
+        accepted_qty=Decimal("2"),
+        received_qty=Decimal("2"),
+        rejected_qty=Decimal("0"),
+    )
+    receipt = SimpleNamespace(
+        id=uuid.uuid4(),
+        gr_number="GR-1",
+        vendor_name="ABC Supplies Ltd",
+        source_document_id=None,
+        receipt_date=None,
+        needs_verification=False,
+        lines=[receipt_line],
+    )
+    po = SimpleNamespace(
+        id=po_id,
+        po_number="PO-1",
+        vendor_id=uuid.uuid4(),
+        vendor_name="ABC Supplies Ltd",
+        currency="USD",
+        po_date=None,
+        source_document_id=None,
+        needs_verification=False,
+        subtotal=Decimal("4.00"),
+        tax_amount=Decimal("0.00"),
+        total_amount=Decimal("4.00"),
+        lines=[po_line],
+    )
+    run_id = uuid.uuid4()
+    invoice = _invoice(
+        po_id=po_id,
+        vendor_id=po.vendor_id,
+        vendor_name_raw="ABC Supplies Ltd",
+        subtotal=Decimal("4.10"),
+        tax_amount=Decimal("0.00"),
+        total_amount=Decimal("4.10"),
+        po_number_raw="PO-1",
+        final_run_id=run_id,
+    )
+    invoice.line_items = [invoice_line]
+    detail_query = MagicMock()
+    detail_query.outerjoin.return_value.filter.return_value.first.return_value = (
+        invoice,
+        SimpleNamespace(extracted_json={}),
+    )
+    lines_query = MagicMock()
+    lines_query.filter.return_value.order_by.return_value.all.return_value = [
+        invoice_line
+    ]
+    discrepancies_query = MagicMock()
+    discrepancies_query.filter.return_value.order_by.return_value.all.return_value = []
+    supporting_documents_query = MagicMock()
+    supporting_documents_query.filter.return_value.scalar.return_value = 0
+    db = MagicMock()
+    db.query.side_effect = [
+        detail_query,
+        lines_query,
+        discrepancies_query,
+        supporting_documents_query,
+    ]
+    db.scalar.return_value = po
+    db.scalars.return_value.all.return_value = [receipt]
+    from src.services.invoice_comparison_services import build_comparison_snapshot
+
+    snapshot = build_comparison_snapshot(
+        invoice,
+        po,
+        [receipt],
+        [invoice_line],
+        [po_line],
+        [receipt_line],
+        [
+            {
+                "code": "HEADER_TOTAL_VARIANCE",
+                "difference": Decimal("0.10"),
+                "next_action": "Review the total.",
+            },
+            {"code": "PRICE_VARIANCE", "line_reference": "SKU-1"},
+        ],
+        require_receipt=True,
+    )
+    db.get.return_value = SimpleNamespace(
+        id=run_id,
+        rules_used={"match_outcome": {"comparison": snapshot, "discrepancies": []}},
+    )
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
+    try:
+        response = client.get(f"/api/invoices/{invoice.id}")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 200
+    rows = {item["field"]: item for item in response.json()["match_review"]}
+    assert rows["total_amount"]["po_value"] == "4.00"
+    assert rows["total_amount"]["difference"] == "0.10"
+    assert rows["total_amount"]["status"] == "mismatch"
+    assert response.json()["line_comparisons"][0]["quantity"]["gr_accepted"] == "2"
+    assert response.json()["line_comparisons"][0]["unit_price"]["po"] == "2.00"
 
 
 def test_invoice_list_applies_filters_and_search():

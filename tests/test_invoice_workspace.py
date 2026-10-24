@@ -54,7 +54,10 @@ def test_confirm_suggested_match_links_po_and_audits(monkeypatch):
         "src.services.invoice_matching_services.run_match_for_invoice", rerun
     )
     response = confirm_invoice_match(
-        invoice_id, {"po_id": str(po_id)}, db, {"sub": str(actor_id)}
+        invoice_id,
+        {"po_id": str(po_id)},
+        db,
+        {"sub": str(actor_id), "role": "associate"},
     )
 
     assert response["status"] == "ready_to_pay"
@@ -99,7 +102,7 @@ def test_approve_exception_cannot_bypass_matching_rules():
             invoice_id,
             {"reason": "Receipt is delayed; supplier confirmed delivery"},
             db,
-            {"sub": str(actor_id)},
+            {"sub": str(actor_id), "role": "associate"},
         )
     assert blocked.value.status_code == 409
     assert invoice.status == "needs_review"
@@ -143,9 +146,12 @@ def test_approve_exception_allows_total_mismatch_and_audits_reason():
 
     result = approve_invoice_exception(
         invoice_id,
-        {"reason": "Finance approved the documented total mismatch"},
+        {
+            "reason": "Finance approved the documented total mismatch",
+            "comment": "PO total was confirmed by Finance.",
+        },
         db,
-        {"sub": str(actor_id)},
+        {"sub": str(actor_id), "role": "associate"},
     )
 
     assert result["status"] == "ready_to_pay"
@@ -157,6 +163,12 @@ def test_approve_exception_allows_total_mismatch_and_audits_reason():
     assert audit.action == "invoice_exception_approved"
     assert audit.reason == "Finance approved the documented total mismatch"
     assert audit.new_value["reason_codes"] == ["HEADER_TOTAL_VARIANCE"]
+    assert audit.new_value["comment"] == "PO total was confirmed by Finance."
+    assert audit.new_value["final_by"] == str(actor_id)
+    assert audit.new_value["final_at"] == invoice.final_at.isoformat()
+    assert result["final_by"] == str(actor_id)
+    assert result["final_at"] == invoice.final_at.isoformat()
+    assert result["comment"] == "PO total was confirmed by Finance."
     db.commit.assert_called_once()
 
 
@@ -174,7 +186,10 @@ def test_approve_exception_allows_total_mismatch_and_audits_reason():
         (
             {"vendor_id": None},
             {"reason": "Vendor review"},
-            "Resolve the invoice vendor before approving an exception.",
+            (
+                "This invoice's vendor is unresolved. Resolve the vendor before "
+                "approving an exception."
+            ),
         ),
     ],
 )
@@ -185,7 +200,9 @@ def test_approve_exception_reports_current_state_conflicts(
     for key, value in invoice_kwargs.items():
         setattr(invoice, key, value)
     with pytest.raises(HTTPException) as blocked:
-        approve_invoice_exception(invoice_id, payload, db, {"sub": str(actor_id)})
+        approve_invoice_exception(
+            invoice_id, payload, db, {"sub": str(actor_id), "role": "associate"}
+        )
     assert blocked.value.status_code == 409
     assert blocked.value.detail == detail
 
@@ -200,7 +217,7 @@ def test_approve_exception_reports_stale_review_snapshot():
                 "expected_match_run_id": str(uuid.uuid4()),
             },
             db,
-            {"sub": str(actor_id)},
+            {"sub": str(actor_id), "role": "associate"},
         )
     assert blocked.value.status_code == 409
     assert blocked.value.detail == (
@@ -216,7 +233,7 @@ def test_approve_exception_reports_disallowed_reason_code():
             invoice_id,
             {"reason": "Business exception requested"},
             db,
-            {"sub": str(actor_id)},
+            {"sub": str(actor_id), "role": "associate"},
         )
     assert blocked.value.status_code == 409
     assert (
