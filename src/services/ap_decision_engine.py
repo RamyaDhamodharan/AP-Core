@@ -1,4 +1,4 @@
-﻿"""
+"""
 Deterministic, Decimal-only AP matching decision rules.
 Flow: invoice-to-PO and goods-receipt matching.
 Called by: src/services/invoice_matching_services.py.
