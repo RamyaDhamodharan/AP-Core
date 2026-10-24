@@ -209,10 +209,8 @@ def _auto_reject_unmatched_invoice(
                     created_by=None,
                 )
             )
-    except Exception as exc:
-        logger.warning(
-            "No-match email draft could not be created (%s)", type(exc).__name__
-        )
+    except Exception:
+        logger.warning("No-match email draft could not be created", exc_info=True)
 
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
@@ -925,11 +923,20 @@ def _save_invoice_from_extraction(
     if source_invoice is not None:
         if not source_invoice.is_current:
             return source_invoice
-        if not all(
-            getattr(source_invoice, field, None) == value
-            for field, value in invoice_values.items()
-            if field != "field_confidence"
-        ):
+        unchanged = True
+        for field, value in invoice_values.items():
+            if field == "field_confidence":
+                continue
+            existing_value = getattr(source_invoice, field, None)
+            if field == "invoice_no_normalized":
+                # Derived keys may be absent on legacy rows and lightweight fixtures.
+                existing_value = normalize_invoice_no(
+                    getattr(source_invoice, "invoice_no", None)
+                )
+            if existing_value != value:
+                unchanged = False
+                break
+        if not unchanged:
             raise ValueError(
                 "Invoice extraction differs from the previously saved record; "
                 "review required"
