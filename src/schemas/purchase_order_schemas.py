@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.schemas.vendor_schemas import VendorCreate
 
@@ -41,6 +41,8 @@ class PurchaseOrderResponse(BaseModel):
     delivery_details: Any | None = None
     field_confidence: dict[str, Any] | None = None
     needs_verification: bool = False
+    vendor_pending: bool = False
+    verification_status: str = "verified"
     created_at: datetime
     updated_at: datetime
     lines: list[PurchaseOrderLineResponse]
@@ -51,6 +53,7 @@ class PurchaseOrderListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+    counts: dict[str, int] = Field(default_factory=dict)
 
 
 class PurchaseOrderVendorResolutionRequest(BaseModel):

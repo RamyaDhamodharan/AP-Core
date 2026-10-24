@@ -57,6 +57,9 @@ class GoodsReceiptResponse(BaseModel):
     gr_number: str
     po_id: uuid.UUID | None
     vendor_id: uuid.UUID | None
+    vendor_name: str | None = None
+    vendor_pending: bool = False
+    verification_status: str = "verified"
     source_document_id: uuid.UUID | None
     receipt_date: date | None
     field_confidence: dict | None = None

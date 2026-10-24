@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.models.vendor_models import Base
+from src.models.vendor_models import Base, Vendor
 
 
 class GoodsReceipt(Base):
@@ -75,6 +75,23 @@ class GoodsReceipt(Base):
     lines: Mapped[list["GoodsReceiptLine"]] = relationship(
         back_populates="goods_receipt", cascade="all, delete-orphan", lazy="selectin"
     )
+    vendor: Mapped["Vendor | None"] = relationship("Vendor", lazy="joined")
+
+    @property
+    def vendor_name(self) -> str | None:
+        return self.vendor.name if self.vendor is not None else None
+
+    @property
+    def vendor_pending(self) -> bool:
+        return self.vendor_id is None
+
+    @property
+    def verification_status(self) -> str:
+        return (
+            "needs_verification"
+            if self.needs_verification or self.vendor_id is None
+            else "verified"
+        )
 
 
 class GoodsReceiptLine(Base):

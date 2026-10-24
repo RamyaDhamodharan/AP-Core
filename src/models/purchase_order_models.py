@@ -100,6 +100,18 @@ class PurchaseOrder(Base):
     vendor: Mapped[Vendor | None] = relationship(lazy="selectin")
 
     @property
+    def vendor_pending(self) -> bool:
+        return self.vendor_id is None
+
+    @property
+    def verification_status(self) -> str:
+        return (
+            "needs_verification"
+            if self.needs_verification or self.vendor_id is None
+            else "verified"
+        )
+
+    @property
     def vendor_name(self) -> str | None:
         return self.vendor.name if self.vendor is not None else None
 

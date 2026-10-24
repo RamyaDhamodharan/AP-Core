@@ -4,6 +4,7 @@ import logging
 import traceback
 import uuid
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.models.audit_models import AuditLog
@@ -14,6 +15,10 @@ from src.services.llm_pipeline_services import validate_extracted_data
 from src.services.vendor_resolution_services import resolve_vendor
 
 logger = logging.getLogger(__name__)
+
+
+def _same_number(column, value: str):
+    return func.lower(func.trim(column)) == value.strip().lower()
 
 
 def backfill_procurement_documents(
@@ -80,10 +85,39 @@ def backfill_procurement_documents(
                     .filter(PurchaseOrder.source_document_id == document.id)
                     .first()
                 )
+                if existing is None:
+                    existing = (
+                        db.query(PurchaseOrder)
+                        .filter(
+                            PurchaseOrder.source_document_id.is_(None),
+                            _same_number(PurchaseOrder.po_number, po_number),
+                        )
+                        .order_by(
+                            PurchaseOrder.created_at.asc(), PurchaseOrder.id.asc()
+                        )
+                        .first()
+                    )
+                    if existing is not None:
+                        existing.source_document_id = document.id
+                        existing.created_by = getattr(
+                            existing, "created_by", None
+                        ) or getattr(document, "created_by", None)
+                        existing.updated_by = getattr(document, "created_by", None)
+                        if (
+                            getattr(existing, "vendor_id", None) is None
+                            and vendor is not None
+                        ):
+                            existing.vendor_id = vendor.id
                 duplicate = _find_duplicate_purchase_order(
                     db, po_number, exclude_document_id=document.id
                 )
                 if existing is not None:
+                    existing.field_confidence = data.get("field_confidence") or getattr(
+                        existing, "field_confidence", None
+                    )
+                    existing.needs_verification = bool(validation_issues) or getattr(
+                        existing, "needs_verification", False
+                    )
                     summary["already_present"] += 1
                 elif duplicate is not None:
                     summary["duplicates"] += 1
@@ -118,7 +152,34 @@ def backfill_procurement_documents(
                     .filter(GoodsReceipt.source_document_id == document.id)
                     .first()
                 )
+                if existing is None:
+                    existing = (
+                        db.query(GoodsReceipt)
+                        .filter(
+                            GoodsReceipt.source_document_id.is_(None),
+                            _same_number(GoodsReceipt.gr_number, gr_number),
+                        )
+                        .order_by(GoodsReceipt.created_at.asc(), GoodsReceipt.id.asc())
+                        .first()
+                    )
+                    if existing is not None:
+                        existing.source_document_id = document.id
+                        existing.created_by = getattr(
+                            existing, "created_by", None
+                        ) or getattr(document, "created_by", None)
+                        existing.updated_by = getattr(document, "created_by", None)
+                        if (
+                            getattr(existing, "vendor_id", None) is None
+                            and vendor is not None
+                        ):
+                            existing.vendor_id = vendor.id
                 if existing is not None:
+                    existing.field_confidence = data.get("field_confidence") or getattr(
+                        existing, "field_confidence", None
+                    )
+                    existing.needs_verification = bool(validation_issues) or getattr(
+                        existing, "needs_verification", False
+                    )
                     summary["already_present"] += 1
                 else:
                     _save_goods_receipt_from_extraction(
