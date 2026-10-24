@@ -287,8 +287,9 @@ def test_invoice_timeline_contains_outbound_draft_events():
     )
 
     class Query:
-        def __init__(self, rows):
+        def __init__(self, rows, first=None):
             self.rows = rows
+            self.first_row = first
 
         def filter(self, *_args):
             return self
@@ -299,15 +300,23 @@ def test_invoice_timeline_contains_outbound_draft_events():
         def join(self, *_args):
             return self
 
+        def order_by(self, *_args):
+            return self
+
+        def first(self):
+            return self.first_row
+
         def all(self):
             return self.rows
 
+    invoice = SimpleNamespace(source_document_id=None, po_id=None)
     rows = {
         EmailDraftEvent: [event],
     }
     db = SimpleNamespace(
-        get=lambda *_args: SimpleNamespace(source_document_id=None),
-        query=lambda model: Query(rows.get(model, [])),
+        query=lambda model: Query(
+            rows.get(model, []), first=invoice if model.__name__ == "Invoice" else None
+        ),
     )
     timeline = invoice_timeline(invoice_id, db, {"sub": str(uuid.uuid4())})
     assert len(timeline) == 1
