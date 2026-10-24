@@ -9,6 +9,7 @@ Tables: audit_log, documents, goods_receipt_lines, goods_receipts,
 invoice_discrepancies, invoice_lines, invoices, match_runs, notifications, po_lines,
 purchase_orders, vendors.
 """
+
 import importlib
 import inspect
 import logging
@@ -100,7 +101,7 @@ from ....services.llm_pipeline_services import (
     is_e2e_stub_enabled,
     validate_extracted_data,
 )
-from ....services.runtime_config_services import no_match_auto_reject
+from ....services.po_matching_services import normalize_po_number
 from ....services.vendor_resolution_services import (
     find_active_alias_conflict,
     find_canonical_name_conflict,
@@ -182,56 +183,6 @@ def _record_pipeline_step(
             db.flush()
     except Exception as exc:
         logger.warning("Pipeline step audit write failed (%s)", type(exc).__name__)
-
-
-def _auto_reject_unmatched_invoice(
-    db, invoice: Invoice, document: Document | None
-) -> None:
-    """Reject a completed no-match and best-effort queue allowlisted email."""
-    if not no_match_auto_reject():
-        return
-    reason = "No purchase order / unknown vendor"
-    current = legacy_workflow_status(invoice)
-    if current in {"approved", "paid", "rejected"}:
-        return
-    if current not in {"no_match", "rejected"}:
-        transition_invoice(db, invoice, "no_match", changed_by=None, reason=reason)
-    transition_invoice(db, invoice, "rejected", changed_by=None, reason=reason)
-    db.add(
-        AuditLog(
-            action="invoice_no_match_rejected",
-            actor="system",
-            entity_type="invoice",
-            entity_id=invoice.id,
-            old_value={"workflow_status": current},
-            new_value={"workflow_status": "rejected", "reason": reason},
-            result="warning",
-            message=reason,
-            reason=reason,
-            created_by=None,
-        )
-    )
-    if document is None or not getattr(document, "email_sender", None):
-        return
-    try:
-        from src.services.email_draft_services import create_no_match_draft
-
-        with db.begin_nested():
-            draft = create_no_match_draft(db, invoice, document.email_sender)
-            db.add(
-                AuditLog(
-                    action="draft_created",
-                    actor="system",
-                    entity_type="email_draft",
-                    entity_id=draft.id,
-                    result="success",
-                    message="No-match reply draft created for associate review",
-                    reason=reason,
-                    created_by=None,
-                )
-            )
-    except Exception:
-        logger.warning("No-match email draft could not be created", exc_info=True)
 
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
@@ -1069,40 +1020,6 @@ def _save_invoice_from_extraction(
     tax_amount = _to_decimal(data.get("tax"))
     total_amount = _to_decimal(data.get("total"))
 
-    po = None
-    match_issues = []
-
-    if po_number:
-        po = (
-            db.query(PurchaseOrder)
-            .filter(
-                func.lower(func.trim(PurchaseOrder.po_number))
-                == _normalize_invoice_value(po_number),
-                PurchaseOrder.is_current.is_(True),
-            )
-            .first()
-        )
-
-    if not vendor:
-        match_status = "needs_vendor_review"
-    elif po is None:
-        match_status = "waiting_for_po"
-    else:
-        if po.vendor_id != vendor.id:
-            match_issues.append("Vendor does not match purchase order")
-
-        if not po.currency or not currency or po.currency.upper() != currency:
-            match_issues.append("Currency does not match purchase order")
-
-        if (
-            po.total_amount is None
-            or total_amount is None
-            or abs(po.total_amount - total_amount) > 0.01
-        ):
-            match_issues.append("Invoice total does not match purchase order")
-
-        match_status = "match_issues" if match_issues else "pending"
-
     invoice_values = {
         "invoice_no": invoice_no,
         "invoice_no_normalized": normalize_invoice_no(invoice_no),
@@ -1118,8 +1035,10 @@ def _save_invoice_from_extraction(
         "po_number_raw": po_number,
         "gl_code": str(data.get("gl_code") or "").strip()[:60] or None,
         "field_confidence": normalize_invoice_confidence(data),
-        "po_id": po.id if po else None,
-        "match_status": match_status,
+        # Only the decision engine may create an invoice-to-PO link or status.
+        "po_id": None,
+        "po_decision": None,
+        "match_status": "pending",
     }
 
     if source_invoice is not None:
@@ -1127,7 +1046,7 @@ def _save_invoice_from_extraction(
             return source_invoice
         unchanged = True
         for field, value in invoice_values.items():
-            if field == "field_confidence":
+            if field in {"field_confidence", "po_id", "match_status", "po_decision"}:
                 continue
             existing_value = getattr(source_invoice, field, None)
             if field == "invoice_no_normalized":
@@ -1246,7 +1165,7 @@ def _save_invoice_from_extraction(
 
     db.add(invoice)
     db.flush()
-    _replace_invoice_lines(db, invoice, data, po)
+    _replace_invoice_lines(db, invoice, data, None)
 
     return invoice
 
@@ -1648,19 +1567,19 @@ def _save_goods_receipt_from_extraction(
         po_candidates = (
             [selected_po]
             if selected_po is not None
-            and _normalize_invoice_value(selected_po.po_number)
-            == _normalize_invoice_value(po_number)
+            and normalize_po_number(selected_po.po_number)
+            == normalize_po_number(po_number)
             else []
         )
     else:
-        po_candidates = (
-            db.query(PurchaseOrder)
-            .filter(
-                func.lower(func.trim(PurchaseOrder.po_number)) == po_number.lower(),
-                PurchaseOrder.is_current.is_(True),
-            )
+        po_candidates = [
+            row
+            for row in db.query(PurchaseOrder)
+            .filter(PurchaseOrder.is_current.is_(True))
             .all()
-        )
+            if normalize_po_number(getattr(row, "po_number", po_number))
+            == normalize_po_number(po_number)
+        ]
     po = po_candidates[0] if len(po_candidates) == 1 else None
     if po and vendor and po.vendor_id and po.vendor_id != vendor.id:
         validation_issues = [*(validation_issues or []), "Vendor does not match PO"]
@@ -1796,23 +1715,33 @@ def _rematch_waiting_invoices_for_po(
     po: PurchaseOrder,
 ) -> int:
     """Rematch current invoices waiting for this purchase order."""
-    po_number = _normalize_invoice_value(getattr(po, "po_number", None))
+    po_number = normalize_po_number(getattr(po, "po_number", None))
     if not po_number:
         return 0
 
     invoices = (
-        db.query(Invoice)
-        .filter(
-            func.lower(func.trim(Invoice.po_number_raw)) == po_number,
-            Invoice.is_current.is_(True),
-        )
-        .with_for_update()
-        .all()
+        db.query(Invoice).filter(Invoice.is_current.is_(True)).with_for_update().all()
     )
 
     rematched = 0
 
     for invoice in invoices:
+        number_matches = normalize_po_number(invoice.po_number_raw) == po_number
+        no_number_waiting = (
+            not normalize_po_number(invoice.po_number_raw)
+            and getattr(invoice, "po_decision", None) == "waiting_for_po"
+            and (
+                (invoice.vendor_id is not None and invoice.vendor_id == po.vendor_id)
+                or (
+                    getattr(invoice, "vendor_tax_id_raw", None)
+                    and po.vendor is not None
+                    and str(invoice.vendor_tax_id_raw).strip().casefold()
+                    == str(po.vendor.tax_id or "").strip().casefold()
+                )
+            )
+        )
+        if not number_matches and not no_number_waiting:
+            continue
         final_run_id = getattr(invoice, "final_run_id", None)
         prior_run = db.get(MatchRun, final_run_id) if final_run_id else None
         saved_outcome = (
@@ -1823,11 +1752,16 @@ def _rematch_waiting_invoices_for_po(
             for item in saved_outcome.get("discrepancies", [])
             if isinstance(item, dict)
         }
-        if invoice.match_status != "waiting_for_po" and not saved_codes.intersection(
-            {"MISSING_PO", "MISSING_GR"}
+        is_waiting = getattr(invoice, "po_decision", None) == "waiting_for_po"
+        has_related_issue = bool(
+            saved_codes.intersection({"PO_NOT_RECEIVED", "MISSING_PO", "MISSING_GR"})
+        )
+        if (
+            not is_waiting
+            and invoice.match_status != "waiting_for_po"
+            and not has_related_issue
         ):
             continue
-        invoice.po_id = po.id
         if getattr(invoice, "id", None):
             run_match_for_invoice(
                 db,
@@ -1863,9 +1797,7 @@ def _save_pending_goods_receipts_for_po(db: Session, po: PurchaseOrder) -> int:
         referenced_po = str(
             data.get("order_number") or data.get("po_number") or ""
         ).strip()
-        if _normalize_invoice_value(referenced_po) != _normalize_invoice_value(
-            po.po_number
-        ):
+        if normalize_po_number(referenced_po) != normalize_po_number(po.po_number):
             continue
         vendor_name = str(data.get("vendor") or "").strip()
         vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
@@ -1935,6 +1867,7 @@ def _save_purchase_order_from_extraction(
         # Invoice confidence gates apply to invoices only. Procurement records
         # remain usable for matching even when extracted confidence is low.
         existing.needs_verification = bool(validation_issues)
+        _rematch_waiting_invoices_for_po(db, existing)
         return existing
 
     purchase_order = PurchaseOrder(

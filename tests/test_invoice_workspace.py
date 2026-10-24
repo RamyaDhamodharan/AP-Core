@@ -14,46 +14,6 @@ from src.models.audit_models import AuditLog
 from src.models.invoice_match_models import InvoiceMatch
 from src.models.invoice_models import Invoice
 from src.models.purchase_order_models import PurchaseOrder
-from src.services.invoice_matching_services import _status_after_match
-
-
-def test_match_result_statuses_require_clean_po_and_receipt():
-    assert (
-        _status_after_match(
-            po_linked=True,
-            result="match_ok",
-            has_discrepancies=False,
-            missing_receipt=False,
-        )
-        == "ready_to_pay"
-    )
-    assert (
-        _status_after_match(
-            po_linked=False,
-            result="no_match",
-            has_discrepancies=True,
-            missing_receipt=False,
-        )
-        == "needs_review"
-    )
-    assert (
-        _status_after_match(
-            po_linked=True,
-            result="match_issues",
-            has_discrepancies=True,
-            missing_receipt=False,
-        )
-        == "needs_review"
-    )
-    assert (
-        _status_after_match(
-            po_linked=True,
-            result="match_ok",
-            has_discrepancies=False,
-            missing_receipt=True,
-        )
-        == "needs_review"
-    )
 
 
 def test_confirm_suggested_match_links_po_and_audits(monkeypatch):
@@ -66,6 +26,7 @@ def test_confirm_suggested_match_links_po_and_audits(monkeypatch):
         match_status="no_match",
         po_id=None,
         po_number_raw=None,
+        po_decision="awaiting_confirmation",
     )
     po = SimpleNamespace(id=po_id, po_number="PO-2026-0001")
     candidate = SimpleNamespace(po_id=po_id, status="suggested", confirmed_by=None)
@@ -84,6 +45,8 @@ def test_confirm_suggested_match_links_po_and_audits(monkeypatch):
     }[model]
 
     def rerun(_db, _invoice_id, _actor_id, **_kwargs):
+        assert invoice.po_id is None
+        invoice.po_id = po.id
         invoice.status = "ready_to_pay"
         return SimpleNamespace(id=uuid.uuid4())
 
@@ -275,6 +238,11 @@ def test_admin_can_set_active_vendor_through_invoice_patch_and_matching_runs(
         invoice_no_normalized="INV1",
         updated_by=None,
         source_document_id=None,
+        status="processing",
+        match_status="pending",
+        final_status=None,
+        workflow_status="received",
+        po_decision=None,
     )
     vendor = SimpleNamespace(id=vendor_id, is_active=True)
     query = MagicMock()

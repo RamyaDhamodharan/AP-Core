@@ -6,6 +6,7 @@ Calls: audit_models, dependencies, document_models, procurement_backfill_service
 purchase_order_models.
 Tables: audit_log, documents, purchase_orders, vendors.
 """
+
 import uuid
 from datetime import date
 from typing import Annotated, Literal
@@ -28,7 +29,7 @@ from src.schemas.purchase_order_schemas import (
     PurchaseOrderVendorReassignmentRequest,
 )
 from src.services.invoice_matching_services import run_match_for_invoice
-from src.services.po_matching_services import normalize_value
+from src.services.po_matching_services import normalize_po_number
 
 router = APIRouter(
     prefix="/api/purchase-orders",
@@ -226,6 +227,20 @@ def reassign_purchase_order_vendor(
             updated_by=owner_id,
         )
     )
+    invoices = db.query(Invoice).filter(Invoice.is_current.is_(True)).all()
+    for invoice in invoices:
+        if normalize_po_number(invoice.po_number_raw) != normalize_po_number(
+            order.po_number
+        ):
+            continue
+        run_match_for_invoice(
+            db,
+            invoice.id,
+            owner_id,
+            force=True,
+            idempotent=True,
+            trigger="po_vendor_reassigned",
+        )
     db.commit()
     return db.scalar(
         _query().where(
@@ -384,7 +399,9 @@ def amend_purchase_order(
         db.query(Invoice).filter(Invoice.is_current.is_(True)).with_for_update().all()
     )
     for invoice in invoices:
-        if normalize_value(invoice.po_number_raw) != normalize_value(order.po_number):
+        if normalize_po_number(invoice.po_number_raw) != normalize_po_number(
+            order.po_number
+        ):
             continue
         run_match_for_invoice(
             db,

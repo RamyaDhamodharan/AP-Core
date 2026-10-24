@@ -6,6 +6,7 @@ src/api/rest/routers/audit_routers.py.
 Calls: invoice_number_services, vendor_models.
 Tables: invoices.
 """
+
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -40,6 +41,7 @@ class Invoice(Base):
         verifying, waiting_for_po.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     __tablename__ = "invoices"
     __table_args__ = (
         Index("ix_invoices_due_date", "due_date"),
@@ -78,6 +80,7 @@ class Invoice(Base):
         ENUM(
             "processing",
             "needs_review",
+            "needs_approval",
             "ready_to_pay",
             "on_hold",
             "rejected",
@@ -124,6 +127,7 @@ class Invoice(Base):
         UUID(as_uuid=True),
         ForeignKey("purchase_orders.id"),
     )
+    po_decision: Mapped[str | None] = mapped_column(String(32))
     match_status: Mapped[str] = mapped_column(
         ENUM(
             "pending",
@@ -158,6 +162,7 @@ class Invoice(Base):
             "match_approved",
             "match_issues",
             "no_match",
+            "needs_approval",
             "approved",
             "rejected",
             "on_hold",
@@ -213,6 +218,7 @@ class InvoiceLine(Base):
     Status values: this table has no status enum.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     __tablename__ = "invoice_lines"
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -5,6 +5,7 @@ Called by: src/api/rest/routers/invoice_routers.py.
 Calls: standard-library or framework helpers.
 Tables: no database tables directly.
 """
+
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -21,7 +22,12 @@ InvoiceMatchStatus = Literal[
     "no_match",
 ]
 InvoiceStatus = Literal[
-    "processing", "needs_review", "ready_to_pay", "on_hold", "rejected"
+    "processing",
+    "needs_review",
+    "needs_approval",
+    "ready_to_pay",
+    "on_hold",
+    "rejected",
 ]
 InvoiceFinalStatus = Literal["approved", "rejected", "on_hold"]
 InvoiceWorkflowStatus = Literal[
@@ -32,6 +38,7 @@ InvoiceWorkflowStatus = Literal[
     "match_approved",
     "match_issues",
     "no_match",
+    "needs_approval",
     "approved",
     "rejected",
     "on_hold",
@@ -48,6 +55,7 @@ class InvoiceReviewRequest(BaseModel):
     Fields: decision, comment, reason, override_reason.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     decision: InvoiceFinalStatus
     comment: str | None = None
     reason: str | None = None
@@ -60,10 +68,12 @@ class InvoiceReviewResponse(BaseModel):
     Fields: invoice_id, final_status, final_by, final_at.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     invoice_id: UUID
     final_status: InvoiceFinalStatus
     final_by: UUID
     final_at: datetime
+    status: str
 
 
 class InvoiceDashboardItem(BaseModel):
@@ -74,6 +84,7 @@ class InvoiceDashboardItem(BaseModel):
         total_amount, and more
     Use: shared persistence or validation contract for this flow stage.
     """
+
     invoice_id: UUID
     source_document_id: UUID | None = None
     received_at: datetime | None = None
@@ -88,6 +99,9 @@ class InvoiceDashboardItem(BaseModel):
     total_amount: Decimal | None
     currency: str | None
     match_status: InvoiceMatchStatus
+    po_decision: (
+        Literal["awaiting_confirmation", "waiting_for_po", "invoice_only"] | None
+    ) = None
     final_status: InvoiceFinalStatus | None
     workflow_status: InvoiceWorkflowStatus = "received"
     gl_code: str | None = None
@@ -106,6 +120,7 @@ class InvoiceDashboardResponse(BaseModel):
     Fields: items, total, page, page_size.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     items: list[InvoiceDashboardItem]
     total: int
     page: int

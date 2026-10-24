@@ -5,10 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
-from src.models.email_draft_models import EmailDraft
-from src.models.invoice_state_history_models import InvoiceStateHistory
+from src.models.audit_models import AuditLog
 from src.models.match_run_models import MatchRun
 from src.services import invoice_matching_services as matching
 
@@ -32,9 +29,11 @@ def test_pipeline_match_sets_match_approved_without_admin_decision(monkeypatch):
         match_status="pending",
         final_status=None,
         final_run_id=None,
+        po_decision=None,
         final_by=None,
         final_at=None,
         invoice_no="INV-1",
+        po_number_raw="PO-1",
         workflow_status="matching",
         status="processing",
         field_confidence={
@@ -102,9 +101,24 @@ def test_pipeline_match_sets_match_approved_without_admin_decision(monkeypatch):
 
 
 def test_dependency_match_rerun_is_idempotent_when_inputs_are_unchanged(monkeypatch):
-    invoice = SimpleNamespace(id=uuid.uuid4())
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        po_id=None,
+        po_number_raw=None,
+        po_decision=None,
+        status="needs_review",
+        workflow_status="match_issues",
+        match_status="needs_po_confirmation",
+        final_status=None,
+        final_run_id=None,
+        field_confidence={},
+    )
+    expected_inputs = {
+        "po_decision": "awaiting_confirmation",
+        "po_suggestions": [],
+    }
     state_fingerprint = hashlib.sha256(
-        json.dumps({}, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(expected_inputs, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     previous = SimpleNamespace(
         rules_used={"state_fingerprint": state_fingerprint},
@@ -116,8 +130,14 @@ def test_dependency_match_rerun_is_idempotent_when_inputs_are_unchanged(monkeypa
     monkeypatch.setattr(
         matching,
         "evaluate_invoice",
-        lambda *_args, **_kwargs: {"inputs_summary": {}},
+        lambda *_args, **_kwargs: {
+            "inputs_summary": {},
+            "discrepancies": [],
+            "outcome": "needs_review",
+            "low_confidence_fields": [],
+        },
     )
+    monkeypatch.setattr(matching, "_suggested_purchase_orders", lambda *_: [])
 
     result = matching.run_match_for_invoice(
         db,
@@ -185,75 +205,38 @@ def _no_match_fixture(monkeypatch, *, candidates=None, source="upload"):
     monkeypatch.setattr(
         matching, "_suggested_purchase_orders", lambda *_: candidates or []
     )
+    monkeypatch.setattr(
+        matching,
+        "evaluate_invoice",
+        lambda *_args, **_kwargs: {
+            "rule_set_version": "ap-match-v1",
+            "outcome": "needs_review",
+            "discrepancies": [
+                {
+                    "code": "PO_CONFIRMATION_REQUIRED",
+                    "message": "Select a suggested PO or wait.",
+                    "severity": "info",
+                }
+            ],
+            "low_confidence_fields": [],
+            "inputs_summary": {},
+        },
+    )
     return db, invoice, document, invoice_id
 
 
-def test_completed_no_match_stays_in_review_without_auto_reject_or_draft(
+def test_no_number_invoice_waits_for_human_po_decision_without_auto_reject(
     monkeypatch,
 ):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
-    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
-
-    run = matching.run_match_for_invoice(db, invoice_id)
-
-    assert run.result == "no_match"
-    assert invoice.workflow_status == "no_match"
-    assert invoice.status == "needs_review"
-    added = [call.args[0] for call in db.add.call_args_list]
-    assert not any(isinstance(row, EmailDraft) for row in added)
-
-
-@pytest.mark.parametrize(
-    ("setting", "expected_status"),
-    [("true", "rejected"), ("false", "needs_review")],
-)
-def test_no_match_flag_controls_automatic_rejection(
-    monkeypatch, setting, expected_status
-):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", setting)
-    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch)
-    run = matching.run_match_for_invoice(db, invoice_id)
-    assert run.result == "no_match"
-    assert invoice.status == expected_status
-
-
-def test_no_match_does_not_notify_with_empty_allowlist_or_when_flag_disabled(
-    monkeypatch,
-):
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "")
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
-    matching.run_match_for_invoice(db, invoice_id)
-    assert invoice.status == "needs_review"
-    assert not any(
-        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
-    )
-
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
     run = matching.run_match_for_invoice(db, invoice_id)
-    assert run.result == "no_match"
-    assert invoice.workflow_status == "no_match"
+    assert run.result == "match_issues"
+    assert invoice.po_decision == "awaiting_confirmation"
+    assert invoice.workflow_status == "match_issues"
     assert invoice.status == "needs_review"
-
-
-def test_upload_no_match_stays_in_review_without_sender_notification(monkeypatch):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
-    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="upload")
-
-    run = matching.run_match_for_invoice(db, invoice_id)
-
-    assert run.result == "no_match"
-    assert invoice.status == "needs_review"
-    assert not any(
-        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
-    )
 
 
 def test_missing_confidence_keeps_a_matched_invoice_in_verification(monkeypatch):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
         po_id=uuid.uuid4(),
@@ -278,20 +261,15 @@ def test_missing_confidence_keeps_a_matched_invoice_in_verification(monkeypatch)
     monkeypatch.setattr(matching, "_invoice_state_fingerprint", lambda *_: "verify")
     monkeypatch.setattr(matching, "sync_invoice_issues", lambda *_args, **_kwargs: [])
 
-    matching.run_match_for_invoice(db, invoice.id)
+    run = matching.run_match_for_invoice(db, invoice.id)
 
     assert invoice.workflow_status == "verifying"
     assert invoice.status == "needs_review"
-    assert any(
-        isinstance(call.args[0], InvoiceStateHistory)
-        and call.args[0].reason == "Confidence unavailable, please verify"
-        for call in db.add.call_args_list
-    )
+    assert any(item["code"] == "LOW_CONFIDENCE" for item in run.differences)
 
 
 def test_suggested_candidate_is_review_not_no_match(monkeypatch):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "true")
-    candidate = (SimpleNamespace(id=uuid.uuid4()), Decimal("80"))
+    candidate = (SimpleNamespace(id=uuid.uuid4()), Decimal("80"), {})
     db, invoice, _document, invoice_id = _no_match_fixture(
         monkeypatch, candidates=[candidate]
     )
@@ -301,44 +279,63 @@ def test_suggested_candidate_is_review_not_no_match(monkeypatch):
     assert run.result == "match_issues"
     assert invoice.workflow_status == "match_issues"
     assert invoice.status == "needs_review"
-    assert not any(
-        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
+    assert invoice.po_decision == "awaiting_confirmation"
+
+
+def test_po_decision_endpoint_returns_status_and_audits_choice(monkeypatch):
+    from src.api.rest.routers.invoice_routers import decide_invoice_po_path
+
+    actor_id = uuid.uuid4()
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        owner_user_id=None,
+        created_by=actor_id,
+        status="needs_review",
+        match_status="needs_po_confirmation",
+        po_decision="awaiting_confirmation",
+        po_id=None,
+        po_number_raw=None,
     )
+    query = MagicMock()
+    locked_query = query.outerjoin.return_value.filter.return_value
+    locked_query = locked_query.with_for_update.return_value
+    locked_query.first.return_value = invoice
+    db = MagicMock()
+    db.query.return_value = query
+    match_run = SimpleNamespace(id=uuid.uuid4())
 
+    def run_match(_db, invoice_id, _actor_id, **_kwargs):
+        assert invoice_id == invoice.id
+        invoice.status = "needs_review"
+        invoice.match_status = "waiting_for_po"
+        return match_run
 
-def test_new_match_invalidates_unpaid_approval_but_preserves_paid_invoice(monkeypatch):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    for workflow_status, legacy_status in (
-        ("approved", "needs_review"),
-        ("paid", "paid"),
-    ):
-        db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch)
-        invoice.workflow_status = workflow_status
-        invoice.status = legacy_status
-        monkeypatch.setattr(
-            matching, "_invoice_state_fingerprint", lambda *_: "new-state"
-        )
-
-        assert matching.run_match_for_invoice(db, invoice_id) is not None
-        if workflow_status == "approved":
-            assert invoice.workflow_status == "no_match"
-            assert invoice.status == "needs_review"
-            assert invoice.final_status is None
-        else:
-            assert invoice.workflow_status == workflow_status
-            assert invoice.status == legacy_status
-
-
-def test_no_match_does_not_create_draft_or_auto_reject(monkeypatch, caplog):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
-    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
-
-    run = matching.run_match_for_invoice(db, invoice_id)
-
-    assert run.result == "no_match"
-    assert invoice.workflow_status == "no_match"
-    assert invoice.status == "needs_review"
-    assert not any(
-        isinstance(call.args[0], EmailDraft) for call in db.add.call_args_list
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.run_match_for_invoice", run_match
     )
+    response = decide_invoice_po_path(
+        invoice.id,
+        {"decision": "wait_for_po"},
+        db,
+        {"sub": str(actor_id)},
+    )
+    assert response["status"] == "needs_review"
+    assert response["po_decision"] == "waiting_for_po"
+    audit = next(
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], AuditLog)
+    )
+    assert audit.action == "invoice_po_decision"
+    assert audit.new_value["status"] == "needs_review"
+    db.commit.assert_called_once()
+
+
+def test_rematch_preserves_paid_invoice(monkeypatch):
+    db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch)
+    invoice.workflow_status = "paid"
+    invoice.status = "paid"
+    monkeypatch.setattr(matching, "_invoice_state_fingerprint", lambda *_: "new-state")
+    matching.run_match_for_invoice(db, invoice_id, force=True)
+    assert invoice.workflow_status == "paid"
+    assert invoice.status == "paid"

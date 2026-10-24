@@ -10,7 +10,6 @@ from src.api.rest.routers.command_center_routers import command_center_bills
 from src.api.rest.routers.document_routers import _save_invoice_from_extraction
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
-from src.models.email_draft_models import EmailDraft
 from src.models.exchange_rate_models import ExchangeRate
 from src.models.follow_up_models import FollowUp
 from src.models.invoice_match_models import InvoiceDiscrepancy
@@ -41,7 +40,6 @@ def _high_confidence():
 def test_case_1_matching_invoice_po_and_receipt_auto_moves_to_ready_to_pay(
     db_session, db_factories, monkeypatch
 ):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "false")
     user = db_factories["associate"]()
     vendor = db_factories["vendor"]()
     po = db_factories["purchase_order"](
@@ -112,11 +110,9 @@ def test_case_1_matching_invoice_po_and_receipt_auto_moves_to_ready_to_pay(
     assert invoice.status == "ready_to_pay"
 
 
-def test_case_5_unknown_vendor_rejected_with_unsent_sender_draft(
-    db_session, db_factories, monkeypatch
+def test_case_5_unknown_vendor_waits_for_review_without_no_match_rejection(
+    db_session, db_factories
 ):
-    monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "")
     document = Document(
         original_filename="unknown-vendor.eml",
         file_hash=uuid.uuid4().hex + "a" * 32,
@@ -138,17 +134,13 @@ def test_case_5_unknown_vendor_rejected_with_unsent_sender_draft(
 
     run = invoice_matching_services.run_match_for_invoice(db_session, invoice.id)
 
-    draft = db_session.query(EmailDraft).filter_by(invoice_id=invoice.id).one()
-    assert run.result == "no_match"
-    assert invoice.workflow_status == "rejected"
-    assert invoice.final_status == "rejected"
-    assert draft.to_addresses == ["sender@example.test"]
-    assert draft.status == "draft"
-    assert draft.blocked_by_allowlist is True
-    queued_notifications = db_session.query(Notification).filter_by(
-        document_id=document.id
+    assert run.result == "match_issues"
+    assert invoice.workflow_status == "match_issues"
+    assert invoice.status == "needs_review"
+    assert invoice.final_status is None
+    assert (
+        db_session.query(Notification).filter_by(document_id=document.id).count() == 0
     )
-    assert queued_notifications.count() == 0
 
 
 def test_case_7_mark_overdue_creates_history_alert_and_follow_up(

@@ -342,8 +342,18 @@ def resolve_extracted_records_for_vendor(
     if rematch_ids:
         from src.services.invoice_matching_services import run_match_for_invoice
 
+        summary["invoice_statuses"] = []
         for invoice_id in rematch_ids:
             run_match_for_invoice(db, invoice_id, actor_id, force=True)
+            invoice = db.get(Invoice, invoice_id)
+            if invoice is not None:
+                summary["invoice_statuses"].append(
+                    {
+                        "invoice_id": str(invoice.id),
+                        "status": invoice.status,
+                        "po_decision": getattr(invoice, "po_decision", None),
+                    }
+                )
     db.add(
         AuditLog(
             action="unknown_vendor_records_resolved",

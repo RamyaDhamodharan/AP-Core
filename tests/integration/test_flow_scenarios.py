@@ -12,13 +12,17 @@ from fastapi import BackgroundTasks
 from src.api.rest.routers.purchase_order_routers import amend_purchase_order
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
+from src.models.invoice_match_models import InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.match_run_models import MatchRun
 from src.models.purchase_order_models import PurchaseOrderLine
 from src.schemas.purchase_order_schemas import PurchaseOrderAmendmentRequest
 from src.services import document_ingest_services
-from src.services.invoice_matching_services import run_match_for_invoice
+from src.services.invoice_matching_services import (
+    _suggested_purchase_orders,
+    run_match_for_invoice,
+)
 
 
 def _confidence(value=95):
@@ -110,7 +114,7 @@ def _case(db_session, factories, *, receipt=True):
 @pytest.mark.parametrize(
     ("scenario", "expected_code"),
     [
-        ("missing_po", "MISSING_PO"),
+        ("missing_po", "PO_NOT_RECEIVED"),
         ("ambiguous_po", "AMBIGUOUS_PO"),
         ("vendor_mismatch", "VENDOR_MISMATCH"),
         ("missing_gr", "MISSING_GR"),
@@ -127,15 +131,13 @@ def _case(db_session, factories, *, receipt=True):
 def test_saved_flow_scenario_reason_codes(
     scenario, expected_code, db_session, db_factories, monkeypatch
 ):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     _, vendor, po, _po_line, invoice = _case(
         db_session, db_factories, receipt=scenario != "missing_gr"
     )
     line = db_session.query(InvoiceLine).filter_by(invoice_id=invoice.id).one()
     if scenario == "missing_po":
         invoice.po_id = None
-        invoice.po_number_raw = None
-        invoice.vendor_id = None
+        invoice.po_number_raw = "PO-NOT-RECEIVED"
     elif scenario == "ambiguous_po":
         # Exercise PO-number ambiguity rather than an already confirmed PO ID.
         invoice.po_id = None
@@ -186,7 +188,7 @@ def test_saved_flow_scenario_reason_codes(
         db_session.query(InvoiceStateHistory).filter_by(invoice_id=invoice.id).count()
         >= 1
     )
-    assert invoice.status in {"needs_review", "rejected", "ready_to_pay"}
+    assert invoice.status in {"needs_review", "needs_approval", "ready_to_pay"}
     assert db_session.query(Invoice).filter_by(id=invoice.id).count() == 1
     assert not any(
         code in {"received", "reading", "matching"}
@@ -198,7 +200,6 @@ def test_saved_flow_scenario_reason_codes(
 def test_price_boundary_two_percent(
     db_session, db_factories, monkeypatch, price, has_issue
 ):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     _, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
     line = db_session.query(InvoiceLine).filter_by(invoice_id=invoice.id).one()
     line.unit_price = Decimal(price)
@@ -214,7 +215,6 @@ def test_price_boundary_two_percent(
 
 
 def test_reading_saved_match_is_stable(db_session, db_factories, monkeypatch):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     _, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
     run = run_match_for_invoice(db_session, invoice.id)
     db_session.flush()
@@ -295,17 +295,18 @@ def test_email_and_upload_intake_share_the_ingest_pipeline(
     assert email_document.email_sender == "ap-test@example.test"
 
 
-def test_confirmed_po_id_matches_without_raw_po_number(
+def test_unreferenced_po_id_does_not_auto_link_without_raw_po_number(
     db_session, db_factories, monkeypatch
 ):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
-    _, _vendor, po, _po_line, invoice = _case(db_session, db_factories)
+    _, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
     invoice.po_number_raw = None
     run = run_match_for_invoice(db_session, invoice.id, force=True)
     db_session.flush()
-    assert run.result == "match_ok"
-    assert invoice.po_id == po.id
-    assert not any(item["code"] == "MISSING_PO" for item in run.differences)
+    assert run.result == "match_issues"
+    assert invoice.po_id is None
+    assert invoice.status == "needs_review"
+    assert invoice.po_decision == "awaiting_confirmation"
+    assert "PO_CONFIRMATION_REQUIRED" in {item["code"] for item in run.differences}
 
 
 def test_unknown_vendor_added_then_invoice_is_ready_to_pay(
@@ -313,7 +314,6 @@ def test_unknown_vendor_added_then_invoice_is_ready_to_pay(
 ):
     from src.api.rest.routers.vendor_routers import resolve_extracted_records_for_vendor
 
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     user, vendor, _po, _po_line, invoice = _case(db_session, db_factories)
     invoice.vendor_id = None
     document = Document(
@@ -354,7 +354,6 @@ def test_edit_after_approval_rechecks_and_invalidates_approval(
     from src.api.rest.routers.invoice_routers import update_invoice
     from src.services.invoice_state_services import transition_invoice
 
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     user, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
     run_match_for_invoice(db_session, invoice.id)
     db_session.flush()
@@ -386,7 +385,6 @@ def test_edit_after_approval_rechecks_and_invalidates_approval(
 def test_po_amendment_versions_and_reruns_invoice_match(
     db_session, db_factories, monkeypatch
 ):
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     _user, _vendor, po, _po_line, invoice = _case(db_session, db_factories)
     first_run = run_match_for_invoice(db_session, invoice.id)
     db_session.flush()
@@ -445,7 +443,7 @@ def test_two_concurrent_edits_are_serialized_and_both_rematched(
     from sqlalchemy.orm import Session
 
     from src.api.rest.routers.invoice_routers import update_invoice
-    monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
+
     seed = Session(test_engine)
     user = db_user_factory(
         seed,
@@ -510,3 +508,307 @@ def test_two_concurrent_edits_are_serialized_and_both_rematched(
             .count()
             == 2
         )
+
+
+def test_numbered_po_match_is_saved_as_ready_to_pay(db_session, db_factories):
+    _, _, _, _, invoice = _case(db_session, db_factories)
+    run = run_match_for_invoice(db_session, invoice.id, force=True)
+    assert run.result == "match_ok"
+    assert invoice.status == "ready_to_pay"
+    assert invoice.po_id is not None
+    assert invoice.po_decision is None
+
+
+def test_missing_numbered_po_waits_until_po_and_gr_arrive(db_session, db_factories):
+    from src.api.rest.routers.document_routers import (
+        _save_goods_receipt_from_extraction,
+        _save_purchase_order_from_extraction,
+    )
+
+    user, vendor, _old_po, _old_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = "PO-LATE-100"
+    first = run_match_for_invoice(db_session, invoice.id, force=True)
+    assert invoice.po_decision == "waiting_for_po"
+    assert invoice.status == "needs_review"
+    assert any(row["code"] == "PO_NOT_RECEIVED" for row in first.differences)
+
+    po_document = Document(
+        original_filename="late-po.pdf",
+        file_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        status="extracted",
+        doc_type="po",
+        source="upload",
+        created_by=user.id,
+    )
+    db_session.add(po_document)
+    db_session.flush()
+    po = _save_purchase_order_from_extraction(
+        db_session,
+        po_document,
+        {
+            "po_number": "PO-LATE-100",
+            "currency": "USD",
+            "subtotal": "100.00",
+            "tax": "0.00",
+            "total": "100.00",
+            "line_items": [
+                {
+                    "item_code": "SKU-FLOW",
+                    "description": "Flow item",
+                    "uom": "EA",
+                    "qty": "1",
+                    "unit_price": "100.00",
+                    "line_amount": "100.00",
+                }
+            ],
+        },
+        vendor,
+    )
+    gr_document = Document(
+        original_filename="late-gr.pdf",
+        file_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        status="extracted",
+        doc_type="goods_receipt",
+        source="upload",
+        created_by=user.id,
+    )
+    db_session.add(gr_document)
+    db_session.flush()
+    _save_goods_receipt_from_extraction(
+        db_session,
+        gr_document,
+        {
+            "gr_number": "GR-LATE-100",
+            "order_number": "PO-LATE-100",
+            "line_items": [
+                {
+                    "item_code": "SKU-FLOW",
+                    "description": "Flow item",
+                    "received_qty": "1",
+                    "accepted_qty": "1",
+                    "rejected_qty": "0",
+                }
+            ],
+        },
+        vendor,
+        purchase_order_id=po.id,
+    )
+    db_session.flush()
+    assert invoice.status == "ready_to_pay"
+    assert invoice.po_id == po.id
+    assert invoice.po_decision is None
+    runs = db_session.query(MatchRun).filter_by(invoice_id=invoice.id).all()
+    assert len(runs) >= 3
+    assert runs[-1].rules_used["trigger"] == "dependency_arrived"
+
+
+def test_no_number_suggestions_are_scored_and_human_confirmed(db_session, db_factories):
+    from src.api.rest.routers.invoice_routers import confirm_invoice_match
+
+    user, _vendor, po, _po_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = None
+    run = run_match_for_invoice(db_session, invoice.id, force=True)
+    suggestions = (
+        db_session.query(InvoiceMatch)
+        .filter_by(invoice_id=invoice.id, status="suggested")
+        .all()
+    )
+    assert run.result == "match_issues"
+    assert invoice.po_decision == "awaiting_confirmation"
+    assert len(suggestions) == 1
+    assert suggestions[0].score == Decimal("100.00")
+    assert suggestions[0].score_details["components"] == {
+        "vendor": "30",
+        "item_identity": "30",
+        "quantity": "20",
+        "price": "20",
+    }
+    assert suggestions[0].score_details["lines_matched"] == "1 of 1"
+    assert suggestions[0].score_details["best"] is True
+    result = confirm_invoice_match(
+        invoice.id,
+        {"po_id": str(po.id)},
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert result["status"] == "ready_to_pay"
+    assert invoice.po_id == po.id
+    assert invoice.po_decision is None
+
+
+def test_rejecting_all_candidates_returns_to_po_decision_question(
+    db_session, db_factories
+):
+    from src.api.rest.routers.invoice_routers import reject_invoice_match
+
+    user, _vendor, po, _po_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = None
+    run_match_for_invoice(db_session, invoice.id, force=True)
+    result = reject_invoice_match(
+        invoice.id,
+        {"po_id": str(po.id), "reason": "Wrong candidate"},
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert result["status"] == "needs_review"
+    assert result["po_decision"] == "awaiting_confirmation"
+    assert result["candidates"] == []
+    assert (
+        db_session.query(AuditLog)
+        .filter_by(
+            entity_id=invoice.id,
+            action="invoice_po_confirmation_required",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_wait_for_po_reopens_suggestions_when_vendor_po_arrives(
+    db_session, db_factories
+):
+    from src.api.rest.routers.document_routers import _rematch_waiting_invoices_for_po
+    from src.api.rest.routers.invoice_routers import decide_invoice_po_path
+
+    user, vendor, _po, _po_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = None
+    result = decide_invoice_po_path(
+        invoice.id,
+        {"decision": "wait_for_po"},
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert result["status"] == "needs_review"
+    assert result["po_decision"] == "waiting_for_po"
+    assert (
+        db_session.query(InvoiceMatch)
+        .filter_by(invoice_id=invoice.id, status="suggested")
+        .count()
+        == 0
+    )
+    new_po = db_factories["purchase_order"](
+        vendor,
+        po_number=f"LATE-{uuid.uuid4()}",
+        currency="USD",
+        lines=[
+            {
+                "item_code": "SKU-FLOW",
+                "description": "Flow item",
+                "qty": Decimal("1"),
+                "unit_price": Decimal("100.00"),
+            }
+        ],
+    )
+    assert _rematch_waiting_invoices_for_po(db_session, new_po) == 1
+    assert invoice.po_decision == "awaiting_confirmation"
+    assert (
+        db_session.query(InvoiceMatch)
+        .filter_by(invoice_id=invoice.id, status="suggested")
+        .count()
+        == 2
+    )
+    assert (
+        db_session.query(AuditLog)
+        .filter_by(
+            entity_id=invoice.id,
+            action="invoice_po_decision_changed",
+        )
+        .count()
+        >= 1
+    )
+
+
+def test_invoice_only_needs_reasoned_approval(db_session, db_factories):
+    from fastapi import HTTPException
+
+    from src.api.rest.routers.invoice_routers import (
+        decide_invoice_po_path,
+        review_invoice,
+    )
+    from src.schemas.invoice_schemas import InvoiceReviewRequest
+
+    user, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
+    decision = decide_invoice_po_path(
+        invoice.id,
+        {"decision": "invoice_only"},
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert decision["status"] == "needs_approval"
+    assert decision["po_decision"] == "invoice_only"
+    with pytest.raises(HTTPException) as error:
+        review_invoice(
+            invoice.id,
+            InvoiceReviewRequest(decision="approved"),
+            db_session,
+            {"sub": str(user.id), "role": "associate"},
+        )
+    assert error.value.status_code == 422
+    approved = review_invoice(
+        invoice.id,
+        InvoiceReviewRequest(decision="approved", reason="No PO issued"),
+        db_session,
+        {"sub": str(user.id), "role": "associate"},
+    )
+    assert approved.status == "ready_to_pay"
+    assert invoice.final_status == "approved"
+
+
+def test_suggestions_exclude_other_vendors_and_near_ties_have_no_best(
+    db_session, db_factories
+):
+    user, vendor, po, _po_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = None
+    other_vendor = db_factories["vendor"]()
+    db_factories["purchase_order"](
+        other_vendor,
+        po_number=f"OTHER-{uuid.uuid4()}",
+        currency="USD",
+        lines=[
+            {
+                "item_code": "SKU-FLOW",
+                "description": "Flow item",
+                "qty": Decimal("1"),
+                "unit_price": Decimal("100.00"),
+            }
+        ],
+    )
+    results = _suggested_purchase_orders(db_session, invoice)
+    assert [row[0].id for row in results] == [po.id]
+    db_factories["purchase_order"](
+        vendor,
+        po_number=f"NEAR-{uuid.uuid4()}",
+        currency="USD",
+        lines=[
+            {
+                "item_code": "SKU-FLOW",
+                "description": "Flow item",
+                "qty": Decimal("1"),
+                "unit_price": Decimal("100.00"),
+            }
+        ],
+    )
+    near_results = _suggested_purchase_orders(db_session, invoice)
+    assert len(near_results) == 2
+    assert near_results[0][1] == near_results[1][1]
+    assert near_results[0][2]["best"] is False
+    assert near_results[1][2]["best"] is False
+
+
+def test_quantity_and_price_failures_reduce_suggestion_score(db_session, db_factories):
+    _, _vendor, _po, _po_line, invoice = _case(db_session, db_factories)
+    invoice.po_id = None
+    invoice.po_number_raw = None
+    line = db_session.query(InvoiceLine).filter_by(invoice_id=invoice.id).one()
+    line.qty = Decimal("2")
+    line.unit_price = Decimal("102.01")
+    score = _suggested_purchase_orders(db_session, invoice)[0]
+    assert score[1] == Decimal("60.00")
+    detail = score[2]["lines"][0]
+    assert detail["quantity_pass"] is False
+    assert detail["price_pass"] is False

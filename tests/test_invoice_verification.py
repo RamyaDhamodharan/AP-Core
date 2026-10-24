@@ -7,12 +7,9 @@ from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
-from src.api.rest.routers import document_routers
 from src.api.rest.routers.invoice_routers import _invoice_dashboard_filters
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
-from src.models.document_models import Document
-from src.models.email_draft_models import EmailDraft
 from src.models.invoice_models import Invoice
 from src.services.document_workflow_services import compare_available_records
 from src.services.invoice_confidence_services import (
@@ -26,30 +23,45 @@ from src.services.invoice_confidence_services import (
 
 def test_overall_confidence_percent_uses_header_min_and_line_average():
     fields = (
-        "vendor", "invoice_number", "invoice_date", "due_date", "currency",
-        "subtotal", "tax", "total", "order_number", "gl_code",
+        "vendor",
+        "invoice_number",
+        "invoice_date",
+        "due_date",
+        "currency",
+        "subtotal",
+        "tax",
+        "total",
+        "order_number",
+        "gl_code",
     )
-    confidence = normalize_invoice_confidence({
-        **dict.fromkeys(fields, "value"),
-        "field_confidence": {
-            **{field: {"confidence": 90} for field in fields},
-            "total": {"confidence": 86},
-        },
-        "line_items": [{
-            "qty": 1, "unit_price": 2, "line_amount": 2,
+    confidence = normalize_invoice_confidence(
+        {
+            **dict.fromkeys(fields, "value"),
             "field_confidence": {
-                "qty": {"confidence": 80},
-                "unit_price": {"confidence": 100},
-                "line_amount": {"confidence": 100},
+                **{field: {"confidence": 90} for field in fields},
+                "total": {"confidence": 86},
             },
-        }],
-    })
+            "line_items": [
+                {
+                    "qty": 1,
+                    "unit_price": 2,
+                    "line_amount": 2,
+                    "field_confidence": {
+                        "qty": {"confidence": 80},
+                        "unit_price": {"confidence": 100},
+                        "line_amount": {"confidence": 100},
+                    },
+                }
+            ],
+        }
+    )
     assert overall_confidence_percent(confidence) == 86
 
 
 def test_overall_confidence_percent_treats_missing_as_zero_and_rounds():
     confidence = normalize_invoice_confidence({"vendor": "Only field"})
     assert overall_confidence_percent(confidence) == 0
+
 
 client = TestClient(app)
 
@@ -181,7 +193,6 @@ def test_verify_edits_audit_old_new_reason_and_associate_can_continue(monkeypatc
 
 
 def test_verify_rejects_real_duplicate_invoice_number_with_409(monkeypatch):
-    from src.models.invoice_models import Invoice
 
     owner_id = uuid.uuid4()
     vendor_id = uuid.uuid4()
@@ -203,8 +214,7 @@ def test_verify_rejects_real_duplicate_invoice_number_with_409(monkeypatch):
     )
     invoice_query = MagicMock()
     (
-        invoice_query.outerjoin.return_value.filter.return_value.with_for_update
-        .return_value.first.return_value
+        invoice_query.outerjoin.return_value.filter.return_value.with_for_update.return_value.first.return_value
     ) = invoice
     duplicate_query = MagicMock()
     (
@@ -272,40 +282,71 @@ def test_get_verification_returns_values_confidence_and_gl_warning(monkeypatch):
     assert result["gl_code_warning"] == "Unknown GL code: 9999"
 
 
-def test_unmatched_invoice_is_rejected_with_reason_and_reply_draft(monkeypatch):
-    source_document_id = uuid.uuid4()
-    invoice = Invoice(
+def test_unmatched_invoice_remains_in_automatic_match_review(monkeypatch):
+    owner_id = uuid.uuid4()
+    invoice = SimpleNamespace(
         id=uuid.uuid4(),
-        source_document_id=source_document_id,
-        workflow_status="received",
-        match_status="pending",
+        source_document_id=None,
+        workflow_status="verifying",
+        match_status="needs_vendor_review",
+        status="needs_review",
+        po_decision=None,
         final_status=None,
+        final_by=None,
+        final_at=None,
+        vendor_name_raw="Unknown Vendor",
+        vendor_tax_id_raw=None,
         vendor_id=None,
+        invoice_no="INV-UNKNOWN",
+        invoice_date=None,
+        due_date=None,
+        currency="USD",
+        subtotal=Decimal("10"),
+        tax_amount=Decimal("0"),
+        total_amount=Decimal("10"),
+        po_number_raw=None,
+        invoice_no_normalized="INVUNKNOWN",
+        gl_code=None,
+        field_confidence={},
     )
-    document = Document(
-        id=source_document_id,
-        original_filename="invoice.eml",
-        file_hash="a" * 64,
-        status="received",
-        source="email",
-        email_sender="test@example.com",
+    invoice_query = MagicMock()
+    locked_query = (
+        invoice_query.outerjoin.return_value.filter.return_value.with_for_update.return_value
     )
+    locked_query.first.return_value = invoice
+    line_query = MagicMock()
+    line_query.filter.return_value.all.return_value = []
     db = MagicMock()
-    def add_with_model_defaults(obj):
-        if isinstance(obj, EmailDraft) and obj.id is None:
-            obj.id = uuid.uuid4()
+    db.query.side_effect = [invoice_query, line_query]
+    run = SimpleNamespace(id=uuid.uuid4())
 
-    db.add.side_effect = add_with_model_defaults
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "test@example.com")
-    document_routers._auto_reject_unmatched_invoice(db, invoice, document)
-    assert invoice.workflow_status == "rejected"
-    objects = [obj for call in db.add.call_args_list for obj in call.args]
-    assert any(isinstance(obj, AuditLog) for obj in objects)
-    draft = next(obj for obj in objects if isinstance(obj, EmailDraft))
-    assert draft.to_addresses == ["test@example.com"]
-    assert draft.status == "draft"
-    assert draft.blocked_by_allowlist is False
-    assert draft.document_id == source_document_id
+    def match_unlinked(_db, _invoice_id, _actor_id, **_kwargs):
+        invoice.workflow_status = "match_issues"
+        invoice.match_status = "needs_po_confirmation"
+        invoice.po_decision = "awaiting_confirmation"
+        invoice.status = "needs_review"
+        return run
+
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.find_duplicate_invoice",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "src.api.rest.routers.invoice_routers.run_match_for_invoice", match_unlinked
+    )
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {"sub": str(owner_id)}
+    try:
+        response = client.post(f"/api/invoices/{invoice.id}/verify", json={})
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == 200
+    assert response.json()["status"] == "needs_review"
+    assert response.json()["po_decision"] == "awaiting_confirmation"
+    assert invoice.final_status is None
+    assert invoice.workflow_status == "match_issues"
+    assert db.commit.call_count == 1
 
 
 def test_verification_edit_requires_reason():

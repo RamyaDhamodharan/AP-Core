@@ -36,6 +36,11 @@ def normalize_vendor_name(value: object) -> str:
     return normalized
 
 
+def normalize_vendor_tax_id(value: object) -> str:
+    """Normalize tax identifiers for cross-record matching."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
 def _normalized_name_expression(column: Any) -> Any:
     return func.lower(func.regexp_replace(func.trim(column), r"\s+", " ", "g"))
 

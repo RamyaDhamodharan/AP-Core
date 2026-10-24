@@ -374,7 +374,7 @@ def test_parse_document_success(monkeypatch):
     assert saved_invoice.final_status is None
 
 
-def test_invoice_matching_sets_po_and_ready_status():
+def test_invoice_persistence_defers_po_link_and_status_to_match_engine():
     vendor = SimpleNamespace(id=uuid.uuid4())
     po = SimpleNamespace(
         id=uuid.uuid4(),
@@ -388,8 +388,9 @@ def test_invoice_matching_sets_po_and_ready_status():
         purchase_order=po,
     )
 
-    assert invoice.po_id == po.id
+    assert invoice.po_id is None
     assert invoice.match_status == "pending"
+    assert invoice.po_number_raw == "PO-101"
     assert any(call.args[0] is invoice for call in db.add.call_args_list)
 
 
@@ -429,7 +430,7 @@ def test_invoice_matching_resolves_vendor_alias():
     )
 
     assert invoice.vendor_id == vendor.id
-    assert invoice.po_id == po.id
+    assert invoice.po_id is None
     assert invoice.match_status == "pending"
 
 
@@ -442,7 +443,8 @@ def test_invoice_matching_waits_when_po_is_missing():
     )
 
     assert invoice.po_id is None
-    assert invoice.match_status == "waiting_for_po"
+    assert invoice.match_status == "pending"
+    assert invoice.po_number_raw == "PO-101"
 
 
 def test_invoice_matching_flags_vendor_mismatch():
@@ -459,8 +461,8 @@ def test_invoice_matching_flags_vendor_mismatch():
         purchase_order=po,
     )
 
-    assert invoice.po_id == po.id
-    assert invoice.match_status == "match_issues"
+    assert invoice.po_id is None
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_flags_currency_mismatch():
@@ -477,8 +479,8 @@ def test_invoice_matching_flags_currency_mismatch():
         purchase_order=po,
     )
 
-    assert invoice.po_id == po.id
-    assert invoice.match_status == "match_issues"
+    assert invoice.po_id is None
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_flags_amount_mismatch():
@@ -496,8 +498,8 @@ def test_invoice_matching_flags_amount_mismatch():
         extracted_data={"total": "1800.00"},
     )
 
-    assert invoice.po_id == po.id
-    assert invoice.match_status == "match_issues"
+    assert invoice.po_id is None
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_keeps_existing_one_cent_tolerance():
@@ -515,6 +517,7 @@ def test_invoice_matching_keeps_existing_one_cent_tolerance():
         extracted_data={"total": "1500.01"},
     )
 
+    assert invoice.po_id is None
     assert invoice.match_status == "pending"
 
 
@@ -551,7 +554,6 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
             "trigger": "dependency_arrived",
         }
         invoice.match_status = "pending"
-        invoice.final_status = "approved"
         return SimpleNamespace(result="match_ok")
 
     monkeypatch.setattr(document_routers, "run_match_for_invoice", auto_match)
@@ -562,9 +564,8 @@ def test_rematch_waiting_invoice_when_po_arrives(monkeypatch):
     count = document_routers._rematch_waiting_invoices_for_po(db, po)
 
     assert count == 1
-    assert invoice.po_id == po_id
+    assert invoice.po_id is None
     assert invoice.match_status == "pending"
-    assert invoice.final_status == "approved"
     db.flush.assert_called_once()
 
 
@@ -600,7 +601,7 @@ def test_rematch_waiting_invoice_flags_amount_mismatch(monkeypatch):
     count = document_routers._rematch_waiting_invoices_for_po(db, po)
 
     assert count == 1
-    assert invoice.po_id == po.id
+    assert invoice.po_id is None
     assert invoice.match_status == "waiting_for_po"
 
 
@@ -617,8 +618,8 @@ def test_invoice_matching_requires_vendor_review_when_unresolved():
         purchase_order=po,
     )
 
-    assert invoice.po_id == po.id
-    assert invoice.match_status == "needs_vendor_review"
+    assert invoice.po_id is None
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_requires_review_for_ambiguous_vendor_alias():
@@ -641,7 +642,7 @@ def test_invoice_matching_requires_review_for_ambiguous_vendor_alias():
     )
 
     assert invoice.vendor_id is None
-    assert invoice.match_status == "needs_vendor_review"
+    assert invoice.match_status == "pending"
 
 
 def test_invoice_matching_rerun_rejects_changed_extraction_without_overwrite():

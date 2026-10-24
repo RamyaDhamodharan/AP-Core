@@ -15,7 +15,6 @@ from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import invoice_routers
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
-from src.models.email_draft_models import EmailDraft
 from src.models.invoice_models import Invoice
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.services.document_ingest_services import IngestResult
@@ -220,33 +219,11 @@ def test_case_4_duplicate_invoice_upload_is_skipped(monkeypatch):
     assert response.json()["results"][0]["result"] == "duplicate"
 
 
-def test_case_5_unknown_vendor_rejected_and_sender_draft_created(monkeypatch):
-    """Case 5 verifies a reviewable draft is created for the sender."""
-    from src.api.rest.routers.document_routers import _auto_reject_unmatched_invoice
+def test_case_5_legacy_no_match_rejector_is_removed():
+    """No-match invoices stay in the human decision flow."""
+    from src.api.rest.routers import document_routers
 
-    sender = "ap-test@example.invalid"
-    monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", sender)
-    invoice = SimpleNamespace(
-        id=uuid.uuid4(),
-        workflow_status="received",
-        match_status="pending",
-        final_status=None,
-        vendor_id=None,
-    )
-    document = SimpleNamespace(id=uuid.uuid4(), email_sender=sender)
-    invoice.source_document_id = document.id
-    db = MagicMock()
-    _auto_reject_unmatched_invoice(db, invoice, document)
-    drafts = [
-        call.args[0]
-        for call in db.add.call_args_list
-        if isinstance(call.args[0], EmailDraft)
-    ]
-    assert invoice.workflow_status == "rejected"
-    assert len(drafts) == 1
-    assert drafts[0].status == "draft"
-    assert drafts[0].to_addresses == [sender]
-    assert drafts[0].blocked_by_allowlist is False
+    assert not hasattr(document_routers, "_auto_reject_unmatched_invoice")
 
 
 def test_case_6_low_confidence_verification_edit_is_audited(monkeypatch):
@@ -283,7 +260,11 @@ def test_case_6_low_confidence_verification_edit_is_audited(monkeypatch):
     db = MagicMock()
     db.query.side_effect = [query, lines]
     _api(db, actor)
-    monkeypatch.setattr(invoice_routers, "run_match_for_invoice", lambda *_a: None)
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_a, **_kwargs: None,
+    )
     try:
         response = client.post(
             f"/api/invoices/{invoice.id}/verify",
@@ -386,7 +367,11 @@ def test_case_8_wrong_gl_rejected_and_resubmitted_with_correct_gl(monkeypatch):
     monkeypatch.setattr(
         invoice_routers, "find_duplicate_invoice", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(invoice_routers, "run_match_for_invoice", lambda *_a: None)
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_a, **_kwargs: None,
+    )
     try:
         response = client.post(
             f"/api/invoices/{old.id}/resubmit", json={"gl_code": "6100"}

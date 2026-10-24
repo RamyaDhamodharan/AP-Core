@@ -30,6 +30,7 @@ ROUTE_AUDIT_TESTS = {
     "invoice_routers.py:verify_invoice_fields": "test_invoice_verification.py",
     "invoice_routers.py:confirm_invoice_match": "test_invoice_matching_services.py",
     "invoice_routers.py:reject_invoice_match": "test_invoice_matching_services.py",
+    "invoice_routers.py:decide_invoice_po_path": "test_invoice_matching_services.py",
     "invoice_routers.py:approve_invoice_exception": "test_invoice_review.py",
     "invoice_routers.py:review_invoice": "test_invoice_review.py",
     "invoice_routers.py:approve_invoice": "test_invoice_review.py",

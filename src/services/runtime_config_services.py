@@ -8,10 +8,20 @@ Tables: no database tables directly.
 
 import logging
 import os
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Deterministic PO suggestion score: vendor 30, identity 30, quantity 20, price 20.
+PO_SUGGESTION_WEIGHTS = {
+    "vendor": Decimal("30"),
+    "item_identity": Decimal("30"),
+    "quantity": Decimal("20"),
+    "price": Decimal("20"),
+}
+SIMILARITY_HIGH = Decimal(os.getenv("SIMILARITY_HIGH", "85"))
 
 
 def env_flag(name: str, default: bool, *, legacy_name: str | None = None) -> bool:
@@ -28,14 +38,12 @@ def require_goods_receipt() -> bool:
     return env_flag("REQUIRE_GOODS_RECEIPT", True)
 
 
-def no_match_auto_reject() -> bool:
-    return env_flag(
-        "NO_MATCH_AUTO_REJECT", True, legacy_name="EMAIL_NO_MATCH_AUTO_REJECT"
-    )
-
-
 def currency_conversion_enabled() -> bool:
     return env_flag("CURRENCY_CONVERSION", True)
+
+
+def invoice_only_requires_approval() -> bool:
+    return env_flag("INVOICE_ONLY_REQUIRES_APPROVAL", True)
 
 
 def is_running_in_container() -> bool:
@@ -52,8 +60,10 @@ def is_running_in_container() -> bool:
 def _is_localhost_endpoint(value: str) -> bool:
     candidate = value if "://" in value else f"//{value}"
     hostname = urlparse(candidate).hostname
-    return hostname == "localhost" or hostname == "::1" or (
-        hostname is not None and hostname.startswith("127.")
+    return (
+        hostname == "localhost"
+        or hostname == "::1"
+        or (hostname is not None and hostname.startswith("127."))
     )
 
 

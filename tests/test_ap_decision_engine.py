@@ -89,7 +89,7 @@ def _codes(monkeypatch, mutate=lambda _i, _p, _l: None, **kwargs):
     ("code", "mutate", "options"),
     [
         (
-            "MISSING_PO",
+            "PO_CONFIRMATION_REQUIRED",
             lambda invoice, purchase_order, line: setattr(
                 invoice, "po_number_raw", None
             ),

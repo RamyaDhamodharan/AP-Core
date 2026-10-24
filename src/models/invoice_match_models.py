@@ -6,6 +6,7 @@ src/api/rest/routers/invoice_routers.py, src/services/invoice_matching_services.
 Calls: vendor_models.
 Tables: no database tables directly.
 """
+
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -35,6 +36,7 @@ class InvoiceMatch(Base):
     Status values: this table has no status enum.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     __tablename__ = "invoice_matches"
     __table_args__ = (Index("ix_invoice_matches_invoice", "invoice_id", "status"),)
 
@@ -54,6 +56,7 @@ class InvoiceMatch(Base):
     )
     match_type: Mapped[str] = mapped_column(String(10), nullable=False)
     score: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    score_details: Mapped[dict | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="suggested"
     )
@@ -78,6 +81,7 @@ class InvoiceDiscrepancy(Base):
     Status values: this table has no status enum.
     Use: shared persistence or validation contract for this flow stage.
     """
+
     __tablename__ = "invoice_discrepancies"
     __table_args__ = (
         Index("ix_invoice_discrepancies_invoice", "invoice_id", "resolved"),

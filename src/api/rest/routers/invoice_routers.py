@@ -9,6 +9,7 @@ goods_receipts, invoice_discrepancies, invoice_issues, invoice_lines,
 invoice_matches, invoice_state_history, invoice_supporting_documents, invoices,
 match_runs, notifications, payments, purchase_orders, users, vendors.
 """
+
 import os
 import uuid
 from datetime import UTC, date, datetime
@@ -451,6 +452,7 @@ def _invoice_dashboard_response(
                 ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
+                po_decision=getattr(invoice, "po_decision", None),
             )
             for invoice, vendor_name, document in rows
         ],
@@ -832,19 +834,6 @@ def verify_invoice_fields(
         if field == "vendor":
             vendor = resolve_vendor(db, value)
             invoice.vendor_id = vendor.id if vendor else None
-        if field == "order_number":
-            po = None
-            if value:
-                po = (
-                    db.query(PurchaseOrder)
-                    .filter(
-                        func.lower(func.trim(PurchaseOrder.po_number))
-                        == str(value).strip().casefold(),
-                        PurchaseOrder.is_current.is_(True),
-                    )
-                    .first()
-                )
-            invoice.po_id = po.id if po else None
         db.add(
             AuditLog(
                 action="invoice_field_edited",
@@ -936,53 +925,16 @@ def verify_invoice_fields(
             changed_by=actor_id,
             reason=reason or "Associate verified invoice fields",
         )
-    if invoice.po_id and invoice.vendor_id:
-        run_match_for_invoice(db, invoice.id, actor_id, force=True)
-    else:
-        transition_invoice(
-            db,
-            invoice,
-            "no_match",
-            changed_by=actor_id,
-            reason="No Match: vendor or purchase order is missing",
-        )
-        transition_invoice(
-            db,
-            invoice,
-            "rejected",
-            changed_by=actor_id,
-            reason="No Match: vendor or purchase order is missing",
-        )
-        if invoice.source_document_id:
-            sender = (
-                db.query(Document.email_sender)
-                .filter(Document.id == invoice.source_document_id)
-                .scalar()
-            )
-            allowed_senders = {
-                item.strip().casefold()
-                for item in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
-                if item.strip()
-            }
-            if sender and sender.casefold() in allowed_senders:
-                db.add(
-                    Notification(
-                        document_id=invoice.source_document_id,
-                        recipient_email=sender,
-                        subject="Invoice needs attention",
-                        body=(
-                            "No Match: add a valid vendor and purchase order, "
-                            "then reopen."
-                        ),
-                        status="queued",
-                    )
-                )
+    match_run = run_match_for_invoice(db, invoice.id, actor_id, force=True)
     db.commit()
     if invoice.source_document_id:
         dispatch_queued_notifications(db, invoice.source_document_id)
     return {
         "invoice_id": str(invoice.id),
         "workflow_status": invoice.workflow_status,
+        "status": getattr(invoice, "status", None) or _workspace_status(invoice),
+        "po_decision": getattr(invoice, "po_decision", None),
+        "match_run_id": str(match_run.id) if match_run else None,
         "needs_verification": False,
     }
 
@@ -1057,12 +1009,6 @@ def get_invoice_detail(
             .options(selectinload(PurchaseOrder.lines))
             .where(
                 PurchaseOrder.id == invoice.po_id,
-                or_(
-                    PurchaseOrder.created_by == owner_id,
-                    PurchaseOrder.source_document_id.in_(
-                        select(Document.id).where(Document.created_by == owner_id)
-                    ),
-                ),
             )
         )
     linked_goods_receipts = []
@@ -1099,7 +1045,7 @@ def get_invoice_detail(
         }
         for code, label, invoice_value, expected_value in (
             (
-                "MISSING_PO",
+                "PO_NOT_RECEIVED",
                 "Purchase order",
                 invoice.po_number_raw,
                 linked_po.po_number if linked_po else None,
@@ -1199,6 +1145,7 @@ def get_invoice_detail(
         "po_number_raw": invoice.po_number_raw,
         "gl_code": getattr(invoice, "gl_code", None),
         "match_status": invoice.match_status,
+        "po_decision": getattr(invoice, "po_decision", None),
         "final_status": invoice.final_status,
         "workflow_status": getattr(invoice, "workflow_status", "received"),
         "status": getattr(invoice, "status", None) or _workspace_status(invoice),
@@ -1355,61 +1302,10 @@ def invoice_match_candidates(
         .order_by(InvoiceMatch.score.desc().nullslast(), InvoiceMatch.created_at)
         .all()
     )
-    if not rows and not invoice.po_id:
-        from src.services.invoice_matching_services import _suggested_purchase_orders
-
-        rejected_po_ids = {
-            row.po_id
-            for row in db.query(InvoiceMatch)
-            .filter(
-                InvoiceMatch.invoice_id == invoice.id,
-                InvoiceMatch.status == "rejected",
-            )
-            .all()
-        }
-        for po, score in _suggested_purchase_orders(db, invoice, owner_id):
-            if po.id in rejected_po_ids:
-                continue
-            match = InvoiceMatch(
-                invoice_id=invoice.id,
-                po_id=po.id,
-                match_type="2-way",
-                score=score,
-                status="suggested",
-            )
-            db.add(match)
-            rows.append((match, po))
-        if rows:
-            old_status = invoice.status
-            db.query(InvoiceDiscrepancy).filter(
-                InvoiceDiscrepancy.invoice_id == invoice.id,
-                InvoiceDiscrepancy.field == "no_po_found",
-            ).delete(synchronize_session=False)
-            db.add(
-                InvoiceDiscrepancy(
-                    invoice_id=invoice.id,
-                    field="suggested_po_match",
-                    severity="warning",
-                    reason="Suggested PO match",
-                )
-            )
-            invoice.status = "needs_review"
-            if old_status != "needs_review":
-                db.add(
-                    AuditLog(
-                        action="invoice_status_transition",
-                        actor="system",
-                        entity_type="invoice",
-                        entity_id=invoice.id,
-                        old_value={"status": old_status},
-                        new_value={"status": "needs_review"},
-                        reason="Suggested purchase orders need human confirmation",
-                        created_by=None,
-                    )
-                )
-        db.commit()
     return {
         "invoice_id": str(invoice.id),
+        "status": invoice.status,
+        "po_decision": getattr(invoice, "po_decision", None),
         "candidates": [
             {
                 "match_id": str(match.id),
@@ -1418,11 +1314,62 @@ def invoice_match_candidates(
                 "vendor_name": po.vendor_name,
                 "total_amount": po.total_amount,
                 "currency": po.currency,
-                "score": float(match.score or 0),
+                "score": match.score or 0,
+                "score_details": match.score_details or {},
+                "best": bool((match.score_details or {}).get("best")),
                 "status": match.status,
             }
             for match, po in rows
         ],
+    }
+
+
+@router.post("/{invoice_id:uuid}/po-decision")
+def decide_invoice_po_path(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Choose to wait for a PO or process the invoice without a PO."""
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    decision = payload.get("decision")
+    reason = str(payload.get("reason") or "").strip()
+    if decision not in {"wait_for_po", "invoice_only"}:
+        raise HTTPException(
+            status_code=422,
+            detail="decision must be wait_for_po or invoice_only",
+        )
+    old = {"status": invoice.status, "po_decision": invoice.po_decision}
+    invoice.po_decision = (
+        "waiting_for_po" if decision == "wait_for_po" else "invoice_only"
+    )
+    if decision == "invoice_only":
+        invoice.po_number_raw = None
+    run = run_match_for_invoice(db, invoice.id, actor_id, force=True)
+    db.add(
+        AuditLog(
+            action="invoice_po_decision",
+            actor=str(actor_id),
+            entity_type="invoice",
+            entity_id=invoice.id,
+            old_value=old,
+            new_value={
+                "status": invoice.status,
+                "po_decision": invoice.po_decision,
+                "match_run_id": str(run.id) if run else None,
+            },
+            reason=reason or "Invoice will wait for a purchase order.",
+            message="Invoice PO path selected",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "status": invoice.status,
+        "po_decision": invoice.po_decision,
+        "match_run_id": str(run.id) if run else None,
     }
 
 
@@ -1463,8 +1410,8 @@ def confirm_invoice_match(
     if candidate is None or po is None:
         raise HTTPException(status_code=404, detail="Suggested PO match not found")
     old_status = invoice.status
-    invoice.po_id = po.id
     invoice.po_number_raw = po.po_number
+    invoice.po_decision = None
     candidate.status = "confirmed"
     candidate.confirmed_by = actor_id
     from src.services.invoice_matching_services import run_match_for_invoice
@@ -1526,6 +1473,41 @@ def reject_invoice_match(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Suggested PO match not found")
     candidate.status = "rejected"
+    remaining = (
+        db.query(InvoiceMatch)
+        .filter(
+            InvoiceMatch.invoice_id == invoice.id,
+            InvoiceMatch.status == "suggested",
+            InvoiceMatch.id != candidate.id,
+        )
+        .count()
+    )
+    if remaining == 0:
+        invoice.po_decision = "awaiting_confirmation"
+        run = run_match_for_invoice(
+            db,
+            invoice.id,
+            actor_id,
+            force=True,
+            trigger="suggestions_rejected",
+        )
+        db.add(
+            AuditLog(
+                action="invoice_po_confirmation_required",
+                actor="system",
+                entity_type="invoice",
+                entity_id=invoice.id,
+                old_value={"status": "needs_review", "po_decision": None},
+                new_value={
+                    "status": invoice.status,
+                    "po_decision": invoice.po_decision,
+                    "match_run_id": str(run.id) if run else None,
+                },
+                reason="All suggested purchase orders were declined.",
+                message="Invoice is waiting for a PO path decision",
+                created_by=None,
+            )
+        )
     db.add(
         AuditLog(
             action="invoice_match_rejected",
@@ -1533,13 +1515,19 @@ def reject_invoice_match(
             entity_type="invoice",
             entity_id=invoice.id,
             old_value={"po_id": str(po_id), "status": "suggested"},
-            new_value={"status": "rejected"},
+            new_value={
+                "status": invoice.status,
+                "po_decision": invoice.po_decision,
+            },
             reason=(payload.get("reason") or "Suggested purchase order declined"),
             created_by=actor_id,
         )
     )
     db.commit()
-    return invoice_match_candidates(invoice_id, db, current_user)
+    result = invoice_match_candidates(invoice_id, db, current_user)
+    result["status"] = invoice.status
+    result["po_decision"] = invoice.po_decision
+    return result
 
 
 @router.post("/{invoice_id:uuid}/approve-exception")
@@ -1626,6 +1614,9 @@ def approve_invoice_exception(
             status_code=409,
             detail="Resolve the invoice vendor before approving an exception.",
         )
+    invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
+    if invoice_only:
+        allowed_exception_codes.add("MISSING_PO")
     saved_run = (
         db.get(MatchRun, invoice.final_run_id)
         if getattr(invoice, "final_run_id", None)
@@ -1827,6 +1818,17 @@ def review_invoice(
             detail="Invoice not found",
         )
 
+    invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
+    if (
+        payload.decision == "approved"
+        and invoice_only
+        and not (payload.reason or "").strip()
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="A reason is required to approve invoice-only processing",
+        )
+
     open_issues = 0
     if payload.decision == "approved":
         open_issues = (
@@ -1847,6 +1849,7 @@ def review_invoice(
     if (
         payload.decision == "approved"
         and getattr(invoice, "status", _workspace_status(invoice)) != "ready_to_pay"
+        and not (invoice_only and invoice.status == "needs_approval")
         and not has_issue_override
     ):
         raise HTTPException(
@@ -1886,7 +1889,10 @@ def review_invoice(
         saved_outcome = (
             (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
         )
-        if not saved_outcome or saved_outcome.get("outcome") != "ready_to_pay":
+        allowed_outcomes = {"ready_to_pay"}
+        if invoice_only:
+            allowed_outcomes.add("needs_approval")
+        if not saved_outcome or saved_outcome.get("outcome") not in allowed_outcomes:
             raise HTTPException(
                 status_code=409,
                 detail="Invoice cannot be approved until all matching rules pass",
@@ -1957,6 +1963,7 @@ def review_invoice(
         final_status=invoice.final_status,
         final_by=invoice.final_by,
         final_at=invoice.final_at,
+        status=invoice.status,
     )
 
 
@@ -1980,6 +1987,7 @@ def approve_invoice(
         InvoiceReviewRequest(
             decision="approved",
             comment=(payload or {}).get("comment"),
+            reason=(payload or {}).get("reason"),
             override_reason=(payload or {}).get("override_reason"),
         ),
         db,
@@ -2868,9 +2876,10 @@ def update_invoice(
         "total_amount",
         "po_number_raw",
     }
+    match_run = None
     if matching_fields.intersection(changes):
         db.flush()
-        run_match_for_invoice(db, invoice.id, user_id, force=True)
+        match_run = run_match_for_invoice(db, invoice.id, user_id, force=True)
     new = {
         key: str(getattr(invoice, key)) if getattr(invoice, key) is not None else None
         for key in changes
@@ -2894,7 +2903,14 @@ def update_invoice(
     db.commit()
     if invoice.source_document_id:
         dispatch_queued_notifications(db, invoice.source_document_id, background_tasks)
-    return {"invoice_id": str(invoice.id), "updated": new, "flagged_fields": flagged}
+    return {
+        "invoice_id": str(invoice.id),
+        "updated": new,
+        "flagged_fields": flagged,
+        "status": getattr(invoice, "status", None) or _workspace_status(invoice),
+        "po_decision": getattr(invoice, "po_decision", None),
+        "match_run_id": str(match_run.id) if match_run else None,
+    }
 
 
 @router.post("/{invoice_id}/confirm-po")
@@ -2932,8 +2948,30 @@ def confirm_invoice_po(
             detail="Only the current purchase order version can be confirmed",
         )
     old = str(invoice.po_id) if invoice.po_id else None
-    invoice.po_id = po_id
+    invoice.po_decision = None
     invoice.po_number_raw = selected_po.po_number
+    confirmed_match = (
+        db.query(InvoiceMatch)
+        .filter(
+            InvoiceMatch.invoice_id == invoice.id,
+            InvoiceMatch.po_id == selected_po.id,
+        )
+        .first()
+    )
+    if confirmed_match is None:
+        db.add(
+            InvoiceMatch(
+                invoice_id=invoice.id,
+                po_id=selected_po.id,
+                match_type="2-way",
+                score=Decimal("100"),
+                status="confirmed",
+                confirmed_by=user_id,
+            )
+        )
+    else:
+        confirmed_match.status = "confirmed"
+        confirmed_match.confirmed_by = user_id
     if legacy_workflow_status(invoice) not in {
         "approved",
         "rejected",
@@ -2948,14 +2986,17 @@ def confirm_invoice_po(
             reason="Purchase order confirmed",
         )
     db.flush()
-    run_match_for_invoice(db, invoice.id, user_id, force=True)
+    run = run_match_for_invoice(db, invoice.id, user_id, force=True)
     db.add(
         AuditLog(
             action="invoice_po_confirmed",
             entity_type="invoice",
             entity_id=invoice.id,
             old_value={"po_id": old},
-            new_value={"po_id": str(po_id)},
+            new_value={
+                "po_id": str(invoice.po_id) if invoice.po_id else None,
+                "status": invoice.status,
+            },
             message="Purchase order confirmed",
             created_by=user_id,
         )
@@ -2963,4 +3004,9 @@ def confirm_invoice_po(
     db.commit()
     if invoice.source_document_id:
         dispatch_queued_notifications(db, invoice.source_document_id, background_tasks)
-    return {"invoice_id": str(invoice.id), "po_id": str(po_id)}
+    return {
+        "invoice_id": str(invoice.id),
+        "po_id": str(invoice.po_id) if invoice.po_id else None,
+        "status": invoice.status,
+        "match_run_id": str(run.id) if run else None,
+    }

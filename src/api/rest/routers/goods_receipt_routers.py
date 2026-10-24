@@ -7,6 +7,7 @@ goods_receipt_schemas.
 Tables: audit_log, documents, goods_receipt_lines, goods_receipts, po_lines,
 purchase_orders, vendors.
 """
+
 import uuid
 from datetime import date
 from typing import Annotated, Literal
@@ -332,6 +333,13 @@ def create_goods_receipt(
                 created_by=actor,
             )
         )
+        from src.api.rest.routers.document_routers import (
+            _rematch_waiting_invoices_for_po,
+        )
+
+        po = db.get(PurchaseOrder, receipt.po_id)
+        if po is not None:
+            _rematch_waiting_invoices_for_po(db, po)
         db.commit()
     except IntegrityError as exc:
         _handle_goods_receipt_integrity_error(db, exc)
@@ -386,6 +394,7 @@ def update_goods_receipt(
             status_code=409, detail="Goods receipt number already exists"
         )
     old = {"gr_number": receipt.gr_number, "po_id": str(receipt.po_id)}
+    old_po_id = receipt.po_id
     for field, value in updates.items():
         setattr(receipt, field, value.strip() if field == "gr_number" else value)
     if lines is not None:
@@ -407,6 +416,14 @@ def update_goods_receipt(
                 created_by=actor,
             )
         )
+        from src.api.rest.routers.document_routers import (
+            _rematch_waiting_invoices_for_po,
+        )
+
+        for po_id_to_rematch in {old_po_id, receipt.po_id} - {None}:
+            po = db.get(PurchaseOrder, po_id_to_rematch)
+            if po is not None:
+                _rematch_waiting_invoices_for_po(db, po)
         db.commit()
     except IntegrityError as exc:
         _handle_goods_receipt_integrity_error(db, exc)
@@ -432,6 +449,7 @@ def delete_goods_receipt(
     """
     receipt = _load(db, receipt_id)
     actor = _actor(current_user)
+    po = db.get(PurchaseOrder, receipt.po_id) if receipt.po_id else None
     db.add(
         AuditLog(
             action="goods_receipt_deleted",
@@ -442,5 +460,11 @@ def delete_goods_receipt(
         )
     )
     db.delete(receipt)
+    if po is not None:
+        from src.api.rest.routers.document_routers import (
+            _rematch_waiting_invoices_for_po,
+        )
+
+        _rematch_waiting_invoices_for_po(db, po)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

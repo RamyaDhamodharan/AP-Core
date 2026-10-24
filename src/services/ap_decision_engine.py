@@ -15,16 +15,18 @@ from sqlalchemy.orm import Session
 
 from src.models.exchange_rate_models import ExchangeRate
 from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
+from src.models.invoice_match_models import InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
-from src.services.document_workflow_services import _owner_scope
 from src.services.invoice_confidence_services import overall_confidence_percent
 from src.services.invoice_number_services import find_duplicate_invoice
-from src.services.po_matching_services import normalize_value
+from src.services.po_matching_services import normalize_po_number, normalize_value
 from src.services.runtime_config_services import (
     currency_conversion_enabled,
+    invoice_only_requires_approval,
     require_goods_receipt,
 )
+from src.services.vendor_resolution_services import normalize_vendor_tax_id
 
 RULE_SET_VERSION = os.getenv("AP_MATCH_RULE_SET_VERSION", "ap-match-v1")
 PRICE_TOLERANCE = Decimal(os.getenv("AP_PRICE_TOLERANCE_PERCENT", "2")) / 100
@@ -146,46 +148,53 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     issues = []
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
-    po_ref = normalize_value(po_number_raw)
-    linked_po_id = getattr(invoice, "po_id", None)
-    linked_po = (
-        db.query(PurchaseOrder)
-        .filter(
-            PurchaseOrder.id == linked_po_id,
-            PurchaseOrder.is_current.is_(True),
-            *_owner_scope(PurchaseOrder, owner_id),
-        )
-        .first()
-        if linked_po_id
-        else None
-    )
-    if linked_po is not None and (
-        not po_ref or normalize_value(linked_po.po_number) == po_ref
-    ):
-        po_rows = [linked_po]
-    if po_ref and not po_rows:
+    po_ref = normalize_po_number(po_number_raw)
+    invoice_only = getattr(invoice, "po_decision", None) == "invoice_only"
+    if po_ref and not invoice_only:
         po_rows = [
             po
             for po in db.query(PurchaseOrder)
-            .filter(
-                PurchaseOrder.is_current.is_(True),
-                *_owner_scope(PurchaseOrder, owner_id),
-            )
+            .filter(PurchaseOrder.is_current.is_(True))
             .all()
-            if normalize_value(po.po_number) == po_ref
+            if normalize_po_number(po.po_number) == po_ref
         ]
+        confirmed_match = (
+            db.query(PurchaseOrder)
+            .join(InvoiceMatch, InvoiceMatch.po_id == PurchaseOrder.id)
+            .filter(
+                InvoiceMatch.invoice_id == invoice.id,
+                InvoiceMatch.status == "confirmed",
+                PurchaseOrder.is_current.is_(True),
+            )
+            .first()
+        )
+        if confirmed_match is not None and confirmed_match in po_rows:
+            po_rows = [confirmed_match]
+    elif not invoice_only:
+        confirmed_match = (
+            db.query(PurchaseOrder)
+            .join(InvoiceMatch, InvoiceMatch.po_id == PurchaseOrder.id)
+            .filter(
+                InvoiceMatch.invoice_id == invoice.id,
+                InvoiceMatch.status == "confirmed",
+                PurchaseOrder.is_current.is_(True),
+            )
+            .first()
+        )
+        if confirmed_match is not None:
+            po_rows = [confirmed_match]
     po = po_rows[0] if len(po_rows) == 1 else None
-    if not po_rows:
+    if po_ref and not po_rows and not invoice_only:
         issues.append(
             _issue(
-                "MISSING_PO",
-                "No purchase order matches this invoice.",
+                "PO_NOT_RECEIVED",
+                f"PO {po_number_raw} not received yet",
                 po_number_raw,
                 None,
-                action="Add or correct the PO number.",
+                action="Wait for this PO to be received or correct its number.",
             )
         )
-    elif len(po_rows) != 1:
+    elif len(po_rows) > 1 and not invoice_only:
         issues.append(
             _issue(
                 "AMBIGUOUS_PO",
@@ -198,7 +207,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
 
     # Step 2: Load invoice, PO and receipt lines for quantity and SKU evidence.
     lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
-    if not lines:
+    if not lines and po is not None:
         issues.append(
             _issue(
                 "LINE_NOT_ON_PO",
@@ -214,14 +223,10 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         else []
     )
     receipts = (
-        db.query(GoodsReceipt)
-        .filter(GoodsReceipt.po_id == po.id, *_owner_scope(GoodsReceipt, owner_id))
-        .all()
-        if po
-        else []
+        db.query(GoodsReceipt).filter(GoodsReceipt.po_id == po.id).all() if po else []
     )
     require_receipt = require_goods_receipt()
-    if not receipts and require_receipt:
+    if po is not None and not invoice_only and not receipts and require_receipt:
         issues.append(
             _issue(
                 "MISSING_GR",
@@ -244,7 +249,19 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
 
     # Step 3: Check vendor ownership and matching currencies before comparing amounts.
     invoice_vendor_id = getattr(invoice, "vendor_id", None)
-    if po and (not invoice_vendor_id or invoice_vendor_id != po.vendor_id):
+    invoice_tax_id = normalize_vendor_tax_id(
+        getattr(invoice, "vendor_tax_id_raw", None)
+    )
+    po_vendor = getattr(po, "vendor", None) if po is not None else None
+    vendor_matches = bool(
+        po and invoice_vendor_id and invoice_vendor_id == po.vendor_id
+    )
+    vendor_matches = vendor_matches or bool(
+        po_vendor
+        and invoice_tax_id
+        and normalize_vendor_tax_id(po_vendor.tax_id) == invoice_tax_id
+    )
+    if po and not vendor_matches:
         issues.append(
             _issue(
                 "VENDOR_MISMATCH",
@@ -300,6 +317,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                     "Correct the quantity, price, or line total.",
                 )
             )
+        if po is None or invoice_only:
+            continue
         candidates = [
             pl
             for pl in po_lines
@@ -458,6 +477,21 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         )
 
     # Step 6: Require at least 85 percent confidence for every material field.
+    if invoice_only:
+        information = _issue(
+            "INVOICE_ONLY",
+            "Invoice-only processing requires an approver decision.",
+        )
+        information["severity"] = "info"
+        issues.append(information)
+    elif not po_ref:
+        information = _issue(
+            "PO_CONFIRMATION_REQUIRED",
+            "Select a suggested purchase order or choose to wait for a PO.",
+        )
+        information["severity"] = "info"
+        issues.append(information)
+
     confidence = getattr(invoice, "field_confidence", None) or {}
     overall_percent = overall_confidence_percent(confidence)
     low_fields = []
@@ -514,9 +548,22 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         if any(value == "medium" for value in confidence_levels.values())
         else "high"
     )
+    blocking_issues = [item for item in issues if item.get("severity") != "info"]
+    outcome = "ready_to_pay" if not blocking_issues else "needs_review"
+    if invoice_only and not blocking_issues and invoice_only_requires_approval():
+        outcome = "needs_approval"
     return {
         "rule_set_version": RULE_SET_VERSION,
-        "outcome": "ready_to_pay" if not issues else "needs_review",
+        "outcome": outcome,
+        "po_decision": (
+            "invoice_only"
+            if invoice_only
+            else "waiting_for_po"
+            if po_ref and not po_rows
+            else "awaiting_confirmation"
+            if not po_ref
+            else None
+        ),
         "confidence_level": confidence_level,
         "overall_confidence_percent": overall_percent,
         "field_confidence": confidence,

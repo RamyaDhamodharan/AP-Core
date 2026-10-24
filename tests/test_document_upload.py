@@ -192,6 +192,8 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(
         final_by=None,
         final_at=None,
         match_status="pending",
+        po_decision=None,
+        po_number_raw="PO-1",
         invoice_no="INV-1",
         workflow_status="matching",
         status="processing",

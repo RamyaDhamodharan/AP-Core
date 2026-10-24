@@ -25,6 +25,7 @@ WORKFLOW_STATUSES = {
     "matching",
     "match_approved",
     "match_issues",
+    "needs_approval",
     "no_match",
     "approved",
     "rejected",
@@ -42,14 +43,23 @@ ALLOWED_TRANSITIONS = {
         "matching",
         "match_approved",
         "match_issues",
+        "needs_approval",
         "no_match",
         "failed",
     },
     "reading": {"verifying", "matching", "failed", "received"},
-    "verifying": {"matching", "match_issues", "no_match", "failed", "received"},
+    "verifying": {
+        "matching",
+        "match_issues",
+        "needs_approval",
+        "no_match",
+        "failed",
+        "received",
+    },
     "matching": {
         "match_approved",
         "match_issues",
+        "needs_approval",
         "no_match",
         "failed",
         "verifying",
@@ -69,6 +79,7 @@ ALLOWED_TRANSITIONS = {
         "matching",
         "match_approved",
         "no_match",
+        "needs_approval",
         "on_hold",
         "rejected",
         "resubmitted",
@@ -82,6 +93,7 @@ ALLOWED_TRANSITIONS = {
         "rejected",
         "resubmitted",
     },
+    "needs_approval": {"approved", "rejected", "on_hold", "matching", "match_issues"},
     "approved": {
         "paid",
         "overdue",
@@ -130,7 +142,10 @@ def transition_invoice(
         run_id = getattr(invoice, "final_run_id", None)
         run = db.get(MatchRun, run_id) if run_id else None
         outcome = (run.rules_used or {}).get("match_outcome") if run else None
-        if not outcome or outcome.get("outcome") != "ready_to_pay":
+        allowed_outcomes = {"ready_to_pay"}
+        if getattr(invoice, "po_decision", None) == "invoice_only":
+            allowed_outcomes.add("needs_approval")
+        if not outcome or outcome.get("outcome") not in allowed_outcomes:
             raise HTTPException(
                 status_code=409,
                 detail="Invoice cannot be approved until all matching rules pass",
@@ -159,6 +174,8 @@ def transition_invoice(
         invoice.status = "on_hold"
     elif to_status in {"verifying", "match_issues", "no_match"}:
         invoice.status = "needs_review"
+    elif to_status == "needs_approval":
+        invoice.status = "needs_approval"
     else:
         invoice.status = "processing"
     if to_status in {"approved", "paid", "overdue"}:
@@ -172,6 +189,7 @@ def transition_invoice(
         "matching",
         "match_approved",
         "match_issues",
+        "needs_approval",
         "no_match",
         "resubmitted",
         "failed",
@@ -184,6 +202,7 @@ def transition_invoice(
         "matching": "pending",
         "match_approved": "pending",
         "match_issues": "match_issues",
+        "needs_approval": "pending",
         "no_match": "no_match",
         "resubmitted": "pending",
         "failed": "pending",

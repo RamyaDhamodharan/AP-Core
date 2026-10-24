@@ -8,6 +8,7 @@ invoice_number_services, purchase_order_models.
 Tables: documents, goods_receipts, invoice_lines, invoices, po_lines,
 purchase_orders.
 """
+
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -32,6 +33,11 @@ def normalize_value(value: object) -> str:
         return ""
 
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+
+def normalize_po_number(value: object) -> str:
+    """Normalize PO references across case, whitespace, and dash variants."""
+    return re.sub(r"[\s\-\u2010-\u2015]+", "", str(value or "")).casefold()
 
 
 def normalize_amount(value: object) -> Decimal | None:

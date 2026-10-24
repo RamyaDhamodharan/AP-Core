@@ -9,6 +9,7 @@ goods_receipt_models, invoice_confidence_services.
 Tables: document_workflows, documents, goods_receipts, invoice_lines, invoices,
 po_lines, purchase_orders, vendors.
 """
+
 import uuid
 from decimal import Decimal
 
@@ -33,7 +34,7 @@ from src.services.invoice_confidence_services import (
     requires_verification,
 )
 from src.services.invoice_number_services import normalize_invoice_no
-from src.services.po_matching_services import normalize_value
+from src.services.po_matching_services import normalize_po_number, normalize_value
 from src.services.tolerance_config_services import (
     read_nonnegative_decimal,
     tolerance_fraction,
@@ -733,7 +734,6 @@ def evaluate_document_workflow(
         db.query(PurchaseOrder)
         .filter(
             PurchaseOrder.source_document_id == document.id,
-            *_owner_scope(PurchaseOrder, owner_id),
         )
         .first()
     )
@@ -742,7 +742,6 @@ def evaluate_document_workflow(
         .options(selectinload(GoodsReceipt.lines))
         .filter(
             GoodsReceipt.source_document_id == document.id,
-            *_owner_scope(GoodsReceipt, owner_id),
         )
         .all()
     )
@@ -752,7 +751,6 @@ def evaluate_document_workflow(
             db.query(PurchaseOrder)
             .filter(
                 PurchaseOrder.id == invoice.po_id,
-                *_owner_scope(PurchaseOrder, owner_id),
             )
             .first()
         )
@@ -761,7 +759,6 @@ def evaluate_document_workflow(
             db.query(PurchaseOrder)
             .filter(
                 PurchaseOrder.id == receipts[0].po_id,
-                *_owner_scope(PurchaseOrder, owner_id),
             )
             .first()
         )
@@ -781,7 +778,6 @@ def evaluate_document_workflow(
                     db.query(PurchaseOrder)
                     .filter(
                         PurchaseOrder.id == selected_invoice.po_id,
-                        *_owner_scope(PurchaseOrder, owner_id),
                     )
                     .first()
                 )
@@ -791,14 +787,13 @@ def evaluate_document_workflow(
             db.query(PurchaseOrder)
             .filter(
                 PurchaseOrder.is_current.is_(True),
-                *_owner_scope(PurchaseOrder, owner_id),
             )
             .all()
         )
         candidates = [
             po
             for po in candidates
-            if normalize_value(po.po_number) == normalize_value(po_number)
+            if normalize_po_number(po.po_number) == normalize_po_number(po_number)
         ]
     else:
         candidates = [purchase_order] if purchase_order is not None else []
@@ -816,7 +811,7 @@ def evaluate_document_workflow(
         invoice_candidates = [
             row
             for row in invoice_candidates
-            if normalize_value(row.po_number_raw) == normalize_value(po_number)
+            if normalize_po_number(row.po_number_raw) == normalize_po_number(po_number)
         ]
         invoice = invoice_candidates[0] if len(invoice_candidates) == 1 else None
         ambiguous = ambiguous or len(invoice_candidates) > 1
@@ -830,8 +825,8 @@ def evaluate_document_workflow(
             row
             for row in invoice_candidates
             if row.po_id == purchase_order.id
-            or normalize_value(row.po_number_raw)
-            == normalize_value(purchase_order.po_number)
+            or normalize_po_number(row.po_number_raw)
+            == normalize_po_number(purchase_order.po_number)
         ]
         invoice = invoice_candidates[0] if len(invoice_candidates) == 1 else None
         ambiguous = ambiguous or len(invoice_candidates) > 1
@@ -841,7 +836,6 @@ def evaluate_document_workflow(
             .options(selectinload(GoodsReceipt.lines))
             .filter(
                 GoodsReceipt.po_id == purchase_order.id,
-                *_owner_scope(GoodsReceipt, owner_id),
             )
             .all()
         )
@@ -1277,9 +1271,7 @@ def evaluate_document_workflow(
         "needs_vendor_review",
         "needs_data_review",
         "incomplete",
-    } or any(
-        item.outcome == "mismatch" for item in checks
-    ):
+    } or any(item.outcome == "mismatch" for item in checks):
         status = "review_required"
     elif (
         invoice is not None
@@ -1592,7 +1584,6 @@ def recommend_invoice_review(
                 db.query(PurchaseOrder)
                 .filter(
                     PurchaseOrder.id == invoice.po_id,
-                    *_owner_scope(PurchaseOrder, owner_id),
                 )
                 .first()
             )
@@ -1604,11 +1595,10 @@ def recommend_invoice_review(
                 for row in db.query(PurchaseOrder)
                 .filter(
                     PurchaseOrder.is_current.is_(True),
-                    *_owner_scope(PurchaseOrder, owner_id),
                 )
                 .all()
-                if normalize_value(row.po_number)
-                == normalize_value(invoice.po_number_raw)
+                if normalize_po_number(row.po_number)
+                == normalize_po_number(invoice.po_number_raw)
             ]
         po = po_candidates[0] if len(po_candidates) == 1 else None
         receipts = (
@@ -1616,7 +1606,6 @@ def recommend_invoice_review(
             .options(selectinload(GoodsReceipt.lines))
             .filter(
                 GoodsReceipt.po_id == po.id,
-                *_owner_scope(GoodsReceipt, owner_id),
             )
             .all()
             if po is not None
