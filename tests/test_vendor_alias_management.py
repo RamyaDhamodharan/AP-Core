@@ -9,11 +9,13 @@ from sqlalchemy.dialects import postgresql
 
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
+from src.api.rest.routers.vendor_routers import _clear_stale_vendor_flag
 from src.db.session_db import get_db
 from src.models.vendor_models import VendorAlias
 from src.services.vendor_resolution_services import (
     normalize_vendor_name,
     resolve_vendor,
+    suggest_vendor_candidates,
 )
 
 client = TestClient(app)
@@ -68,7 +70,7 @@ def _resolver_db(canonical_vendors=(), alias_rows=()):
         alias_rows
     )
     db = MagicMock()
-    db.query.side_effect = [canonical_query, alias_query]
+    db.query.side_effect = [alias_query, canonical_query]
     return db, canonical_query, alias_query
 
 
@@ -76,7 +78,21 @@ def test_vendor_name_normalization_collapses_whitespace_and_case():
     assert normalize_vendor_name("  ACME \t  SUPPLIES \n") == ("acme supplies")
 
 
-def test_resolution_prefers_exact_canonical_name():
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("QuickBasket Traders, Pvt. Ltd.", "quickbasket traders"),
+        ("Northwind Private LLP", "northwind"),
+        ("Acme & Co", "acme"),
+    ],
+)
+def test_vendor_name_normalization_strips_punctuation_and_company_suffixes(
+    raw, expected
+):
+    assert normalize_vendor_name(raw) == expected
+
+
+def test_resolution_prefers_exact_alias_over_canonical_name():
     canonical = _vendor(name="Acme Supplies")
     alias_vendor = _vendor(name="Other Canonical")
     alias = _alias(alias_vendor.id, name="acme supplies")
@@ -85,8 +101,8 @@ def test_resolution_prefers_exact_canonical_name():
         alias_rows=[(alias, alias_vendor)],
     )
 
-    assert resolve_vendor(db, "  ACME   SUPPLIES ") is canonical
-    alias_query.join.assert_not_called()
+    assert resolve_vendor(db, "  ACME   SUPPLIES ") is alias_vendor
+    alias_query.join.assert_called_once()
 
 
 def test_resolution_accepts_case_and_whitespace_variations():
@@ -131,7 +147,7 @@ def test_resolution_filters_out_inactive_aliases_and_vendors():
     canonical_query = MagicMock()
     canonical_query.filter.return_value.all.return_value = []
     db = MagicMock()
-    db.query.side_effect = [canonical_query, alias_query]
+    db.query.side_effect = [alias_query, canonical_query]
 
     assert resolve_vendor(db, "alternate vendor") is None
 
@@ -168,6 +184,33 @@ def test_unmatched_tax_id_does_not_fall_back_to_similar_vendor_name():
 
     assert resolve_vendor(db, "Canonical Vendor", tax_id="MISMATCH") is None
     db.query.assert_called_once()
+
+
+def test_fuzzy_match_is_only_a_suggestion():
+    candidate = _vendor(name="QuickBasket Traders")
+    db = MagicMock()
+    query = MagicMock()
+    query.filter.return_value.all.return_value = [candidate]
+    db.query.return_value = query
+
+    assert resolve_vendor(db, "Quick Basket Traderz") is None
+    assert suggest_vendor_candidates(db, "Quick Basket Traderz", threshold=0.8) == [
+        candidate
+    ]
+
+
+def test_exact_resolution_clears_only_stale_new_vendor_flag():
+    document = SimpleNamespace(
+        status="needs_vendor_review",
+        failure_message="New vendor. Add or select the vendor to continue matching.",
+    )
+    _clear_stale_vendor_flag(document)
+    assert document.failure_message is None
+    assert document.status == "needs_data_review"
+
+    other = SimpleNamespace(status="needs_data_review", failure_message="Missing total")
+    _clear_stale_vendor_flag(other)
+    assert other.failure_message == "Missing total"
 
 
 def test_create_alias_normalizes_and_persists_mapping():

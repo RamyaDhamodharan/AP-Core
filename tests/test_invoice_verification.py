@@ -19,8 +19,37 @@ from src.services.invoice_confidence_services import (
     confidence_level,
     confidence_threshold,
     normalize_invoice_confidence,
+    overall_confidence_percent,
     requires_verification,
 )
+
+
+def test_overall_confidence_percent_uses_header_min_and_line_average():
+    fields = (
+        "vendor", "invoice_number", "invoice_date", "due_date", "currency",
+        "subtotal", "tax", "total", "order_number", "gl_code",
+    )
+    confidence = normalize_invoice_confidence({
+        **dict.fromkeys(fields, "value"),
+        "field_confidence": {
+            **{field: {"confidence": 90} for field in fields},
+            "total": {"confidence": 86},
+        },
+        "line_items": [{
+            "qty": 1, "unit_price": 2, "line_amount": 2,
+            "field_confidence": {
+                "qty": {"confidence": 80},
+                "unit_price": {"confidence": 100},
+                "line_amount": {"confidence": 100},
+            },
+        }],
+    })
+    assert overall_confidence_percent(confidence) == 86
+
+
+def test_overall_confidence_percent_treats_missing_as_zero_and_rounds():
+    confidence = normalize_invoice_confidence({"vendor": "Only field"})
+    assert overall_confidence_percent(confidence) == 0
 
 client = TestClient(app)
 

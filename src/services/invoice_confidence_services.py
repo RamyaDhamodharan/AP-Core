@@ -1,6 +1,7 @@
 """Normalization helpers for extraction confidence and verification gating."""
 
 import os
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 INVOICE_CONFIDENCE_FIELDS = (
@@ -16,6 +17,48 @@ INVOICE_CONFIDENCE_FIELDS = (
     "gl_code",
 )
 LINE_CONFIDENCE_FIELDS = ("qty", "unit_price", "line_amount")
+
+
+def overall_confidence_percent(confidence: dict[str, Any] | None) -> int:
+    """Return the deterministic invoice confidence percentage.
+
+    Formula: take the minimum score across the ten material header fields;
+    when line items exist, average every material line-field score and take
+    the lower of the header minimum and that line average. Missing or invalid
+    values score 0. Scores in the 0..1 range are treated as fractions.
+    The final percentage is rounded half up to an integer.
+    """
+    confidence = confidence if isinstance(confidence, dict) else {}
+
+    def score(raw: Any) -> Decimal:
+        value = (
+            raw.get("confidence", raw.get("score"))
+            if isinstance(raw, dict)
+            else raw
+        )
+        try:
+            result = Decimal(str(value))
+            if Decimal("0") <= result <= Decimal("1"):
+                result *= Decimal("100")
+            return min(Decimal("100"), max(Decimal("0"), result))
+        except Exception:
+            return Decimal("0")
+
+    header_scores = [
+        score(confidence.get(field)) for field in INVOICE_CONFIDENCE_FIELDS
+    ]
+    overall = min(header_scores, default=Decimal("0"))
+    lines = confidence.get("line_items")
+    if isinstance(lines, list) and lines:
+        line_scores = [
+            score(line.get(field)) if isinstance(line, dict) else Decimal("0")
+            for line in lines
+            for field in LINE_CONFIDENCE_FIELDS
+        ]
+        overall = min(
+            overall, sum(line_scores, Decimal("0")) / Decimal(len(line_scores))
+        )
+    return int(overall.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def confidence_threshold() -> float:

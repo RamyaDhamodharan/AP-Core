@@ -71,6 +71,7 @@ class InvoiceDashboardItem(BaseModel):
     # Display-only overall level derived from the minimum invoice field
     # confidence (unavailable values are treated as low).
     confidence_level: str = "low"
+    overall_confidence_percent: int = 0
     can_resubmit: bool = False
     status: InvoiceStatus = "processing"
 

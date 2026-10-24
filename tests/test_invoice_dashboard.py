@@ -105,6 +105,7 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "gl_code": None,
             "confidence": None,
             "confidence_level": "low",
+                "overall_confidence_percent": 0,
             "can_resubmit": False,
             "status": "processing",
         }

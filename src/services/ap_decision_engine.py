@@ -9,6 +9,7 @@ from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.document_workflow_services import _owner_scope
+from src.services.invoice_confidence_services import overall_confidence_percent
 from src.services.invoice_number_services import find_duplicate_invoice
 from src.services.po_matching_services import normalize_value
 
@@ -356,6 +357,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         )
 
     confidence = getattr(invoice, "field_confidence", None) or {}
+    overall_percent = overall_confidence_percent(confidence)
     low_fields = []
     for field in MATERIAL_FIELDS:
         score = _score(confidence.get(field))
@@ -367,7 +369,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             score = _score(fields.get(field))
             if score is None or score < MIN_MATERIAL_CONFIDENCE:
                 low_fields.append(f"line_{index}.{field}")
-    if low_fields:
+    if low_fields or Decimal(overall_percent) < MIN_MATERIAL_CONFIDENCE:
         issues.append(
             _issue(
                 "LOW_CONFIDENCE",
@@ -414,6 +416,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         "rule_set_version": RULE_SET_VERSION,
         "outcome": "ready_to_pay" if not issues else "needs_review",
         "confidence_level": confidence_level,
+        "overall_confidence_percent": overall_percent,
         "field_confidence": confidence,
         "confidence_levels": confidence_levels,
         "low_confidence_fields": low_fields,

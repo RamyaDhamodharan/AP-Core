@@ -45,6 +45,7 @@ from src.services.document_workflow_services import (  # noqa: F401
 from src.services.invoice_confidence_services import (
     confidence_level,
     confidence_threshold,
+    overall_confidence_percent,
     requires_verification,
 )
 from src.services.invoice_issue_services import _assignment
@@ -420,6 +421,9 @@ def _invoice_dashboard_response(
                 confidence_level=_overall_invoice_confidence(
                     getattr(invoice, "field_confidence", None) or {}
                 ),
+                overall_confidence_percent=overall_confidence_percent(
+                    getattr(invoice, "field_confidence", None) or {}
+                ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
             )
@@ -673,6 +677,7 @@ def get_invoice_verification(
         ],
         "needs_verification": requires_verification(confidence),
         "confidence_level": confidence_level(confidence),
+        "overall_confidence_percent": overall_confidence_percent(confidence),
         "threshold": confidence_threshold(),
         "gl_code_warning": (
             f"Unknown GL code: {invoice.gl_code}"
@@ -1234,6 +1239,9 @@ def get_invoice_detail(
             getattr(invoice, "field_confidence", None) or {}
         ),
         "confidence_level": _overall_invoice_confidence(
+            getattr(invoice, "field_confidence", None) or {}
+        ),
+        "overall_confidence_percent": overall_confidence_percent(
             getattr(invoice, "field_confidence", None) or {}
         ),
         "low_confidence_fields": low_confidence_fields,

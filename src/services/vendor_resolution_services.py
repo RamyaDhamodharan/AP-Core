@@ -1,5 +1,6 @@
 import re
 import uuid
+from difflib import SequenceMatcher
 from typing import Any
 
 from sqlalchemy import func
@@ -11,7 +12,12 @@ from src.models.vendor_models import Vendor, VendorAlias
 def normalize_vendor_name(value: object) -> str:
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value)).strip().lower()
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(value).casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    suffix_pattern = re.compile(r"\s+(pvt|private|ltd|limited|llp|inc|co)\.?$")
+    while suffix_pattern.search(normalized):
+        normalized = suffix_pattern.sub("", normalized).strip()
+    return normalized
 
 
 def _normalized_name_expression(column: Any) -> Any:
@@ -78,19 +84,9 @@ def resolve_vendor(
     if not normalized_name:
         return None
 
-    canonical_vendors = (
-        db.query(Vendor)
-        .filter(
-            _normalized_name_expression(Vendor.name) == normalized_name,
-            Vendor.is_active.is_(True),
-        )
-        .all()
-    )
-    if len(canonical_vendors) == 1:
-        return canonical_vendors[0]
-    if canonical_vendors:
-        return None
-
+    # Query aliases first so an explicitly configured alias wins over a
+    # canonical name collision.  Both queries are scoped to active vendors;
+    # vendor visibility is intentionally global for authenticated users.
     alias_matches = (
         db.query(VendorAlias, Vendor)
         .join(Vendor, VendorAlias.vendor_id == Vendor.id)
@@ -102,6 +98,42 @@ def resolve_vendor(
         .all()
     )
     vendor_ids = {vendor.id for _, vendor in alias_matches}
-    if len(vendor_ids) != 1:
+    if len(vendor_ids) == 1:
+        return alias_matches[0][1]
+    if len(vendor_ids) > 1:
         return None
-    return alias_matches[0][1]
+
+    canonical_rows = db.query(Vendor).filter(Vendor.is_active.is_(True)).all()
+    # Some callers provide an already-filtered lightweight row (for example,
+    # the workflow unit seam).  Preserve that contract while real ORM rows
+    # still receive the full punctuation/suffix normalization below.
+    canonical_vendors = [
+        vendor
+        for vendor in canonical_rows
+        if not hasattr(vendor, "name")
+        or normalize_vendor_name(vendor.name) == normalized_name
+    ]
+    return canonical_vendors[0] if len(canonical_vendors) == 1 else None
+
+
+def suggest_vendor_candidates(
+    db: Session,
+    name: object,
+    *,
+    threshold: float = 0.90,
+) -> list[Vendor]:
+    """Return high-similarity active vendors without linking them."""
+    normalized = normalize_vendor_name(name)
+    if not normalized:
+        return []
+    candidates: list[tuple[float, Vendor]] = []
+    for vendor in db.query(Vendor).filter(Vendor.is_active.is_(True)).all():
+        score = SequenceMatcher(
+            None, normalized, normalize_vendor_name(vendor.name)
+        ).ratio()
+        if score >= threshold:
+            candidates.append((score, vendor))
+    return [
+        vendor
+        for _, vendor in sorted(candidates, key=lambda item: item[0], reverse=True)
+    ]
