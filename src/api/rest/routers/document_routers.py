@@ -56,6 +56,10 @@ from ....services.docling_model_services import (
     docling_models_available,
 )
 from ....services.document_ingest_services import MAX_FILE_SIZE, ingest_file
+from ....services.document_preview_services import (
+    DocumentPreviewError,
+    get_docx_preview,
+)
 from ....services.document_retry_services import (
     classify_document_failure,
     is_transient_document_error,
@@ -2987,6 +2991,7 @@ def get_document_file(
         )
         .first()
     )
+
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if not document.storage_path:
@@ -3020,6 +3025,73 @@ def get_document_file(
         media_type=media_type,
         headers={
             "Content-Disposition": f"{disposition}; filename*=UTF-8''{filename}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/{document_id}/preview")
+def get_document_preview(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return an inline preview without replacing or exposing the original object."""
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == document_id,
+            *_document_scope_filters(_document_owner_id(current_user), current_user),
+        )
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    extension = Path(document.original_filename).suffix.casefold()
+    if extension in {".pdf", ".png", ".jpg", ".jpeg"}:
+        if not document.storage_path:
+            raise HTTPException(status_code=404, detail="Original file is unavailable")
+        try:
+            content = download_file(document.storage_path)
+        except Exception as exc:
+            logger.error("Preview source download failed (%s)", type(exc).__name__)
+            raise HTTPException(
+                status_code=502, detail="Document preview could not be retrieved"
+            ) from exc
+        media_type = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        }[extension]
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    if extension != ".docx":
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "preview_unsupported",
+                "message": "This file type does not support a preview.",
+            },
+        )
+    try:
+        content = get_docx_preview(document)
+    except DocumentPreviewError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "inline",
             "X-Content-Type-Options": "nosniff",
         },
     )

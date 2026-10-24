@@ -62,6 +62,17 @@ def download_file(object_key: str) -> bytes:
         response.release_conn()
 
 
+def file_exists(object_key: str) -> bool:
+    """Return whether an object exists without exposing object contents."""
+    try:
+        get_minio_client().stat_object(get_bucket_name(), object_key)
+        return True
+    except S3Error as exc:
+        if exc.code in {"NoSuchKey", "NoSuchObject", "NotFound"}:
+            return False
+        raise
+
+
 def delete_file(object_key: str) -> None:
     get_minio_client().remove_object(get_bucket_name(), object_key)
 
