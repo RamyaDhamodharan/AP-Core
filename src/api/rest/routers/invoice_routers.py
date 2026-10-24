@@ -58,6 +58,7 @@ from src.services.invoice_comparison_services import saved_comparison_checks
 from src.services.invoice_confidence_services import (
     confidence_level,
     confidence_threshold,
+    confidence_unavailable,
     overall_confidence_percent,
     requires_verification,
 )
@@ -98,12 +99,11 @@ def _owner_id(user: dict) -> uuid.UUID:
 def _overall_invoice_confidence(confidence: dict | None) -> str:
     """Return the display level using the minimum invoice field confidence.
 
-    Missing or derived confidence is deliberately exposed as ``low`` for the
-    invoice UI; the decision engine still treats it as unverified and applies
-    its existing 85-point gate.
+    Missing or derived confidence stays unscored in the UI; matching still
+    treats it as unverified and applies the 85-point gate.
     """
     level = confidence_level(confidence or {})
-    return level if level in {"high", "medium", "low"} else "low"
+    return level if level in {"high", "medium", "low", "unknown"} else "unknown"
 
 
 def _checked_invoice_number(db, vendor_id, invoice_no, *, exclude_invoice_id=None):
@@ -432,6 +432,7 @@ def _invoice_dashboard_response(
                 email_sender=getattr(document, "email_sender", None),
                 email_subject=getattr(document, "email_subject", None),
                 invoice_no=invoice.invoice_no,
+                vendor_id=getattr(invoice, "vendor_id", None),
                 vendor_name=vendor_name or invoice.vendor_name_raw,
                 invoice_date=invoice.invoice_date,
                 due_date=invoice.due_date,
@@ -451,6 +452,13 @@ def _invoice_dashboard_response(
                 ),
                 overall_confidence_percent=overall_confidence_percent(
                     getattr(invoice, "field_confidence", None) or {}
+                ),
+                confidence_status=(
+                    "not_scored"
+                    if confidence_unavailable(
+                        getattr(invoice, "field_confidence", None) or {}
+                    )
+                    else "scored"
                 ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
@@ -725,6 +733,9 @@ def get_invoice_verification(
         "needs_verification": requires_verification(confidence),
         "confidence_level": confidence_level(confidence),
         "overall_confidence_percent": overall_confidence_percent(confidence),
+        "confidence_status": (
+            "not_scored" if confidence_unavailable(confidence) else "scored"
+        ),
         "threshold": confidence_threshold(),
         "gl_code_warning": (
             f"Unknown GL code: {invoice.gl_code}"
@@ -1178,6 +1189,11 @@ def get_invoice_detail(
         ),
         "overall_confidence_percent": overall_confidence_percent(
             getattr(invoice, "field_confidence", None) or {}
+        ),
+        "confidence_status": (
+            "not_scored"
+            if confidence_unavailable(getattr(invoice, "field_confidence", None) or {})
+            else "scored"
         ),
         "low_confidence_fields": low_confidence_fields,
         "supporting_documents_count": (

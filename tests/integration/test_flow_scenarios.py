@@ -525,6 +525,50 @@ def test_numbered_po_match_is_saved_as_ready_to_pay(db_session, db_factories):
     assert invoice.po_decision is None
 
 
+def test_null_vendor_tax_id_self_heals_before_match_and_reaches_ready_to_pay(
+    db_session, db_factories
+):
+    user, vendor, _po, _line, invoice = _case(db_session, db_factories)
+    invoice.vendor_id = None
+    invoice.vendor_name_raw = vendor.name
+    invoice.vendor_tax_id_raw = vendor.tax_id
+
+    run = run_match_for_invoice(db_session, invoice.id, user.id, force=True)
+    db_session.flush()
+
+    assert invoice.vendor_id == vendor.id
+    assert invoice.status == "ready_to_pay"
+    assert run.result == "match_ok"
+    assert (
+        db_session.query(AuditLog)
+        .filter_by(
+            entity_type="invoice",
+            entity_id=invoice.id,
+            action="vendor_linked_automatically",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_vendor_link_backfill_is_idempotent_and_rematches(db_session, db_factories):
+    from src.services.vendor_backfill_services import backfill_vendor_links
+
+    _user, vendor, _po, _line, invoice = _case(db_session, db_factories)
+    invoice.vendor_id = None
+    invoice.vendor_name_raw = vendor.name
+    invoice.vendor_tax_id_raw = vendor.tax_id
+
+    first = backfill_vendor_links(db_session)
+    second = backfill_vendor_links(db_session)
+
+    assert first["invoices_linked"] == 1
+    assert first["invoices_rematched"] == 1
+    assert second["invoices_linked"] == 0
+    assert second["invoices_rematched"] == 0
+    assert invoice.status == "ready_to_pay"
+
+
 def test_missing_numbered_po_waits_until_po_and_gr_arrive(db_session, db_factories):
     from src.api.rest.routers.document_routers import (
         _save_goods_receipt_from_extraction,

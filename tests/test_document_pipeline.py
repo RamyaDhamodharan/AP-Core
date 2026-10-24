@@ -377,6 +377,51 @@ def test_parse_document_success(monkeypatch):
     assert matched_invoice_ids == [saved_invoice.id]
 
 
+def test_reread_invoice_document_requeues_extracted_invoice(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from src.models.audit_models import AuditLog
+
+    document = SimpleNamespace(
+        id=uuid.uuid4(),
+        doc_type="invoice",
+        status="extracted",
+        failure_message="old reason",
+        failure_class="permanent",
+        retry_count=3,
+        next_retry_at=object(),
+        updated_by=None,
+    )
+    db = MagicMock()
+    query = db.query.return_value
+    query.filter.return_value.with_for_update.return_value.first.return_value = document
+    dispatched = []
+    monkeypatch.setattr(
+        document_routers,
+        "dispatch_document_processing",
+        lambda *_args: dispatched.append(_args[1]),
+    )
+
+    result = document_routers.reread_invoice_document(
+        document.id,
+        BackgroundTasks(),
+        db,
+        {"sub": str(uuid.uuid4())},
+    )
+
+    assert result == {"document_id": str(document.id), "status": "processing"}
+    assert document.status == "received"
+    assert document.failure_message is None
+    assert document.failure_class is None
+    assert document.retry_count == 0
+    assert dispatched == [document.id]
+    assert any(
+        isinstance(call.args[0], AuditLog)
+        and call.args[0].action == "invoice_document_reread_requested"
+        for call in db.add.call_args_list
+    )
+
+
 def test_invoice_persistence_defers_po_link_and_status_to_match_engine():
     vendor = SimpleNamespace(id=uuid.uuid4())
     po = SimpleNamespace(

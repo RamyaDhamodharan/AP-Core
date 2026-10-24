@@ -58,9 +58,10 @@ def test_overall_confidence_percent_uses_header_min_and_line_average():
     assert overall_confidence_percent(confidence) == 86
 
 
-def test_overall_confidence_percent_treats_missing_as_zero_and_rounds():
+def test_overall_confidence_percent_is_unscored_when_confidence_is_missing():
     confidence = normalize_invoice_confidence({"vendor": "Only field"})
-    assert overall_confidence_percent(confidence) == 0
+    assert overall_confidence_percent(confidence) is None
+    assert confidence_level(confidence) == "unknown"
 
 
 client = TestClient(app)

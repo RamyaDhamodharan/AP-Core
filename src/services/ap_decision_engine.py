@@ -20,7 +20,10 @@ from src.models.invoice_match_models import InvoiceMatch
 from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.invoice_comparison_services import build_comparison_snapshot
-from src.services.invoice_confidence_services import overall_confidence_percent
+from src.services.invoice_confidence_services import (
+    confidence_unavailable,
+    overall_confidence_percent,
+)
 from src.services.invoice_number_services import find_duplicate_invoice
 from src.services.po_matching_services import normalize_po_reference, normalize_value
 from src.services.runtime_config_services import (
@@ -148,6 +151,11 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     """
     # Step 1: Resolve only an exact normalized PO number; ambiguous numbers need review.
     issues = []
+    from src.services.invoice_vendor_link_services import (
+        link_invoice_vendor_if_resolvable,
+    )
+
+    link_invoice_vendor_if_resolvable(db, invoice, actor_id=owner_id)
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
     po_ref = normalize_po_reference(po_number_raw)
@@ -227,6 +235,13 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     receipts = (
         db.query(GoodsReceipt).filter(GoodsReceipt.po_id == po.id).all() if po else []
     )
+    linked_vendor_id = getattr(invoice, "vendor_id", None)
+    if po is not None and linked_vendor_id and po.vendor_id is None:
+        po.vendor_id = linked_vendor_id
+    if po is not None and linked_vendor_id:
+        for receipt in receipts:
+            if getattr(receipt, "vendor_id", None) is None:
+                receipt.vendor_id = linked_vendor_id
     require_receipt = require_goods_receipt()
     if po is not None and not invoice_only and not receipts and require_receipt:
         issues.append(
@@ -252,7 +267,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             ) + _d(grline.accepted_qty)
 
     # Step 3: Check vendor ownership and matching currencies before comparing amounts.
-    invoice_vendor_id = getattr(invoice, "vendor_id", None)
+    invoice_vendor_id = linked_vendor_id
     invoice_tax_id = normalize_vendor_tax_id(
         getattr(invoice, "vendor_tax_id_raw", None)
     )
@@ -519,12 +534,24 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             score = _score(fields.get(field))
             if score is None or score < MIN_MATERIAL_CONFIDENCE:
                 low_fields.append(f"line_{index}.{field}")
-    if low_fields or Decimal(overall_percent) < MIN_MATERIAL_CONFIDENCE:
+    confidence_not_scored = confidence_unavailable(confidence)
+    if (
+        confidence_not_scored
+        or low_fields
+        or (
+            overall_percent is not None
+            and Decimal(overall_percent) < MIN_MATERIAL_CONFIDENCE
+        )
+    ):
         issues.append(
             _issue(
                 "LOW_CONFIDENCE",
-                "One or more material fields are unverified or below the "
-                "confidence threshold.",
+                (
+                    "Confidence not available, re-read the document"
+                    if confidence_not_scored
+                    else "One or more material fields are below the confidence "
+                    "threshold."
+                ),
                 low_fields,
                 f"At least {MIN_MATERIAL_CONFIDENCE}% confidence",
                 action="Verify the listed fields.",
@@ -600,6 +627,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         ),
         "confidence_level": confidence_level,
         "overall_confidence_percent": overall_percent,
+        "confidence_status": "not_scored" if confidence_not_scored else "scored",
         "field_confidence": confidence,
         "confidence_levels": confidence_levels,
         "low_confidence_fields": low_fields,

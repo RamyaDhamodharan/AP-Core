@@ -202,11 +202,29 @@ def test_unresolved_vendor_is_a_saved_blocking_reason(monkeypatch):
     db, invoice, _po, _line = _fixture(monkeypatch)
     invoice.vendor_id = None
     invoice.vendor_tax_id_raw = None
+    monkeypatch.setattr(
+        "src.services.invoice_vendor_link_services.resolve_vendor",
+        lambda *_args, **_kwargs: None,
+    )
     outcome = engine.evaluate_invoice(db, invoice)
     assert outcome["outcome"] == "needs_review"
     assert "VENDOR_UNRESOLVED" in {
         item["code"] for item in outcome["discrepancies"]
     }
+
+
+def test_unscored_confidence_is_null_and_has_a_reread_reason(monkeypatch):
+    db, invoice, _po, _line = _fixture(monkeypatch)
+    invoice.field_confidence = {}
+    outcome = engine.evaluate_invoice(db, invoice)
+    confidence_issue = next(
+        item for item in outcome["discrepancies"] if item["code"] == "LOW_CONFIDENCE"
+    )
+    assert outcome["overall_confidence_percent"] is None
+    assert outcome["confidence_status"] == "not_scored"
+    assert confidence_issue["message"] == (
+        "Confidence not available, re-read the document"
+    )
 
 
 def test_multiple_discrepancies_are_kept(monkeypatch):

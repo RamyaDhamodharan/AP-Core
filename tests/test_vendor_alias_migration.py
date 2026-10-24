@@ -33,7 +33,7 @@ def test_alembic_revision_chain_has_one_expected_head():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261025_0025"]
+    assert script.get_heads() == ["20261025_0026"]
     po_link_revision = script.get_revision("20261025_0025")
     assert po_link_revision is not None
     assert po_link_revision.down_revision == "20261025_0024"

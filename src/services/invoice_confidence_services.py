@@ -26,7 +26,7 @@ INVOICE_CONFIDENCE_FIELDS = (
 LINE_CONFIDENCE_FIELDS = ("qty", "unit_price", "line_amount")
 
 
-def overall_confidence_percent(confidence: dict[str, Any] | None) -> int:
+def overall_confidence_percent(confidence: dict[str, Any] | None) -> int | None:
     """
     Return the deterministic invoice confidence percentage.
 
@@ -41,6 +41,8 @@ def overall_confidence_percent(confidence: dict[str, Any] | None) -> int:
     Results: no workflow status or reason code directly.
     """
     confidence = confidence if isinstance(confidence, dict) else {}
+    if confidence_unavailable(confidence):
+        return None
 
     def score(raw: Any) -> Decimal:
         """
@@ -210,9 +212,7 @@ def confidence_level(confidence: dict[str, Any] | None) -> str:
     Effects: does not write database rows or queue work directly.
     Results: no workflow status or reason code directly.
     """
-    if not confidence:
-        return "unknown"
-    if any(field not in confidence for field in INVOICE_CONFIDENCE_FIELDS):
+    if confidence_unavailable(confidence):
         return "unknown"
     entries = [confidence[field] for field in INVOICE_CONFIDENCE_FIELDS]
     for line in confidence.get("line_items", []):

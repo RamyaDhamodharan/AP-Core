@@ -9,7 +9,10 @@ from sqlalchemy.dialects import postgresql
 
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
-from src.api.rest.routers.vendor_routers import _clear_stale_vendor_flag
+from src.api.rest.routers.vendor_routers import (
+    _clear_stale_vendor_flag,
+    list_vendor_duplicates_admin,
+)
 from src.db.session_db import get_db
 from src.models.vendor_models import VendorAlias
 from src.services.vendor_resolution_services import (
@@ -112,6 +115,13 @@ def test_resolution_accepts_case_and_whitespace_variations():
     assert resolve_vendor(db, "  aCmE\t supplies ") is canonical
 
 
+def test_resolution_accepts_normalized_punctuation_and_company_suffixes():
+    vendor = _vendor(name="QuickBasket Traders")
+    db, _, _ = _resolver_db(canonical_vendors=[vendor])
+
+    assert resolve_vendor(db, "QuickBasket Traders, Pvt. Ltd.") is vendor
+
+
 def test_resolution_uses_unique_alias_mapping():
     vendor = _vendor()
     alias = _alias(vendor.id)
@@ -158,9 +168,6 @@ def test_resolution_filters_out_inactive_aliases_and_vendors():
     assert any(
         "vendor_aliases.is_active IS true" in str(expression) for expression in compiled
     )
-    assert any(
-        "vendors.is_active IS true" in str(expression) for expression in compiled
-    )
 
 
 def test_resolution_uses_unique_active_tax_id_before_vendor_name():
@@ -176,14 +183,27 @@ def test_resolution_uses_unique_active_tax_id_before_vendor_name():
     db.query.assert_called_once()
 
 
-def test_unmatched_tax_id_does_not_fall_back_to_similar_vendor_name():
+def test_unmatched_tax_id_falls_back_to_exact_normalized_vendor_name():
+    vendor = _vendor(name="Canonical Vendor")
     tax_query = MagicMock()
     tax_query.filter.return_value.all.return_value = []
+    alias_query = MagicMock()
+    alias_query.join.return_value.filter.return_value.all.return_value = []
+    name_query = MagicMock()
+    name_query.filter.return_value.all.return_value = [vendor]
     db = MagicMock()
-    db.query.return_value = tax_query
+    db.query.side_effect = [tax_query, alias_query, name_query]
 
-    assert resolve_vendor(db, "Canonical Vendor", tax_id="MISMATCH") is None
-    db.query.assert_called_once()
+    assert resolve_vendor(db, "Canonical Vendor", tax_id="MISMATCH") is vendor
+    assert db.query.call_count == 3
+
+
+def test_alias_can_explicitly_resolve_to_inactive_vendor():
+    vendor = _vendor(name="Retired vendor", is_active=False)
+    alias = _alias(vendor.id, name="legacy name")
+    db, _, _ = _resolver_db(alias_rows=[(alias, vendor)])
+
+    assert resolve_vendor(db, "legacy name") is vendor
 
 
 def test_fuzzy_match_is_only_a_suggestion():
@@ -197,6 +217,26 @@ def test_fuzzy_match_is_only_a_suggestion():
     assert suggest_vendor_candidates(db, "Quick Basket Traderz", threshold=0.8) == [
         candidate
     ]
+
+
+def test_admin_duplicate_list_reports_name_and_tax_prefix_without_merging():
+    first = _vendor(name="QuickBasket Traders, Pvt. Ltd.")
+    second = _vendor(name="QuickBasket Traders", is_active=False)
+    first.tax_id = "51ABCDE1234"
+    second.tax_id = "51ABCDX9999"
+    query = MagicMock()
+    query.order_by.return_value.all.return_value = [first, second]
+    db = MagicMock()
+    db.query.return_value = query
+
+    result = list_vendor_duplicates_admin(db)
+
+    assert result["total"] == 2
+    assert {row["match_type"] for row in result["items"]} == {
+        "normalized_name",
+        "tax_id_prefix",
+    }
+    assert all(len(row["vendors"]) == 2 for row in result["items"])
 
 
 def test_exact_resolution_clears_only_stale_new_vendor_flag():

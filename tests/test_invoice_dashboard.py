@@ -94,6 +94,7 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "email_sender": None,
             "email_subject": None,
             "invoice_no": "INV-101",
+            "vendor_id": None,
             "vendor_name": "ABC Supplies",
             "invoice_date": "2026-10-01",
             "due_date": "2026-10-31",
@@ -105,8 +106,9 @@ def test_invoice_list_is_paginated_and_returns_dashboard_fields():
             "workflow_status": "received",
             "gl_code": None,
             "confidence": None,
-            "confidence_level": "low",
-            "overall_confidence_percent": 0,
+            "confidence_level": "unknown",
+            "overall_confidence_percent": None,
+            "confidence_status": "not_scored",
             "can_resubmit": False,
             "status": "processing",
         }
@@ -218,7 +220,9 @@ def test_invoice_detail_flags_low_confidence_extraction_fields():
         app.dependency_overrides.pop(get_current_user, None)
     assert response.status_code == 200
     assert response.json()["low_confidence_fields"] == ["invoice_no"]
-    assert response.json()["confidence_level"] == "low"
+    assert response.json()["confidence_level"] == "unknown"
+    assert response.json()["confidence_status"] == "not_scored"
+    assert response.json()["overall_confidence_percent"] is None
     assert response.json()["supporting_documents_count"] == 0
     assert response.json()["subtotal"] is None
     assert response.json()["tax_amount"] is None

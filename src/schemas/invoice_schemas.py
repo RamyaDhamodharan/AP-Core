@@ -95,6 +95,7 @@ class InvoiceDashboardItem(BaseModel):
     email_sender: str | None = None
     email_subject: str | None = None
     invoice_no: str | None
+    vendor_id: UUID | None = None
     vendor_name: str | None
     invoice_date: date | None
     due_date: date | None
@@ -108,10 +109,10 @@ class InvoiceDashboardItem(BaseModel):
     workflow_status: InvoiceWorkflowStatus = "received"
     gl_code: str | None = None
     confidence: float | None = None
-    # Display-only overall level derived from the minimum invoice field
-    # confidence (unavailable values are treated as low).
+    # Display-only overall level; unknown means no score was stored.
     confidence_level: str = "low"
-    overall_confidence_percent: int = 0
+    overall_confidence_percent: int | None = None
+    confidence_status: Literal["scored", "not_scored"] = "not_scored"
     can_resubmit: bool = False
     status: InvoiceStatus = "processing"
 

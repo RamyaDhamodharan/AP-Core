@@ -36,6 +36,7 @@ from src.services.vendor_resolution_services import (
     find_active_alias_conflict,
     find_canonical_name_conflict,
     normalize_vendor_name,
+    normalize_vendor_tax_id,
     resolve_vendor,
     suggest_vendor_candidates,
 )
@@ -190,7 +191,7 @@ def resolve_extracted_records_for_vendor(
     Results: no workflow status or reason code directly.
     """
     vendor = db.get(Vendor, vendor_id)
-    if vendor is None or not vendor.is_active:
+    if vendor is None:
         raise HTTPException(status_code=404, detail="Active vendor not found")
     aliases = (
         db.query(VendorAlias)
@@ -200,6 +201,13 @@ def resolve_extracted_records_for_vendor(
         )
         .all()
     )
+    identity_name = normalize_vendor_name(identity.get("name"))
+    alias_names = {alias.alias_norm for alias in aliases}
+    if not vendor.is_active and identity_name not in alias_names:
+        raise HTTPException(
+            status_code=409,
+            detail="Inactive vendors can only be linked through an explicit alias",
+        )
     names = {
         normalize_vendor_name(value)
         for value in (
@@ -239,6 +247,7 @@ def resolve_extracted_records_for_vendor(
         if (
             isinstance(existing_resolution, dict)
             and existing_resolution.get("vendor_id") == str(vendor.id)
+            and document.vendor_id is not None
             and "new vendor" not in str(document.failure_message or "").casefold()
         ):
             # Repeated create-then-resolve calls are safe and do not create
@@ -261,6 +270,7 @@ def resolve_extracted_records_for_vendor(
                             updated_by=actor_id,
                         )
                     )
+        document.vendor_id = vendor.id
         summary["documents"] += 1
         invoice = (
             db.query(Invoice)
@@ -446,6 +456,58 @@ def backfill_unresolved_vendors(
         for key in totals:
             totals[key] += int(summary.get(key, 0))
     return {"status": "completed", "vendors": len(vendors), **totals}
+
+
+@router.post(
+    "/admin/backfill-links",
+    dependencies=[Depends(require_role("admin"))],
+)
+def backfill_vendor_links_admin(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Backfill NULL vendor links and rerun matching for changed invoices."""
+    from src.services.vendor_backfill_services import backfill_vendor_links
+
+    actor_id = uuid.UUID(str(current_user["sub"]))
+    counts = backfill_vendor_links(db, actor_id)
+    db.commit()
+    return {"status": "completed", **counts}
+
+
+@router.get(
+    "/admin/duplicates",
+    dependencies=[Depends(require_role("admin"))],
+)
+def list_vendor_duplicates_admin(db: Session = Depends(get_db)) -> dict:
+    """List possible duplicate vendor groups without merging any records."""
+    vendors = db.query(Vendor).order_by(Vendor.name, Vendor.id).all()
+    groups: dict[tuple[str, str], list[Vendor]] = {}
+    for vendor in vendors:
+        normalized_name = normalize_vendor_name(vendor.name)
+        if normalized_name:
+            groups.setdefault(("normalized_name", normalized_name), []).append(vendor)
+        tax_id = normalize_vendor_tax_id(vendor.tax_id)
+        if len(tax_id) >= 6:
+            groups.setdefault(("tax_id_prefix", tax_id[:6]), []).append(vendor)
+    duplicates = [
+        {
+            "match_type": kind,
+            "key": key,
+            "vendors": [
+                {
+                    "id": str(vendor.id),
+                    "name": vendor.name,
+                    "tax_id": vendor.tax_id,
+                    "is_active": vendor.is_active,
+                }
+                for vendor in rows
+            ],
+        }
+        for (kind, key), rows in sorted(groups.items())
+        if len({vendor.id for vendor in rows}) > 1
+    ]
+    return {"items": duplicates, "total": len(duplicates)}
 
 
 @router.get("/resolve-extracted", dependencies=[Depends(get_current_user)])

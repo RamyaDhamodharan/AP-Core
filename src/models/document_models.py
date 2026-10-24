@@ -91,6 +91,9 @@ class Document(Base):
     size: Mapped[int | None] = mapped_column(nullable=True)
     raw_text: Mapped[str | None] = mapped_column(Text)
     extracted_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    vendor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vendors.id")
+    )
     email_sender: Mapped[str | None] = mapped_column(String(200))
     email_subject: Mapped[str | None] = mapped_column(String(500))
     email_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

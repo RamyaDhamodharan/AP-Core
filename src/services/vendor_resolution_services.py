@@ -120,22 +120,20 @@ def resolve_vendor(
             return matches[0]
         if matches:
             return None
-        return None
 
     normalized_name = normalize_vendor_name(name)
     if not normalized_name:
         return None
 
     # Query aliases first so an explicitly configured alias wins over a
-    # canonical name collision.  Both queries are scoped to active vendors;
-    # vendor visibility is intentionally global for authenticated users.
+    # canonical name collision. An explicit active alias may intentionally point
+    # to an inactive vendor; canonical name and tax ID resolution stay active-only.
     alias_matches = (
         db.query(VendorAlias, Vendor)
         .join(Vendor, VendorAlias.vendor_id == Vendor.id)
         .filter(
             VendorAlias.alias_norm == normalized_name,
             VendorAlias.is_active.is_(True),
-            Vendor.is_active.is_(True),
         )
         .all()
     )

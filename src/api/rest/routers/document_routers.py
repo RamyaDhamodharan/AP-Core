@@ -991,6 +991,8 @@ def _save_invoice_from_extraction(
     vendor_name = str(data.get("vendor") or "").strip() or None
     vendor_resolution_started = time.perf_counter()
     vendor = resolve_vendor(db, vendor_name, tax_id=data.get("vendor_tax_id"))
+    if vendor is not None:
+        document.vendor_id = vendor.id
     _record_pipeline_step(
         db,
         document,
@@ -1068,6 +1070,8 @@ def _save_invoice_from_extraction(
                     "record; review required"
                 )
         source_invoice.field_confidence = invoice_values["field_confidence"]
+        if source_invoice.vendor_id is None and vendor is not None:
+            source_invoice.vendor_id = vendor.id
         return source_invoice
 
     version_no = 1
@@ -1157,6 +1161,8 @@ def _save_invoice_from_extraction(
 
     db.add(invoice)
     db.flush()
+    if vendor is not None:
+        document.vendor_id = vendor.id
     _replace_invoice_lines(db, invoice, data, None)
 
     return invoice
@@ -1538,6 +1544,8 @@ def _save_goods_receipt_from_extraction(
     if existing_receipt is not None:
         existing_receipt.field_confidence = _extracted_field_confidence(data)
         existing_receipt.vendor_id = vendor.id if vendor else existing_receipt.vendor_id
+    if vendor is not None:
+        document.vendor_id = vendor.id
     duplicate_query = db.query(GoodsReceipt).filter(
         func.lower(func.trim(GoodsReceipt.gr_number)) == gr_number.lower()
     )
@@ -1857,6 +1865,8 @@ def _save_purchase_order_from_extraction(
     if existing is not None:
         if existing.vendor_id is None and vendor is not None:
             existing.vendor_id = vendor.id
+        if vendor is not None:
+            document.vendor_id = vendor.id
         existing.field_confidence = _extracted_field_confidence(data)
         # Invoice confidence gates apply to invoices only. Procurement records
         # remain usable for matching even when extracted confidence is low.
@@ -1886,6 +1896,8 @@ def _save_purchase_order_from_extraction(
 
     db.add(purchase_order)
     db.flush()
+    if vendor is not None:
+        document.vendor_id = vendor.id
 
     for raw in data.get("line_items") or []:
         if not isinstance(raw, dict):
@@ -3183,3 +3195,54 @@ def retry_document_processing(
             _process_document_with_retries,
         )
     return {"id": str(document.id), "status": document.status}
+
+
+@router.post("/{document_id}/reread", status_code=202)
+def reread_invoice_document(
+    document_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Re-run extraction and matching on an already extracted invoice document."""
+    owner_id = _document_owner_id(current_user)
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == document_id,
+            *_document_scope_filters(owner_id, current_user),
+        )
+        .with_for_update()
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if document.doc_type != "invoice" or document.status != "extracted":
+        raise HTTPException(
+            status_code=409,
+            detail="Only extracted invoice documents can be re-read",
+        )
+    prior_status = document.status
+    document.status = "received"
+    document.failure_message = None
+    document.failure_class = None
+    document.retry_count = 0
+    document.next_retry_at = None
+    document.updated_by = owner_id
+    db.add(
+        AuditLog(
+            action="invoice_document_reread_requested",
+            entity_type="document",
+            entity_id=document.id,
+            old_value={"status": prior_status},
+            new_value={"status": "received"},
+            result="success",
+            message="Invoice document re-read requested",
+            created_by=owner_id,
+        )
+    )
+    db.commit()
+    dispatch_document_processing(
+        background_tasks, document.id, _process_document_with_retries
+    )
+    return {"document_id": str(document.id), "status": "processing"}

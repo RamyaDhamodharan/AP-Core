@@ -22,6 +22,7 @@ ROUTE_AUDIT_TESTS = {
     "document_routers.py:resolve_purchase_order_vendor": "test_document_pipeline.py",
     "document_routers.py:parse_document": "test_document_pipeline.py",
     "document_routers.py:retry_document_processing": "test_document_pipeline.py",
+    "document_routers.py:reread_invoice_document": "test_document_pipeline.py",
     "document_routers.py:backfill_procurement_documents_endpoint": (
         "test_procurement_auto_flow.py"
     ),
