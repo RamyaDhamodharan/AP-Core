@@ -18,6 +18,12 @@ class GoodsReceiptLineInput(BaseModel):
 
     @model_validator(mode="after")
     def quantities_balance(self):
+        if (
+            self.received_qty is None
+            or self.accepted_qty is None
+            or self.rejected_qty is None
+        ):
+            return self
         if self.accepted_qty + self.rejected_qty != self.received_qty:
             raise ValueError("accepted_qty plus rejected_qty must equal received_qty")
         return self

@@ -98,23 +98,74 @@ def _attempt_audit(
     next_retry_at: datetime | None = None,
     actor_id=None,
 ) -> None:
-    db.add(
-        AuditLog(
-            action="document_processing_attempt",
-            entity_type="document",
-            entity_id=document.id,
-            result=result,
-            message=f"Document processing attempt {attempt}",
-            reason=reason,
-            new_value={
-                "attempt": attempt,
-                "maximum_retries": MAX_AUTOMATIC_RETRIES,
-                "failure_class": document.failure_class,
-                "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
-            },
-            created_by=actor_id,
+    phase = "started" if result == "warning" and reason is None else result
+    try:
+        with db.begin_nested():
+            db.add(
+                AuditLog(
+                    action="document_processing_attempt",
+                    entity_type="document",
+                    entity_id=document.id,
+                    result=result,
+                    message=f"Document processing attempt {attempt} {phase}",
+                    reason=reason,
+                    new_value={
+                        "attempt": attempt,
+                        "maximum_retries": MAX_AUTOMATIC_RETRIES,
+                        "failure_class": document.failure_class,
+                        "next_retry_at": next_retry_at.isoformat()
+                        if next_retry_at
+                        else None,
+                        "phase": phase,
+                    },
+                    created_by=actor_id,
+                )
+            )
+            db.flush()
+    except Exception as exc:
+        logger.warning("Document attempt audit write failed (%s)", type(exc).__name__)
+
+
+def _mark_unexpected_failure(
+    make_session: Callable,
+    document_id: uuid.UUID,
+    attempt_number: int,
+    error: BaseException,
+) -> None:
+    """Ensure an unexpected worker exception cannot leave a document processing."""
+    db = make_session()
+    try:
+        document = (
+            db.query(Document)
+            .filter(Document.id == document_id)
+            .with_for_update()
+            .first()
         )
-    )
+        if document is None or document.status in {"failed", "processed", "extracted"}:
+            return
+        document.status = "failed"
+        document.failure_class = classify_document_failure(error)
+        document.next_retry_at = None
+        document.failure_message = (
+            "Document processing stopped unexpectedly. Retry the document or "
+            "upload the file again."
+        )
+        _attempt_audit(
+            db,
+            document,
+            attempt=attempt_number,
+            result="error",
+            reason=document.failure_message,
+            actor_id=getattr(document, "updated_by", None)
+            or getattr(document, "created_by", None),
+        )
+        db.commit()
+    except Exception as exc:
+        logger.warning(
+            "Unable to mark document attempt failed (%s)", type(exc).__name__
+        )
+    finally:
+        db.close()
 
 
 def process_document_attempt(
@@ -149,7 +200,7 @@ def process_document_attempt(
             db,
             document,
             attempt=attempt_number,
-            result="started",
+            result="warning",
             actor_id=getattr(document, "updated_by", None)
             or getattr(document, "created_by", None),
         )
@@ -157,7 +208,15 @@ def process_document_attempt(
     finally:
         db.close()
 
-    _process_in_background(document_id)
+    try:
+        _process_in_background(document_id)
+    except Exception as exc:
+        logger.warning(
+            "Document processing attempt failed unexpectedly (%s)",
+            type(exc).__name__,
+        )
+        _mark_unexpected_failure(make_session, document_id, attempt_number, exc)
+        return None
 
     db = make_session()
     try:
@@ -174,7 +233,7 @@ def process_document_attempt(
                 db,
                 document,
                 attempt=attempt_number,
-                result="permanent_failure",
+                result="error",
                 reason=document.failure_message,
                 actor_id=getattr(document, "updated_by", None)
                 or getattr(document, "created_by", None),
@@ -192,7 +251,7 @@ def process_document_attempt(
                 db,
                 document,
                 attempt=attempt_number,
-                result="retry_limit_reached",
+                result="error",
                 reason=document.failure_message,
                 actor_id=getattr(document, "updated_by", None)
                 or getattr(document, "created_by", None),
@@ -207,7 +266,7 @@ def process_document_attempt(
             db,
             document,
             attempt=retry_index + 1,
-            result="retry_scheduled",
+            result="warning",
             reason=document.failure_message,
             next_retry_at=document.next_retry_at,
             actor_id=getattr(document, "updated_by", None)
@@ -227,9 +286,7 @@ def process_document_with_retries(
 ) -> None:
     """Non-Celery fallback using the same retry counts and delay schedule."""
     while True:
-        delay = process_document_attempt(
-            document_id, session_factory=session_factory
-        )
+        delay = process_document_attempt(document_id, session_factory=session_factory)
         if delay is None:
             return
         sleep(delay)

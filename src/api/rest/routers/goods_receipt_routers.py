@@ -150,7 +150,7 @@ def list_goods_receipts(
     source_document_id: uuid.UUID | None = None,
     search: Annotated[str | None, Query(max_length=200)] = None,
     sort_by: Annotated[
-        str, Query(pattern="^(receipt_date|gr_number|created_at)$")
+        str, Query(pattern="^(receipt_date|receipt_number|gr_number|created_at)$")
     ] = "receipt_date",
     sort_dir: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
     status: Literal["all", "needs_verification", "verified"] = "all",
@@ -198,7 +198,11 @@ def list_goods_receipts(
             GoodsReceipt.needs_verification.is_(False),
             GoodsReceipt.vendor_id.is_not(None),
         )
-    sort_column = getattr(GoodsReceipt, sort_by)
+    sort_column = (
+        GoodsReceipt.gr_number
+        if sort_by == "receipt_number"
+        else getattr(GoodsReceipt, sort_by)
+    )
     sort_order = sort_column.asc() if sort_dir == "asc" else sort_column.desc()
     total = db.scalar(select(func.count(GoodsReceipt.id)).where(*filters)) or 0
     response.headers["X-Total-Count"] = str(total)

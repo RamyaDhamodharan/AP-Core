@@ -142,27 +142,34 @@ def _record_pipeline_step(
     result: str = "success",
 ) -> None:
     """Write a compact, non-sensitive audit record for one pipeline step."""
-    db.add(
-        AuditLog(
-            action="pipeline_step",
-            actor=(
-                str(getattr(document, "created_by", None))
-                if getattr(document, "created_by", None)
-                else "system"
-            ),
-            entity_type="document",
-            entity_id=document.id,
-            step_name=step_name,
-            duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
-            input_ref=(
-                input_ref or getattr(document, "storage_path", None) or str(document.id)
-            )[:500],
-            output_summary=output_summary or {},
-            result=result,
-            message=f"Document {step_name} step {result}",
-            created_by=getattr(document, "created_by", None),
-        )
-    )
+    try:
+        with db.begin_nested():
+            db.add(
+                AuditLog(
+                    action="pipeline_step",
+                    actor=(
+                        str(getattr(document, "created_by", None))
+                        if getattr(document, "created_by", None)
+                        else "system"
+                    ),
+                    entity_type="document",
+                    entity_id=document.id,
+                    step_name=step_name,
+                    duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+                    input_ref=(
+                        input_ref
+                        or getattr(document, "storage_path", None)
+                        or str(document.id)
+                    )[:500],
+                    output_summary=output_summary or {},
+                    result=result,
+                    message=f"Document {step_name} step {result}",
+                    created_by=getattr(document, "created_by", None),
+                )
+            )
+            db.flush()
+    except Exception as exc:
+        logger.warning("Pipeline step audit write failed (%s)", type(exc).__name__)
 
 
 def _auto_reject_unmatched_invoice(

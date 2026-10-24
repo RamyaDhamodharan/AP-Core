@@ -82,6 +82,28 @@ def test_permanent_failure_is_not_retried(monkeypatch):
     assert document.retry_count == 0
 
 
+def test_unexpected_worker_failure_moves_document_to_failed(monkeypatch):
+    document = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="received",
+        retry_count=0,
+        failure_class=None,
+        failure_message=None,
+        next_retry_at=None,
+    )
+    db = MagicMock()
+    db.query.return_value = _query(document)
+    monkeypatch.setattr(retries, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        "src.api.rest.routers.document_routers._process_in_background",
+        MagicMock(side_effect=RuntimeError("worker crash")),
+    )
+
+    assert retries.process_document_attempt(document.id) is None
+    assert document.status == "failed"
+    assert "stopped unexpectedly" in document.failure_message
+
+
 def test_review_documents_are_not_automatically_retried(monkeypatch):
     document = SimpleNamespace(
         id=uuid.uuid4(), status="needs_data_review", retry_count=0

@@ -17,6 +17,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.vendor_models import Base
 
+STEP_RESULT_VALUES = ("success", "warning", "error")
+
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
@@ -36,9 +38,7 @@ class AuditLog(Base):
     new_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     result: Mapped[str] = mapped_column(
         ENUM(
-            "success",
-            "warning",
-            "error",
+            *STEP_RESULT_VALUES,
             name="step_result",
             schema="core",
             create_type=False,
