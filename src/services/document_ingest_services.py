@@ -178,16 +178,18 @@ def ingest_file(
         return IngestResult("failed", None, str(exc)[:500] or "File ingestion failed")
 
     if extension != ".eml":
-        from src.api.rest.routers.document_routers import _process_in_background
+        from src.api.rest.routers.document_routers import (
+            _process_document_with_retries,
+        )
 
         if background_tasks is not None:
             dispatch_document_processing(
-                background_tasks, document.id, _process_in_background
+                background_tasks, document.id, _process_document_with_retries
             )
         elif os.getenv("USE_CELERY", "false").lower() == "true":
             dispatch_document_processing(
-                BackgroundTasks(), document.id, _process_in_background
+                BackgroundTasks(), document.id, _process_document_with_retries
             )
         else:
-            _process_in_background(document.id)
+            _process_document_with_retries(document.id)
     return IngestResult("received", document.id, "File received")

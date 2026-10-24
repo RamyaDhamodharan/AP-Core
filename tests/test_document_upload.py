@@ -52,6 +52,11 @@ def setup_db(monkeypatch, db):
         "_process_in_background",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        document_routers,
+        "_process_document_with_retries",
+        lambda *args, **kwargs: None,
+    )
 
 
 def teardown_db():
@@ -366,6 +371,9 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(
         )
 
     monkeypatch.setattr(document_routers, "_process_in_background", process_document)
+    monkeypatch.setattr(
+        document_routers, "_process_document_with_retries", process_document
+    )
     try:
         response = client.post(
             "/api/documents/upload",
@@ -615,7 +623,7 @@ def test_upload_triggers_auto_processing(monkeypatch):
     started = []
     monkeypatch.setattr(
         document_routers,
-        "_process_in_background",
+        "_process_document_with_retries",
         lambda document_id: started.append(document_id),
     )
     try:

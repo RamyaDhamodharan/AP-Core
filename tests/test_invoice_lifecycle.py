@@ -244,9 +244,7 @@ def test_payment_unique_index_conflict_returns_clear_conflict():
     db.rollback.assert_called_once()
 
 
-def test_document_retry_classifies_transient_and_uses_exponential_backoff(monkeypatch):
-    monkeypatch.setenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "3")
-    monkeypatch.setenv("DOCUMENT_RETRY_BASE_SECONDS", "2")
+def test_document_retry_classifies_transient_and_leaves_scheduling_to_worker():
     attempts = 0
     delays = []
 
@@ -259,9 +257,10 @@ def test_document_retry_classifies_transient_and_uses_exponential_backoff(monkey
 
     assert is_transient_document_error(ConnectionError("socket reset"))
     assert not is_transient_document_error(ValueError("corrupt PDF"))
-    assert with_transient_retries(operation, sleep=delays.append) == "done"
-    assert attempts == 3
-    assert delays == [2.0, 4.0]
+    with pytest.raises(ConnectionError, match="temporarily unavailable"):
+        with_transient_retries(operation, sleep=delays.append)
+    assert attempts == 1
+    assert delays == []
 
 
 def test_document_retry_does_not_retry_permanent_failures(monkeypatch):

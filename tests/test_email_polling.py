@@ -1114,6 +1114,7 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
         source="email",
         email_message_id="<stuck@vendor.test>",
         updated_at=old,
+        retry_count=3,
     )
     message = EmailMessageRecord(
         message_id="<stuck@vendor.test>",
@@ -1135,10 +1136,10 @@ def test_stuck_document_sweep_marks_failed_and_propagates_reason(
         )
     )
     monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
-    monkeypatch.setenv("DOCUMENT_PROCESS_MAX_ATTEMPTS", "1")
     assert sweep_stuck_documents(db) == 1
     assert document.status == "failed"
-    assert "recovery attempts" in document.failure_message
+    assert document.failure_class == "retry_exhausted"
+    assert "three automatic retries" in document.failure_message
     assert message.status == "failed_final"
     assert message.failure_reason == document.failure_message
 
@@ -1167,8 +1168,17 @@ def test_sweep_requeues_old_received_document_on_documents_queue(
     )
     monkeypatch.setenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")
     assert sweep_stuck_documents(db) == 1
-    assert document.status == "parsing"
-    assert queued == [{"args": [str(document.id)], "queue": "documents"}]
+    assert document.status == "failed"
+    assert document.failure_class == "retryable"
+    assert document.retry_count == 1
+    assert document.next_retry_at is not None
+    assert queued == [
+        {
+            "args": [str(document.id)],
+            "queue": "documents",
+            "countdown": 30,
+        }
+    ]
 
 
 def test_stuck_raw_email_without_attachment_gets_attention_reason(

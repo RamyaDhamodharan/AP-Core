@@ -85,6 +85,15 @@ class Document(Base):
     source: Mapped[str | None] = mapped_column(String(40))
     source_flag: Mapped[str | None] = mapped_column(String(100))
     failure_message: Mapped[str | None] = mapped_column(String(500))
+    failure_class: Mapped[str | None] = mapped_column(String(24))
+    retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bulk_reprocessed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

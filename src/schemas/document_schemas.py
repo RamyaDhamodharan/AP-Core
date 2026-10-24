@@ -13,6 +13,10 @@ class DocumentSummary(BaseModel):
     status: str
     doc_type: str | None
     failure_message: str | None
+    failure_class: str | None = None
+    retry_count: int = 0
+    next_retry_at: datetime | None = None
+    last_attempt_at: datetime | None = None
     source: str | None = None
     parent_document_id: uuid.UUID | None = None
     email_sender: str | None = None
@@ -51,6 +55,7 @@ class DocumentAuditEntry(BaseModel):
     duration_ms: int | None = None
     input_ref: str | None = None
     output_summary: dict[str, Any] | None = None
+    reason: str | None = None
     created_by: uuid.UUID | None
     created_at: datetime
 

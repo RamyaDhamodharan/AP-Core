@@ -57,6 +57,7 @@ from ....services.docling_model_services import (
 )
 from ....services.document_ingest_services import MAX_FILE_SIZE, ingest_file
 from ....services.document_retry_services import (
+    classify_document_failure,
     is_transient_document_error,
     with_transient_retries,
 )
@@ -271,7 +272,9 @@ def reclassify_other_document(
         )
     )
     db.commit()
-    dispatch_document_processing(background_tasks, document.id, _process_in_background)
+    dispatch_document_processing(
+        background_tasks, document.id, _process_document_with_retries
+    )
     return {"id": str(document.id), "status": "received", "doc_type": doc_type}
 
 
@@ -816,6 +819,7 @@ def _process_in_background(document_id: uuid.UUID) -> None:
                     document_id,
                 )
                 document.status = "failed"
+                document.failure_class = "permanent"
                 document.failure_message = (
                     "Document processing could not start because no uploader was "
                     "recorded. Ask an administrator to retry processing."
@@ -839,6 +843,7 @@ def _process_in_background(document_id: uuid.UUID) -> None:
                 document_id,
                 exc.detail,
             )
+            _mark_unhandled_processing_failure(db, document_id, exc)
 
         except Exception as exc:
             logger.error(
@@ -847,9 +852,62 @@ def _process_in_background(document_id: uuid.UUID) -> None:
                 type(exc).__name__,
                 _safe_exception_detail(exc),
             )
+            _mark_unhandled_processing_failure(db, document_id, exc)
 
         finally:
             db.close()
+
+
+def _mark_unhandled_processing_failure(
+    db: Session, document_id: uuid.UUID, error: BaseException
+) -> None:
+    """Persist an escaped worker error so the bounded retry policy can act."""
+    try:
+        db.rollback()
+        document = (
+            db.query(Document)
+            .filter(Document.id == document_id)
+            .with_for_update()
+            .first()
+        )
+        if document is None or document.status in {
+            "failed",
+            "needs_data_review",
+            "needs_vendor_review",
+            "extracted",
+            "processed",
+            "ignored",
+        }:
+            return
+        status_code = getattr(error, "status_code", None)
+        if status_code is not None and status_code >= 500:
+            failure_class = "retryable"
+        elif status_code is not None and status_code >= 400:
+            failure_class = "permanent"
+        else:
+            failure_class = classify_document_failure(error)
+        document.status = "failed"
+        document.failure_class = failure_class
+        document.next_retry_at = None
+        document.failure_message = (
+            "A temporary processing problem occurred. An automatic retry will be "
+            "scheduled."
+            if failure_class == "retryable"
+            else "The document could not be processed. Check the file and try again."
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Could not persist escaped processing failure for %s", document_id
+        )
+
+
+def _process_document_with_retries(document_id: uuid.UUID) -> None:
+    """Run the shared bounded retry policy in the non-Celery worker path."""
+    from ....services.document_retry_services import process_document_with_retries
+
+    process_document_with_retries(document_id, session_factory=SessionLocal)
 
 
 @router.post("/upload", status_code=202)
@@ -921,6 +979,18 @@ def backfill_procurement_documents_endpoint(
 
     actor_id = uuid.UUID(str(current_user["sub"])) if current_user.get("sub") else None
     return backfill_procurement_documents(db, actor_id)
+
+
+@router.post("/admin/reprocess-all", dependencies=[Depends(require_role("admin"))])
+def reprocess_documents_admin(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Explicitly reprocess one idempotent batch of at most five documents."""
+    from ....services.document_retry_services import reprocess_documents_batch
+
+    actor_id = uuid.UUID(str(current_user["sub"]))
+    return reprocess_documents_batch(db, actor_id, limit=5)
 
 
 def _save_invoice_from_extraction(
@@ -1682,9 +1752,7 @@ def _rematch_waiting_invoices_for_po(
 
     for invoice in invoices:
         final_run_id = getattr(invoice, "final_run_id", None)
-        prior_run = (
-            db.get(MatchRun, final_run_id) if final_run_id else None
-        )
+        prior_run = db.get(MatchRun, final_run_id) if final_run_id else None
         saved_outcome = (
             (prior_run.rules_used or {}).get("match_outcome") if prior_run else None
         ) or {}
@@ -2130,6 +2198,8 @@ def parse_document(
     extension = Path(document.original_filename).suffix.casefold()
     if extension not in ALLOWED_EXTENSIONS:
         document.status = "failed"
+        document.failure_class = "permanent"
+        document.next_retry_at = None
         document.failure_message = (
             "This file type is unsupported; ask the vendor to send a PDF or image."
         )
@@ -2182,6 +2252,8 @@ def parse_document(
             "NoSuchBucket",
         }:
             document.status = "failed"
+            document.failure_class = "permanent"
+            document.next_retry_at = None
             document.failure_message = (
                 "The stored file could not be found; upload it again."
             )
@@ -2197,6 +2269,8 @@ def parse_document(
             _safe_exception_detail(exc),
         )
         document.status = "failed"
+        document.failure_class = classify_document_failure(exc)
+        document.next_retry_at = None
         document.failure_message = _document_failure_message(exc)
         db.commit()
 
@@ -2212,6 +2286,8 @@ def parse_document(
             _safe_exception_detail(exc),
         )
         document.status = "failed"
+        document.failure_class = classify_document_failure(exc)
+        document.next_retry_at = None
         document.failure_message = _document_failure_message(exc)
         db.commit()
 
@@ -2364,9 +2440,10 @@ def parse_document(
                 db.rollback()
                 document.doc_type = "other"
                 document.classify_confidence = classify_confidence
-                document.failure_message = (
-                    f"Could not move file to other storage: {type(exc).__name__}"
-                )[:500]
+                document.status = "failed"
+                document.failure_class = classify_document_failure(exc)
+                document.next_retry_at = None
+                document.failure_message = _document_failure_message(exc)
                 db.commit()
                 return {
                     "id": str(document.id),
@@ -2400,9 +2477,10 @@ def parse_document(
             db.rollback()
             document.doc_type = doc_type
             document.classify_confidence = classify_confidence
-            document.failure_message = (
-                f"Could not move file to {doc_type} storage: {type(exc).__name__}"
-            )[:500]
+            document.status = "failed"
+            document.failure_class = classify_document_failure(exc)
+            document.next_retry_at = None
+            document.failure_message = _document_failure_message(exc)
             db.commit()
             return {
                 "id": str(document.id),
@@ -2728,6 +2806,8 @@ def parse_document(
             document.status = (
                 "duplicate_blocked" if duplicate_invoice else "needs_data_review"
             )
+            document.failure_class = "review"
+            document.next_retry_at = None
             document.failure_message = _document_failure_message(
                 ValueError(
                     next(
@@ -2768,6 +2848,9 @@ def parse_document(
 
         else:
             document.status = "extracted"
+            document.failure_class = None
+            document.retry_count = 0
+            document.next_retry_at = None
             document.failure_message = None
 
         db.commit()
@@ -2846,6 +2929,8 @@ def parse_document(
                     )
                 )
                 document.status = "failed"
+                document.failure_class = classify_document_failure(exc)
+                document.next_retry_at = None
                 document.failure_message = _document_failure_message(
                     exc, parse_failed=active_pipeline_step == "parse"
                 )
@@ -2990,6 +3075,9 @@ def retry_document_processing(
     retry_status = "parsing" if is_raw_email else "received"
     document.status = retry_status
     document.failure_message = None
+    document.failure_class = None
+    document.retry_count = 0
+    document.next_retry_at = None
     actor_id = owner_id
     document.updated_by = actor_id
     db.add(
@@ -3010,6 +3098,6 @@ def retry_document_processing(
         dispatch_document_processing(
             background_tasks,
             document.id,
-            _process_in_background,
+            _process_document_with_retries,
         )
     return {"id": str(document.id), "status": document.status}
