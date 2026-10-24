@@ -1,3 +1,13 @@
+"""
+Application module for po matching services.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_workflow_routers.py,
+src/services/ap_decision_engine.py, src/services/document_workflow_services.py.
+Calls: document_models, goods_receipt_models, invoice_models,
+invoice_number_services, purchase_order_models.
+Tables: documents, goods_receipts, invoice_lines, invoices, po_lines,
+purchase_orders.
+"""
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -11,7 +21,13 @@ from src.services.invoice_number_services import normalize_invoice_no
 
 
 def normalize_value(value: object) -> str:
-    """Normalize text for case-insensitive comparison."""
+    """
+    Normalize text for case-insensitive comparison.
+    Inputs: value (object).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if value is None:
         return ""
 
@@ -19,7 +35,13 @@ def normalize_value(value: object) -> str:
 
 
 def normalize_amount(value: object) -> Decimal | None:
-    """Convert a monetary value to Decimal safely."""
+    """
+    Convert a monetary value to Decimal safely.
+    Inputs: value (object).
+    Output: Decimal | None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if value is None or isinstance(value, bool):
         return None
 
@@ -45,6 +67,10 @@ def match_invoice_to_po(
 
     This initial version requires an exact vendor, PO number,
     and total match. It does not support partial invoices.
+    Inputs: db (Session), invoice_data (dict), invoice_document_id.
+    Output: dict.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
     """
     vendor = normalize_value(invoice_data.get("vendor"))
     order_number = normalize_value(invoice_data.get("order_number"))
@@ -131,10 +157,15 @@ def match_invoice_to_po(
 
 
 def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
-    """Compare a persisted invoice with its current PO and posted receipts.
+    """
+    Compare a persisted invoice with its current PO and posted receipts.
 
     This is advisory only: every result is returned for human review and this
     function never changes invoice approval state.
+    Inputs: db (Session), invoice (Invoice).
+    Output: dict.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
     """
     issues: list[str] = []
     invoice_no = getattr(invoice, "invoice_no_normalized", None) or (

@@ -1,4 +1,13 @@
-"""Choose between Celery and FastAPI BackgroundTasks for processing."""
+"""
+Choose between Celery and FastAPI BackgroundTasks for processing.
+Flow: dispatching document and notification work.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/email_polling_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: document_recovery_services, email_draft_services, notification_models,
+session_db, tasks.
+Tables: notifications.
+"""
 
 import logging
 import os
@@ -14,7 +23,13 @@ def dispatch_document_processing(
     document_id: uuid.UUID,
     fallback,
 ) -> str:
-    """Queue processing on Celery or use the same bounded retry fallback."""
+    """
+    Queue processing on Celery or use the same bounded retry fallback.
+    Inputs: background_tasks (BackgroundTasks), document_id (uuid.UUID), fallback.
+    Output: str.
+    Effects: may queue or retry background work.
+    Results: no workflow status or reason code directly.
+    """
     if os.getenv("USE_CELERY", "false").lower() == "true":
         try:
             from src.worker.tasks import process_document
@@ -36,7 +51,13 @@ def dispatch_raw_email_recovery(
     background_tasks: BackgroundTasks,
     document_id: uuid.UUID,
 ) -> str:
-    """Recover persisted attachments instead of parsing an email container."""
+    """
+    Recover persisted attachments instead of parsing an email container.
+    Inputs: background_tasks (BackgroundTasks), document_id (uuid.UUID).
+    Output: str.
+    Effects: may queue or retry background work.
+    Results: no workflow status or reason code directly.
+    """
     if os.getenv("USE_CELERY", "false").lower() == "true":
         try:
             from src.worker.tasks import recover_raw_email
@@ -59,7 +80,13 @@ def dispatch_raw_email_recovery(
 def dispatch_notification(
     background_tasks: BackgroundTasks | None, notification_id: uuid.UUID
 ) -> str:
-    """Dispatch queued email, falling back to the request background task."""
+    """
+    Dispatch queued email, falling back to the request background task.
+    Inputs: background_tasks (BackgroundTasks | None), notification_id (uuid.UUID).
+    Output: str.
+    Effects: may queue or retry background work.
+    Results: no workflow status or reason code directly.
+    """
     if os.getenv("USE_CELERY", "false").lower() == "true":
         try:
             from src.worker.tasks import send_notification
@@ -130,6 +157,13 @@ def _send_notification_in_process(notification_id: uuid.UUID) -> None:
 
 
 def dispatch_queued_notifications(db, document_id, background_tasks=None) -> int:
+    """
+    Dispatch dispatch queued notifications.
+    Inputs: db, document_id, background_tasks.
+    Output: int.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     from src.models.notification_models import Notification
 
     try:

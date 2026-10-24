@@ -1,3 +1,12 @@
+"""
+Application module for dependencies.
+Flow: request authentication and role checks.
+Called by: src/api/rest/routers/audit_routers.py,
+src/api/rest/routers/command_center_routers.py,
+src/api/rest/routers/document_routers.py.
+Calls: session_db, user_models.
+Tables: users.
+"""
 import os
 import uuid
 
@@ -17,6 +26,13 @@ def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
+    """
+    Return get current user.
+    Inputs: credentials (HTTPAuthorizationCredentials), db (Session).
+    Output: dict[str, object].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     token = credentials.credentials
 
     secret = os.getenv("JWT_SECRET_KEY")
@@ -85,7 +101,21 @@ def get_current_user(
 
 
 def require_role(role: str):
+    """
+    Require require role.
+    Inputs: role (str).
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     def role_dependency(current_user: dict[str, object] = Depends(get_current_user)):
+        """
+        Handle role dependency.
+        Inputs: current_user (dict[str, object]).
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if current_user.get("role") != role:
             raise HTTPException(status_code=403, detail="Insufficient role")
         return current_user

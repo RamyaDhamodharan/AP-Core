@@ -1,3 +1,11 @@
+"""
+Application module for purchase order routers.
+Flow: purchase-order review and confirmation.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, procurement_backfill_services,
+purchase_order_models.
+Tables: audit_log, documents, purchase_orders, vendors.
+"""
 import uuid
 from datetime import date
 from typing import Annotated, Literal
@@ -66,6 +74,17 @@ def list_purchase_orders(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> PurchaseOrderListResponse:
+    """
+    List list purchase orders.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), vendor_id (uuid.UUID | None), source_document_id (uuid.UUID | None),
+        search (Annotated[str | None, Query(max_length=200)]), current_only (bool),
+        status (Literal["all", "needs_verification", "verified"]), date_from (date |
+        None), date_to (date | None), ….
+    Output: PurchaseOrderListResponse.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     try:
         owner_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -131,6 +150,13 @@ def get_purchase_order(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Return get purchase order.
+    Inputs: po_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     try:
         owner_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -156,6 +182,15 @@ def reassign_purchase_order_vendor(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Reassign reassign purchase order vendor.
+    Inputs: po_id (uuid.UUID), payload (PurchaseOrderVendorReassignmentRequest), db
+        (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     try:
         owner_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:

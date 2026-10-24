@@ -1,3 +1,12 @@
+"""
+Application module for audit models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/audit_routers.py,
+src/api/rest/routers/command_center_routers.py,
+src/api/rest/routers/document_routers.py.
+Calls: vendor_models.
+Tables: audit_log.
+"""
 import uuid
 from datetime import datetime
 from typing import Any
@@ -21,6 +30,12 @@ STEP_RESULT_VALUES = ("success", "warning", "error")
 
 
 class AuditLog(Base):
+    """
+    Represent the audit_log table used by the AP workflow.
+    Table: audit_log.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "audit_log"
     __table_args__ = (
         Index("ix_audit_entity_timeline", "entity_type", "entity_id", "created_at"),
@@ -77,6 +92,12 @@ class AuditLog(Base):
 
 @event.listens_for(AuditLog, "before_insert")
 def assign_audit_actor(_mapper, _connection, target: AuditLog) -> None:
-    """Make system and user actors explicit on every newly written audit row."""
+    """
+    Make system and user actors explicit on every newly written audit row.
+    Inputs: _mapper, _connection, target (AuditLog).
+    Output: None.
+    Effects: may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     if target.actor is None:
         target.actor = str(target.created_by) if target.created_by else "system"

@@ -1,4 +1,12 @@
-"""Shared file ingestion for browser uploads and email attachments."""
+"""
+Shared file ingestion for browser uploads and email attachments.
+Flow: upload or email intake, hash, storage, and queueing.
+Called by: scripts/evaluate.py, src/api/rest/routers/document_routers.py,
+src/services/document_recovery_services.py.
+Calls: audit_models, dispatch, document_models, document_routers,
+docx_validation_services.
+Tables: audit_log, documents.
+"""
 
 import hashlib
 import logging
@@ -25,6 +33,11 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 
 @dataclass
 class IngestResult:
+    """
+    Represent ingestresult in the application flow.
+    Fields: status, document_id, message.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     status: str
     document_id: uuid.UUID | None
     message: str
@@ -45,7 +58,16 @@ def ingest_file(
     source_flag: str | None = None,
     internal_email_body: bool = False,
 ) -> IngestResult:
-    """Persist one file and enqueue document processing after its row commits."""
+    """
+    Persist one file and enqueue document processing after its row commits.
+    Inputs: db, filename (str), content_bytes (bytes), content_type (str | None),
+        user_id (uuid.UUID | None), source (str), parent_document_id (uuid.UUID | None),
+        email_meta (dict | None), background_tasks (BackgroundTasks | None), ….
+    Output: IngestResult.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: statuses duplicate_blocked, failed, received.
+    """
     ingest_started = time.perf_counter()
     filename = Path(filename or "upload").name
     extension = Path(filename).suffix.lower()

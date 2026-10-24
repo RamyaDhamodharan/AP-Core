@@ -1,4 +1,11 @@
-"""Run sample files through the authenticated API and score against an answer key."""
+"""
+Run sample files through the authenticated API and score against an answer key.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: document_ingest_services, document_models, invoice_models, minio_storage,
+session_db.
+Tables: documents, invoices, users.
+"""
 
 from __future__ import annotations
 
@@ -102,7 +109,14 @@ def score_quality(
     expected_rows: dict[str, dict[str, Any]],
     amount_tolerance: Decimal = Decimal("0.01"),
 ) -> dict[str, Any]:
-    """Score extraction and outcome predictions with stable, testable rules."""
+    """
+    Score extraction and outcome predictions with stable, testable rules.
+    Inputs: records (list[dict[str, Any]]), expected_rows (dict[str, dict[str, Any]]),
+        amount_tolerance (Decimal).
+    Output: dict[str, Any].
+    Effects: does not write database rows or queue work directly.
+    Results: statuses failed, needs_review, no_match.
+    """
     correct: Counter[str] = Counter()
     totals: Counter[str] = Counter()
     confusion: dict[str, Counter[str]] = defaultdict(Counter)
@@ -178,6 +192,13 @@ def score_quality(
     matched_correct = sum(matrix[label].get(label, 0) for label in MATCH_OUTCOMES)
 
     def precision_recall(label: str) -> dict[str, float | None]:
+        """
+        Handle precision recall.
+        Inputs: label (str).
+        Output: dict[str, float | None].
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         tp = matrix[label].get(label, 0)
         fp = sum(
             matrix[expected].get(label, 0)
@@ -707,6 +728,13 @@ def _write_quality_reports(
     sorted_latency = sorted(latencies)
 
     def percentile(p: float) -> float:
+        """
+        Handle percentile.
+        Inputs: p (float).
+        Output: float.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not sorted_latency:
             return 0.0
         if p == 0.5:
@@ -903,6 +931,13 @@ def _main_quality(argv: list[str]) -> int:
 
 
 def main(argv=None) -> int:
+    """
+    Handle main.
+    Inputs: argv.
+    Output: int.
+    Effects: reads database rows.
+    Results: statuses failed.
+    """
     arguments = list(sys.argv[1:] if argv is None else argv)
     if "--bills" in arguments:
         return _main_quality(arguments)

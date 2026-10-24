@@ -1,3 +1,10 @@
+"""
+Application module for main.
+Flow: shared support code called by the application flow.
+Called by: the framework, CLI, or application entry point.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import uvicorn
 
 if __name__ == "__main__":

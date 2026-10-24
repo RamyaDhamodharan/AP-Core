@@ -1,3 +1,11 @@
+"""
+Application module for notification models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_routers.py, src/api/rest/routers/issue_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 
@@ -17,6 +25,12 @@ from src.models.vendor_models import Base
 
 
 class Notification(Base):
+    """
+    Represent the notifications table used by the AP workflow.
+    Table: notifications.
+    Status values: failed.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "notifications"
 
     id: Mapped[uuid.UUID] = mapped_column(

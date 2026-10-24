@@ -1,3 +1,11 @@
+"""
+Application module for email draft models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/email_draft_routers.py,
+src/api/rest/routers/invoice_routers.py, src/services/email_draft_services.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +18,12 @@ from src.models.vendor_models import Base
 
 
 class EmailDraft(Base):
+    """
+    Represent the email_drafts table used by the AP workflow.
+    Table: email_drafts.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "email_drafts"
     __table_args__ = (
         Index("ix_email_drafts_invoice_created", "invoice_id", "created_at"),
@@ -74,6 +88,12 @@ class EmailDraft(Base):
 
 
 class EmailDraftEvent(Base):
+    """
+    Represent the email_draft_events table used by the AP workflow.
+    Table: email_draft_events.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "email_draft_events"
     __table_args__ = (
         Index("ix_email_draft_events_draft_created", "draft_id", "created_at"),

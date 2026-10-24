@@ -1,4 +1,12 @@
-"""Seed deterministic, synthetic AP decision-engine examples into an allowlisted DB."""
+"""
+Seed deterministic, synthetic AP decision-engine examples into an allowlisted DB.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: goods_receipt_models, invoice_matching_services, invoice_models,
+purchase_order_models, session_db.
+Tables: goods_receipt_lines, goods_receipts, invoice_lines, invoices, po_lines,
+purchase_orders, vendors.
+"""
 
 import argparse
 import os
@@ -59,6 +67,13 @@ def _safe_database(database_url):
 
 
 def seed():
+    """
+    Handle seed.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     _safe_database(DATABASE_URL)
     with SessionLocal.begin() as db:
         vendor = db.query(Vendor).filter(Vendor.tax_id == "DEMO-AP-001").first()

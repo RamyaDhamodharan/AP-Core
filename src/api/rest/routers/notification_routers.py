@@ -1,3 +1,11 @@
+"""
+Application module for notification routers.
+Flow: HTTP request handling before service calls and response formatting.
+Called by: the framework, CLI, or application entry point.
+Calls: dependencies, document_models, email_draft_services, invoice_models,
+notification_models.
+Tables: documents, invoices, notifications, users.
+"""
 import uuid
 from typing import Annotated
 
@@ -29,6 +37,14 @@ def retry_notification(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Retry retry notification.
+    Inputs: notification_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may send or queue
+        email.
+    Results: statuses failed.
+    """
     notification = (
         db.query(Notification)
         .filter_by(id=notification_id)
@@ -87,6 +103,15 @@ def list_notifications(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> NotificationListResponse:
+    """
+    List list notifications.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), status (NotificationStatus | None), db (Session), current_user
+        (dict).
+    Output: NotificationListResponse.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     try:
         user_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -161,6 +186,14 @@ def list_exception_alerts(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     db: Session = Depends(get_db),
 ) -> ExceptionAlertListResponse:
+    """
+    List list exception alerts.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), db (Session).
+    Output: ExceptionAlertListResponse.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     attention_filter = or_(
         Invoice.match_status.in_(_EXCEPTION_MATCH_STATUSES),
         Invoice.final_status.is_(None),

@@ -1,4 +1,13 @@
-"""Persisted invoice-to-PO matching and approval workflow."""
+"""
+Persisted invoice-to-PO matching and approval workflow.
+Flow: saved match runs and invoice status updates.
+Called by: scripts/seed_demo.py, src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: ap_decision_engine, audit_models, document_models, document_routers,
+document_workflow_services.
+Tables: audit_log, documents, goods_receipts, invoice_discrepancies, invoice_lines,
+invoice_matches, invoices, match_runs, po_lines, purchase_orders.
+"""
 
 import hashlib
 import json
@@ -195,9 +204,19 @@ def run_match_for_invoice(
     idempotent: bool = False,
     trigger: str | None = None,
 ) -> MatchRun | None:
-    """Persist the initial match or an explicitly requested rerun."""
+    """
+    Persist the initial match or an explicitly requested rerun.
+    Inputs: db (Session), invoice_id, user_id, force (bool), idempotent (bool), trigger
+        (str | None).
+    Output: MatchRun | None.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: reason codes MISSING_GR, MISSING_PO; statuses approved, match_approved,
+        match_issues, match_ok, matching, needs_review, no_match, on_hold.
+    """
     unit_price_tolerance = f"{os.getenv('INVOICE_UNIT_PRICE_TOLERANCE_PCT', '2')}%"
     total_tolerance = f"{os.getenv('INVOICE_TOTAL_TOLERANCE_PCT', '1')}%"
+    # Step 1: Load the invoice and reuse a saved run unless a rerun was requested.
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
         return None
@@ -220,6 +239,7 @@ def run_match_for_invoice(
         "on_hold",
     } or getattr(invoice, "status", None) in {"paid", "rejected", "on_hold"}
     po_link_started = time.perf_counter()
+    # Step 2: Evaluate current PO, receipt, currency, totals, and confidence evidence.
     decision = evaluate_invoice(db, invoice, owner_id=user_id)
     fingerprint = hashlib.sha256(
         json.dumps(
@@ -261,6 +281,7 @@ def run_match_for_invoice(
         )
     )
 
+    # Step 3: Save the explainable decision and its discrepancy rows as one run.
     previous_no = (
         db.query(func.max(MatchRun.run_no))
         .filter(MatchRun.invoice_id == invoice.id)
@@ -308,6 +329,7 @@ def run_match_for_invoice(
     db.add(run)
     db.flush()
 
+    # Step 4: Persist suggested POs so a person can confirm the candidate.
     # Save workspace candidates and explainable discrepancy rows alongside the
     # existing matching run so human decisions survive list/detail refreshes.
     db.query(InvoiceDiscrepancy).filter(
@@ -384,6 +406,7 @@ def run_match_for_invoice(
 
     no_match_auto_reject = False
     has_suggested_candidate = bool(candidates) if not invoice.po_id else False
+    # Step 5: Keep suggested candidates in review; they are not a completed no-match.
     # A suggested PO is a review case. It is never classified as a completed no-match.
     if result == "no_match" and has_suggested_candidate:
         result = "match_issues"
@@ -430,6 +453,7 @@ def run_match_for_invoice(
     current_workflow_status = (
         getattr(invoice, "workflow_status", None) or original_workflow_status
     )
+    # Step 6: Apply confidence and match outcomes without overwriting final decisions.
     workflow_status = {
         "match_ok": "match_approved",
         "match_issues": "match_issues",

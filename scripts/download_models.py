@@ -1,4 +1,10 @@
-"""Download Docling OCR/layout models into the persistent artifacts volume."""
+"""
+Download Docling OCR/layout models into the persistent artifacts volume.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 import logging
 import os
@@ -13,6 +19,13 @@ logger = logging.getLogger("docling_model_download")
 
 
 def main() -> None:
+    """
+    Handle main.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     artifacts_path = Path(
         os.getenv(
             "DOCLING_ARTIFACTS_PATH",

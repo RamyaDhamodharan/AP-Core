@@ -1,4 +1,10 @@
-"""Run an authenticated end-to-end check against the isolated Docker stack."""
+"""
+Run an authenticated end-to-end check against the isolated Docker stack.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 from __future__ import annotations
 
@@ -52,6 +58,10 @@ RUN_ID = uuid.uuid4().hex[:10]
 
 
 class BackendE2E:
+    """
+    Represent backende2e in the application flow.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     def __init__(self) -> None:
         self.client = httpx.Client(timeout=25)
         self.results: list[tuple[str, bool, str]] = []
@@ -80,6 +90,13 @@ class BackendE2E:
         )
 
     def step(self, label: str, operation: Callable[[], str | None]) -> bool:
+        """
+        Handle step.
+        Inputs: label (str), operation (Callable[[], str | None]).
+        Output: bool.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         try:
             evidence = operation() or "assertions passed"
             self.results.append((label, True, evidence))
@@ -93,6 +110,13 @@ class BackendE2E:
 
     @staticmethod
     def safe_error(message: str) -> str:
+        """
+        Handle safe error.
+        Inputs: message (str).
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         for secret in (
             DB_URL,
             TEST_PASSWORD,
@@ -105,11 +129,25 @@ class BackendE2E:
         return message
 
     def db(self, query: str, params: tuple = ()):
+        """
+        Handle db.
+        Inputs: query (str), params (tuple).
+        Output: the value or None returned by its body.
+        Effects: reads database rows.
+        Results: no workflow status or reason code directly.
+        """
         with psycopg.connect(DB_URL) as connection, connection.cursor() as cursor:
             cursor.execute(query, params)
             return cursor.fetchall()
 
     def request(self, method: str, path: str, *, auth=True, **kwargs) -> httpx.Response:
+        """
+        Handle request.
+        Inputs: method (str), path (str), auth, **kwargs.
+        Output: httpx.Response.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         headers = dict(kwargs.pop("headers", {}))
         acting_user = kwargs.pop("acting_user", "admin")
         if auth:
@@ -123,6 +161,13 @@ class BackendE2E:
         )
 
     def wait_http(self) -> None:
+        """
+        Handle wait http.
+        Inputs: no explicit inputs.
+        Output: None.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             try:
@@ -138,12 +183,26 @@ class BackendE2E:
     def assert_status(
         self, response: httpx.Response, expected: int, label: str
     ) -> None:
+        """
+        Handle assert status.
+        Inputs: response (httpx.Response), expected (int), label (str).
+        Output: None.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if response.status_code != expected:
             raise AssertionError(
                 f"{label}: expected HTTP {expected}, got {response.status_code}"
             )
 
     def login(self, email: str, password: str) -> tuple[dict[str, str], dict]:
+        """
+        Authenticate login.
+        Inputs: email (str), password (str).
+        Output: tuple[dict[str, str], dict].
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         response = self.client.post(
             f"{AUTH_URL}/api/auth/login",
             json={"email": email, "password": password},
@@ -156,6 +215,13 @@ class BackendE2E:
         return {"Authorization": f"Bearer {token}"}, claims
 
     def admin_login(self) -> str:
+        """
+        Handle admin login.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         self.wait_http()
         admin_headers, claims = self.login(ADMIN_EMAIL, TEST_PASSWORD)
         assert claims.get("role") == "admin", (
@@ -166,6 +232,13 @@ class BackendE2E:
         return "Auth/Core healthy; admin login token has role=admin"
 
     def associate_rbac(self) -> str:
+        """
+        Handle associate rbac.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         associate_headers, associate_claims = self.login(ASSOCIATE_EMAIL, TEST_PASSWORD)
         assert associate_claims.get("role") == "associate"
         self.associate_headers = associate_headers
@@ -179,6 +252,13 @@ class BackendE2E:
         return "associate role verified; vendor create returned 403"
 
     def create_vendor(self) -> str:
+        """
+        Create create vendor.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         vendor_response = self.request(
             "POST",
             "/api/vendors",
@@ -218,6 +298,13 @@ class BackendE2E:
         raise AssertionError(f"document {filename} did not reach {sorted(acceptable)}")
 
     def upload_po(self, po_number: str, *, label: str) -> tuple[dict, dict]:
+        """
+        Accept upload po.
+        Inputs: po_number (str), label (str).
+        Output: tuple[dict, dict].
+        Effects: does not write database rows or queue work directly.
+        Results: statuses extracted, failed.
+        """
         filename = f"po_{label}_{RUN_ID}.pdf"
         uploaded = self._upload(
             filename,
@@ -241,6 +328,13 @@ class BackendE2E:
         raise AssertionError(f"MinIO object missing for key prefix {key[:120]}")
 
     def seed_checkpoint(self) -> str:
+        """
+        Handle seed checkpoint.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses failed.
+        """
         response = self.request("POST", "/api/email-polling/run")
         self.assert_status(response, 200, "initial email poll")
         status = self.request("GET", "/api/email-polling/status")
@@ -260,10 +354,24 @@ class BackendE2E:
         return "first run saved UID checkpoint without backfill"
 
     def send_mail(self, raw: bytes) -> None:
+        """
+        Send send mail.
+        Inputs: raw (bytes).
+        Output: None.
+        Effects: may send or queue email.
+        Results: no workflow status or reason code directly.
+        """
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
             smtp.sendmail("supplier@localhost", "ap-test@localhost", raw)
 
     def mark_seen(self, message_id: str) -> None:
+        """
+        Mark mark seen.
+        Inputs: message_id (str).
+        Output: None.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         with imaplib.IMAP4(IMAP_HOST, IMAP_PORT) as mailbox:
             mailbox.login("ap-test@localhost", "test-only-password")
             typ, _ = mailbox.select("INBOX")
@@ -277,6 +385,13 @@ class BackendE2E:
             assert typ == "OK", "GreenMail did not mark message Seen"
 
     def send_mail_batch(self) -> str:
+        """
+        Send send mail batch.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses matching, other.
+        """
         matching_id = f"<match-{RUN_ID}@e2e.local>"
         matching = pdf_bytes(
             invoice_payload(
@@ -348,6 +463,13 @@ class BackendE2E:
         )
 
     def poll_messages(self) -> str:
+        """
+        Handle poll messages.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses failed.
+        """
         response = self.request("POST", "/api/email-polling/run")
         self.assert_status(response, 200, "email poll")
         expected = {
@@ -368,6 +490,14 @@ class BackendE2E:
         return f"checkpoint={state['last_uid']}; counts={expected}"
 
     def validate_mail_results(self) -> str:
+        """
+        Validate validate mail results.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses approved, extracted, failed, ignored, match_issues, match_ok,
+            matching, other.
+        """
         matching = self._wait_document(
             self.mail_filenames["matching"], {"extracted", "failed"}
         )
@@ -451,6 +581,13 @@ class BackendE2E:
         )
 
     def send_late_invoice(self) -> str:
+        """
+        Send send late invoice.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses extracted, failed, waiting_for_po.
+        """
         name = self.mail_filenames["late"]
         data = pdf_bytes(
             invoice_payload(
@@ -480,6 +617,13 @@ class BackendE2E:
         return f"invoice {invoice[0][0]} is waiting_for_po before its PO arrives"
 
     def duplicate_invoice_case(self) -> str:
+        """
+        Handle duplicate invoice case.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses duplicate_blocked, failed.
+        """
         filename = f"invoice_same_number_new_message_{RUN_ID}.pdf"
         payload = invoice_payload(
             vendor=self.vendor_name,
@@ -503,6 +647,13 @@ class BackendE2E:
         )
 
     def check_late_po_reprocess(self) -> str:
+        """
+        Check check late po reprocess.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses approved.
+        """
         _, po = self.upload_po(self.future_po_number, label="late-after")
         row = self.db(
             "SELECT match_status::text, final_status::text, po_id "
@@ -517,6 +668,13 @@ class BackendE2E:
         )
 
     def supporting_documents(self) -> str:
+        """
+        Handle supporting documents.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         url = f"/api/invoices/{self.match_invoice_id}/supporting-documents"
         content = b"Synthetic E2E contract evidence."
         upload = self.request(
@@ -549,6 +707,13 @@ class BackendE2E:
         )
 
     def support_delete(self) -> str:
+        """
+        Handle support delete.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         url = (
             f"/api/invoices/{self.match_invoice_id}/supporting-documents/"
             f"{self.supporting_document_id}"
@@ -574,6 +739,13 @@ class BackendE2E:
         return "empty reason rejected; soft-deleted row hidden; MinIO object remains"
 
     def check_audit_timeline(self) -> str:
+        """
+        Check check audit timeline.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         actions = {
             row[0]
             for row in self.db(
@@ -624,6 +796,13 @@ class BackendE2E:
         )
 
     def check_idempotent_poll(self) -> str:
+        """
+        Check check idempotent poll.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         before = self.db(
             "SELECT count(*) FROM core.documents WHERE source='email_poll'"
         )[0][0]
@@ -661,6 +840,13 @@ class BackendE2E:
         }
 
     def quantity_mismatch(self) -> str:
+        """
+        Handle quantity mismatch.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses extracted.
+        """
         po_num = f"E2E-QTY-PO-{RUN_ID}"
         po_raw = build_mail(
             subject=f"Purchase order {po_num}",
@@ -706,6 +892,13 @@ class BackendE2E:
         )
 
     def unknown_vendor_no_po(self) -> str:
+        """
+        Handle unknown vendor no po.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses rejected.
+        """
         number = f"E2E-UNKNOWN-{RUN_ID}"
         invoice_id, result = self._send_invoice(
             number,
@@ -743,6 +936,13 @@ class BackendE2E:
         )
 
     def low_confidence_verify(self) -> str:
+        """
+        Handle low confidence verify.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses verifying.
+        """
         number = f"E2E-LOWCONF-{RUN_ID}"
         confidence = dict.fromkeys(
             (
@@ -794,6 +994,13 @@ class BackendE2E:
         return "low-confidence invoice entered verifying; associate edit was audited"
 
     def overdue_and_buckets(self) -> str:
+        """
+        Handle overdue and buckets.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses overdue, ready_to_pay, rejected.
+        """
         number = f"E2E-OVERDUE-{RUN_ID}"
         invoice_id, result = self._send_invoice(
             number,
@@ -865,6 +1072,13 @@ class BackendE2E:
         )
 
     def reject_correct_resubmit(self) -> str:
+        """
+        Reject reject correct resubmit.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: reads database rows.
+        Results: statuses rejected.
+        """
         number = f"E2E-RESUBMIT-{RUN_ID}"
         invoice_id, result = self._send_invoice(
             number,
@@ -922,6 +1136,13 @@ class BackendE2E:
         )
 
     def corrupt_bulk_upload(self) -> str:
+        """
+        Handle corrupt bulk upload.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses failed, other.
+        """
         files = [
             (
                 "file",
@@ -953,6 +1174,13 @@ class BackendE2E:
         return "bulk API accepted separate per-file results for corrupt and valid PDF"
 
     def issue_draft_send_reply(self) -> str:
+        """
+        Handle issue draft send reply.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: reads database rows.
+        Results: no workflow status or reason code directly.
+        """
         invoice = self.db(
             "SELECT id::text FROM core.invoices WHERE invoice_no=%s "
             "AND is_current ORDER BY created_at DESC LIMIT 1",
@@ -1028,6 +1256,13 @@ class BackendE2E:
         )
 
     def payment_and_followup(self) -> str:
+        """
+        Handle payment and followup.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: statuses ready_to_pay.
+        """
         invoice_id = self.match_invoice_id
         ready = self.request(
             "GET", "/api/command-center/bills", params={"bucket": "ready_to_pay"}
@@ -1088,6 +1323,13 @@ class BackendE2E:
         return "payment recorded once; follow-up created and stopped with reason"
 
     def run(self) -> int:
+        """
+        Run run.
+        Inputs: no explicit inputs.
+        Output: int.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         self.step("service health and seeded admin login/role", self.admin_login)
         self.step("associate cannot create a vendor", self.associate_rbac)
         self.step("admin creates synthetic vendor", self.create_vendor)
@@ -1170,6 +1412,13 @@ class BackendE2E:
 
 
 def wait_for_ports() -> None:
+    """
+    Handle wait for ports.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     for host, port, label in (
         (SMTP_HOST, SMTP_PORT, "GreenMail SMTP"),
         (IMAP_HOST, IMAP_PORT, "GreenMail IMAP"),
@@ -1191,6 +1440,13 @@ def wait_for_ports() -> None:
 
 
 def main() -> int:
+    """
+    Handle main.
+    Inputs: no explicit inputs.
+    Output: int.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     try:
         wait_for_ports()
         print("PASS | local GreenMail and MinIO ports are ready", flush=True)

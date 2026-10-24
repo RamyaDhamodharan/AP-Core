@@ -1,3 +1,11 @@
+"""
+Application module for invoice match models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_routers.py, src/services/invoice_matching_services.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -21,6 +29,12 @@ from src.models.vendor_models import Base
 
 
 class InvoiceMatch(Base):
+    """
+    Represent the invoice_matches table used by the AP workflow.
+    Table: invoice_matches.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoice_matches"
     __table_args__ = (Index("ix_invoice_matches_invoice", "invoice_id", "status"),)
 
@@ -58,6 +72,12 @@ class InvoiceMatch(Base):
 
 
 class InvoiceDiscrepancy(Base):
+    """
+    Represent the invoice_discrepancies table used by the AP workflow.
+    Table: invoice_discrepancies.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoice_discrepancies"
     __table_args__ = (
         Index("ix_invoice_discrepancies_invoice", "invoice_id", "resolved"),

@@ -1,3 +1,12 @@
+"""
+Application module for goods receipt routers.
+Flow: goods-receipt entry and receipt review.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, goods_receipt_models,
+goods_receipt_schemas.
+Tables: audit_log, documents, goods_receipt_lines, goods_receipts, po_lines,
+purchase_orders, vendors.
+"""
 import uuid
 from datetime import date
 from typing import Annotated, Literal
@@ -160,6 +169,18 @@ def list_goods_receipts(
     date_to: date | None = None,
     current_user: dict = Depends(get_current_user),
 ) -> list[GoodsReceipt]:
+    """
+    List list goods receipts.
+    Inputs: response (Response), db (Session), page (Annotated[int, Query(ge=1)]),
+        page_size (Annotated[int, Query(ge=1, le=100)]), po_id (uuid.UUID | None),
+        source_document_id (uuid.UUID | None), search (Annotated[str | None,
+        Query(max_length=200)]), sort_by (Annotated[         str,
+        Query(pattern="^(receipt_date|receipt_number|gr_number|created_at)$")     ]),
+        sort_dir (Annotated[str, Query(pattern="^(asc|desc)$")]), ….
+    Output: list[GoodsReceipt].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     try:
         owner_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -232,6 +253,13 @@ def get_goods_receipt(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> GoodsReceipt:
+    """
+    Return get goods receipt.
+    Inputs: receipt_id (uuid.UUID), db (Session), current_user (dict).
+    Output: GoodsReceipt.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     try:
         owner_id = uuid.UUID(str(current_user["sub"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -259,6 +287,14 @@ def create_goods_receipt(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> GoodsReceipt:
+    """
+    Create create goods receipt.
+    Inputs: payload (GoodsReceiptCreate), db (Session), current_user (dict).
+    Output: GoodsReceipt.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     actor = _actor(current_user)
     if db.scalar(
         select(GoodsReceipt.id).where(
@@ -313,6 +349,15 @@ def update_goods_receipt(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> GoodsReceipt:
+    """
+    Update update goods receipt.
+    Inputs: receipt_id (uuid.UUID), payload (GoodsReceiptUpdate), db (Session),
+        current_user (dict).
+    Output: GoodsReceipt.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     receipt = _load(db, receipt_id)
     actor = _actor(current_user)
     updates = payload.model_dump(exclude_unset=True)
@@ -378,6 +423,13 @@ def delete_goods_receipt(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> Response:
+    """
+    Delete delete goods receipt.
+    Inputs: receipt_id (uuid.UUID), db (Session), current_user (dict).
+    Output: Response.
+    Effects: writes or commits database rows; may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     receipt = _load(db, receipt_id)
     actor = _actor(current_user)
     db.add(

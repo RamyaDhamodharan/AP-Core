@@ -1,3 +1,14 @@
+"""
+Application module for document routers.
+Flow: upload, parse, classify, extract, and document review.
+Called by: src/api/rest/routers/document_workflow_routers.py,
+src/api/rest/routers/email_polling_routers.py,
+src/api/rest/routers/vendor_routers.py.
+Calls: email_draft_services, invoice_issue_services.
+Tables: audit_log, documents, goods_receipt_lines, goods_receipts,
+invoice_discrepancies, invoice_lines, invoices, match_runs, notifications, po_lines,
+purchase_orders, vendors.
+"""
 import importlib
 import inspect
 import logging
@@ -245,7 +256,15 @@ def reclassify_other_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Move an Other document back into the shared classification pipeline."""
+    """
+    Move an Other document back into the shared classification pipeline.
+    Inputs: document_id (uuid.UUID), doc_type (Annotated[str, Body(embed=True)]),
+        background_tasks (BackgroundTasks), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: statuses other, received.
+    """
     if doc_type not in {"invoice", "po", "goods_receipt"}:
         raise HTTPException(status_code=422, detail="Unsupported document type")
     user_id = _document_owner_id(current_user)
@@ -343,7 +362,18 @@ def list_documents(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentListResponse:
-    """List documents uploaded by the authenticated user."""
+    """
+    List documents uploaded by the authenticated user.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), status (Annotated[str | None, Query(max_length=40)]), doc_type
+        (Annotated[str | None, Query(max_length=40)]), source (Annotated[str | None,
+        Query(max_length=40)]), parent_document_id (uuid.UUID | None), include_parents
+        (bool), vendor (Annotated[str | None, Query(max_length=200)]), workflow_status
+        (Annotated[str | None, Query(max_length=40)]), ….
+    Output: DocumentListResponse.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     owner_id = _document_owner_id(current_user)
     filters = _document_scope_filters(owner_id, current_user)
     if status:
@@ -482,7 +512,13 @@ def get_document_detail(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> DocumentReviewDetail:
-    """Return source/extraction evidence and audit history for its uploader."""
+    """
+    Return source/extraction evidence and audit history for its uploader.
+    Inputs: document_id (uuid.UUID), db (Session), current_user (dict).
+    Output: DocumentReviewDetail.
+    Effects: reads database rows; may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)
@@ -897,6 +933,14 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Accept upload document.
+    Inputs: background_tasks (BackgroundTasks), files (list[UploadFile]), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses duplicate_blocked, failed, ignored, other, received.
+    """
     if len(files) > 5:
         raise HTTPException(
             status_code=422,
@@ -952,7 +996,13 @@ def backfill_procurement_documents_endpoint(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Persist existing extracted PO/GR documents that need data review."""
+    """
+    Persist existing extracted PO/GR documents that need data review.
+    Inputs: db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     from ....services.procurement_backfill_services import (
         backfill_procurement_documents,
     )
@@ -966,7 +1016,13 @@ def reprocess_documents_admin(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Explicitly reprocess one idempotent batch of at most five documents."""
+    """
+    Explicitly reprocess one idempotent batch of at most five documents.
+    Inputs: db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     from ....services.document_retry_services import reprocess_documents_batch
 
     actor_id = uuid.UUID(str(current_user["sub"]))
@@ -1377,9 +1433,23 @@ def _document_failure_message(error: Exception, *, parse_failed: bool = False) -
 
 def _line_fingerprints(lines: list, *, extracted: bool = False) -> list[tuple]:
     def value(line, *keys):
+        """
+        Handle value.
+        Inputs: line, *keys.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         return _line_value(line, *keys) if extracted else getattr(line, keys[0], None)
 
     def decimal_key(raw):
+        """
+        Handle decimal key.
+        Inputs: raw.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         parsed = _to_decimal(raw)
         return str(parsed.normalize()) if parsed is not None else None
 
@@ -1459,15 +1529,24 @@ def _replace_invoice_lines(
 
 
 class AwaitingRelatedDocumentError(ValueError):
-    """The source document is valid, but a related record has not arrived."""
+    """
+    The source document is valid, but a related record has not arrived.
+    Use: shared persistence or validation contract for this flow stage.
+    """
 
 
 class AwaitingHumanDecisionError(ValueError):
-    """Available identifiers resolve to more than one possible record."""
+    """
+    Available identifiers resolve to more than one possible record.
+    Use: shared persistence or validation contract for this flow stage.
+    """
 
 
 class DuplicateInvoiceError(ValueError):
-    """The same current invoice content has already been processed."""
+    """
+    The same current invoice content has already been processed.
+    Use: shared persistence or validation contract for this flow stage.
+    """
 
     def __init__(self, message: str, original_invoice_id=None):
         super().__init__(message)
@@ -1922,6 +2001,15 @@ def resolve_purchase_order_vendor(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Resolve resolve purchase order vendor.
+    Inputs: document_id (uuid.UUID), payload (PurchaseOrderVendorResolutionRequest), db
+        (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses extracted, needs_data_review, needs_vendor_review.
+    """
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)
@@ -2136,6 +2224,16 @@ def parse_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Parse parse document.
+    Inputs: document_id (uuid.UUID), background_tasks (BackgroundTasks), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries; may queue or retry background work.
+    Results: statuses classified, duplicate_blocked, extracted, failed,
+        needs_data_review, needs_review, other, parsed.
+    """
     worker_call = current_user.get("worker") is True
     owner_id = None if worker_call else _document_owner_id(current_user)
     if worker_call:
@@ -2284,7 +2382,7 @@ def parse_document(
     active_step_started = time.perf_counter()
 
     try:
-        # Step 1: Prepare the document.
+        # Step 1: Copy bytes to a temporary file because parsers require a file path.
         with tempfile.NamedTemporaryFile(
             suffix=Path(document.original_filename).suffix.lower(),
             delete=False,
@@ -2294,7 +2392,7 @@ def parse_document(
 
         document.failure_message = None
 
-        # Step 2: Parse using Docling.
+        # Step 2: Parse text; PDF text-layer fallback keeps readable PDFs recoverable.
         parse_started = time.perf_counter()
         if os.getenv("AP_E2E_MOCK_EXTRACTION") or is_e2e_stub_enabled():
             raw_text = extract_e2e_test_document_text(content)
@@ -2345,7 +2443,7 @@ def parse_document(
         )
         db.commit()
 
-        # Step 3: Classify using OpenRouter.
+        # Step 3: Classify the type so extraction uses the matching persistence path.
         active_pipeline_step = "classify"
         active_step_started = time.perf_counter()
         classify_started = time.perf_counter()
@@ -2475,7 +2573,7 @@ def parse_document(
         document.status = "classified"
         db.commit()
 
-        # Step 4: Extract fields using the configured LLM pipeline.
+        # Step 4: Extract fields and retain their confidence evidence.
         active_pipeline_step = "extract"
         active_step_started = time.perf_counter()
         extract_started = time.perf_counter()
@@ -2545,7 +2643,7 @@ def parse_document(
                         "received/accepted/rejected quantities"
                     )
 
-        # Step 5: Validate the extracted fields.
+        # Step 5: Validate required values before saving incomplete business records.
         validation_issues = validate_extracted_data(
             validation_data,
             doc_type,
@@ -2589,7 +2687,7 @@ def parse_document(
             result="success" if po_vendor or goods_receipt_vendor else "warning",
         )
 
-        # Step 6: Check current purchase order duplicates.
+        # Step 6: Check PO duplicates before creating another procurement record.
         duplicate_purchase_order = None
 
         if (
@@ -2780,7 +2878,7 @@ def parse_document(
             except ValueError as exc:
                 validation_issues.append(str(exc))
 
-        # Step 7: Set final document status.
+        # Step 7: Save the terminal or waiting status so users can see the next action.
         if validation_issues:
             duplicate_invoice = any(
                 issue.startswith("Duplicate current invoice:")
@@ -2861,7 +2959,7 @@ def parse_document(
         )
         db.commit()
 
-        # Step 8: Return extraction and duplicate-check results.
+        # Step 8: Return persisted extraction and duplicate-check results to the caller.
         return {
             "id": str(document.id),
             "status": document.status,
@@ -2962,6 +3060,14 @@ def get_document_file(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Return get document file.
+    Inputs: document_id (uuid.UUID), disposition (Literal["inline", "attachment"]), db
+        (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     document = (
         db.query(Document)
         .filter(
@@ -3015,7 +3121,13 @@ def get_document_preview(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return an inline preview without replacing or exposing the original object."""
+    """
+    Return an inline preview without replacing or exposing the original object.
+    Inputs: document_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     document = (
         db.query(Document)
         .filter(
@@ -3084,6 +3196,16 @@ def retry_document_processing(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Retry retry document processing.
+    Inputs: document_id (uuid.UUID), background_tasks (BackgroundTasks), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: statuses failed, incomplete, needs_data_review, needs_vendor_review,
+        parsing, received.
+    """
     owner_id = _document_owner_id(current_user)
     document = (
         db.query(Document)

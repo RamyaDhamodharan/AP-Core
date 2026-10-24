@@ -1,3 +1,11 @@
+"""
+Application module for follow up models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/follow_up_routers.py,
+src/api/rest/routers/invoice_routers.py, src/api/rest/routers/issue_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 
@@ -9,6 +17,12 @@ from src.models.vendor_models import Base
 
 
 class FollowUp(Base):
+    """
+    Represent the follow_ups table used by the AP workflow.
+    Table: follow_ups.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "follow_ups"
     __table_args__ = (
         Index("ix_follow_ups_due", "stopped_at", "next_due_at"),

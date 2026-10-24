@@ -1,3 +1,11 @@
+"""
+Application module for document models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/evaluate.py, src/api/rest/routers/audit_routers.py,
+src/api/rest/routers/command_center_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +18,14 @@ from src.models.vendor_models import Base
 
 
 class Document(Base):
+    """
+    Represent the documents table used by the AP workflow.
+    Table: documents.
+    Status values: classified, duplicate_blocked, extracted, failed, ignored,
+        incomplete, needs_data_review, needs_vendor_review, other, parsed, parsing,
+        processed, received.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "documents"
     __table_args__ = (
         Index("ix_documents_status", "status"),

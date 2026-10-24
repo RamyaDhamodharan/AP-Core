@@ -1,4 +1,12 @@
-"""Idempotent backfill for extracted invoices and exhausted email retries."""
+"""
+Idempotent backfill for extracted invoices and exhausted email retries.
+Flow: shared business-flow service called by API routes and workers.
+Called by: scripts/backfill_invoices.py,
+src/api/rest/routers/email_polling_routers.py.
+Calls: audit_models, document_models, document_routers, document_workflow_services,
+email_models.
+Tables: audit_log, documents, email_messages, invoices.
+"""
 
 import uuid
 
@@ -12,6 +20,15 @@ from src.models.invoice_models import Invoice
 
 
 def backfill_extracted_invoices(db: Session, actor_id: uuid.UUID | None = None) -> dict:
+    """
+    Handle backfill extracted invoices.
+    Inputs: db (Session), actor_id (uuid.UUID | None).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses duplicate_blocked, extracted, failed, needs_data_review,
+        needs_review.
+    """
     from src.api.rest.routers.document_routers import (
         DuplicateInvoiceError,
         _record_invoice_extraction_issues,

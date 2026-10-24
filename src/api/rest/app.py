@@ -1,3 +1,11 @@
+"""
+Application module for app.
+Flow: API startup and route registration.
+Called by: src/worker/tasks.py.
+Calls: docling_model_services, llm_pipeline_services, routers,
+runtime_config_services, tolerance_config_services.
+Tables: no database tables directly.
+"""
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -36,6 +44,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """
+    Handle lifespan.
+    Inputs: _app (FastAPI).
+    Output: AsyncIterator[None].
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     warn_if_container_redis_url_is_localhost()
     warn_if_container_minio_endpoint_is_localhost()
     validate_llm_provider_config()
@@ -57,6 +72,13 @@ app = FastAPI(
 
 @app.get("/health")
 def health_check():
+    """
+    Handle health check.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return {"status": "ok", "service": "ap-core"}
 
 

@@ -1,4 +1,10 @@
-"""Read-only audit log search API."""
+"""
+Read-only audit log search API.
+Flow: HTTP request handling before service calls and response formatting.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, invoice_models, session_db.
+Tables: audit_log, documents, invoices.
+"""
 
 import uuid
 from datetime import datetime
@@ -36,6 +42,16 @@ def search_audit_log(
     db: Session = Depends(get_db),
     _current_user: dict = Depends(require_role("admin")),
 ):
+    """
+    Handle search audit log.
+    Inputs: entity_type (str | None), entity_id (uuid.UUID | None), action (str | None),
+        result (str | None), user (uuid.UUID | None), vendor_id (uuid.UUID | None),
+        invoice_id (uuid.UUID | None), gl_code (str | None), owner (uuid.UUID | None),
+        ….
+    Output: the value or None returned by its body.
+    Effects: reads database rows; may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     query = db.query(AuditLog)
     if entity_type:
         query = query.filter(AuditLog.entity_type == entity_type)

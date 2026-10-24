@@ -1,3 +1,10 @@
+"""
+Application module for follow up routers.
+Flow: HTTP request handling before service calls and response formatting.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, follow_up_models, session_db.
+Tables: audit_log, follow_ups.
+"""
 import uuid
 from datetime import UTC, datetime
 
@@ -14,11 +21,23 @@ router = APIRouter(prefix="/api/follow-ups", tags=["Follow-ups"])
 
 
 class StopFollowUpRequest(BaseModel):
+    """
+    Validate the stopfollowuprequest API data shape.
+    Fields: reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     reason: str = Field(min_length=1, max_length=2000)
 
     @field_validator("reason")
     @classmethod
     def require_nonblank_reason(cls, value):
+        """
+        Require require nonblank reason.
+        Inputs: value.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not value.strip():
             raise ValueError("A reason is required")
         return value.strip()
@@ -35,6 +54,14 @@ def list_follow_ups(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    List list follow ups.
+    Inputs: entity_type (str | None), entity_id (uuid.UUID | None), kind (str | None),
+        stopped (bool | None), page (int), page_size (int), db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     query = db.query(FollowUp)
     if entity_type:
         query = query.filter(FollowUp.entity_type == entity_type)
@@ -72,6 +99,15 @@ def stop_follow_up(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Stop stop follow up.
+    Inputs: follow_up_id (uuid.UUID), request (StopFollowUpRequest), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     row = (
         db.query(FollowUp)
         .filter_by(id=follow_up_id)

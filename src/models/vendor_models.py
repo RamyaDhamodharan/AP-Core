@@ -1,3 +1,11 @@
+"""
+Application module for vendor models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/seed_demo.py, scripts/seed_import.py,
+scripts/seed_invoice_review_sample.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -19,10 +27,20 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
+    """
+    Represent base in the application flow.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     metadata = MetaData(schema="core")
 
 
 class Vendor(Base):
+    """
+    Represent the vendors table used by the AP workflow.
+    Table: vendors.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "vendors"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -54,6 +72,12 @@ class Vendor(Base):
 
 
 class VendorAlias(Base):
+    """
+    Represent the vendor_aliases table used by the AP workflow.
+    Table: vendor_aliases.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "vendor_aliases"
     __table_args__ = (
         UniqueConstraint("vendor_id", "alias_norm", name="uq_vendor_alias"),

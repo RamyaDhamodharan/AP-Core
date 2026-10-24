@@ -1,4 +1,11 @@
-"""Failure classification and bounded retries for document processing."""
+"""
+Failure classification and bounded retries for document processing.
+Flow: worker attempts, retries, and terminal failures.
+Called by: src/api/rest/routers/document_routers.py,
+src/services/document_recovery_services.py, src/worker/tasks.py.
+Calls: audit_models, document_models, document_routers, session_db.
+Tables: audit_log, documents.
+"""
 
 import logging
 import time
@@ -56,7 +63,13 @@ TRANSIENT_MARKERS = (
 
 
 def classify_document_failure(error: BaseException) -> str:
-    """Classify known permanent file failures before transient infrastructure errors."""
+    """
+    Classify known permanent file failures before transient infrastructure errors.
+    Inputs: error (BaseException).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     parts = []
     current: BaseException | None = error
     while current is not None:
@@ -73,17 +86,37 @@ def classify_document_failure(error: BaseException) -> str:
 
 
 def retry_delay_seconds(retry_count: int) -> int:
+    """
+    Retry retry delay seconds.
+    Inputs: retry_count (int).
+    Output: int.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return RETRY_DELAYS_SECONDS[min(max(retry_count, 0), MAX_AUTOMATIC_RETRIES - 1)]
 
 
 def is_transient_document_error(error: BaseException) -> bool:
+    """
+    Handle is transient document error.
+    Inputs: error (BaseException).
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return classify_document_failure(error) == "retryable"
 
 
 def with_transient_retries(
     operation: Callable[[], object], *, sleep: Callable[[float], None] = time.sleep
 ):
-    """Run a single attempt; retries are managed and recorded per document."""
+    """
+    Run a single attempt; retries are managed and recorded per document.
+    Inputs: operation (Callable[[], object]), sleep (Callable[[float], None]).
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     del sleep
     return operation()
 
@@ -173,12 +206,19 @@ def process_document_attempt(
     *,
     session_factory: Callable | None = None,
 ) -> int | None:
-    """Run once; return delay seconds when a retry was scheduled."""
+    """
+    Run once; return delay seconds when a retry was scheduled.
+    Inputs: document_id (uuid.UUID), session_factory (Callable | None).
+    Output: int | None.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses failed, received.
+    """
     from src.api.rest.routers.document_routers import _process_in_background
 
     make_session = session_factory or SessionLocal
     db = make_session()
     try:
+        # Step 1: Lock the row so duplicate workers cannot start the same attempt.
         document = (
             db.query(Document)
             .filter(Document.id == document_id)
@@ -196,6 +236,7 @@ def process_document_attempt(
             return None
         document.last_attempt_at = datetime.now(UTC)
         attempt_number = retry_index + 1
+        # Step 2: Record the attempt before parsing so crashes remain visible.
         _attempt_audit(
             db,
             document,
@@ -208,6 +249,7 @@ def process_document_attempt(
     finally:
         db.close()
 
+    # Step 3: Run the same document pipeline used by the background entry point.
     try:
         _process_in_background(document_id)
     except Exception as exc:
@@ -218,6 +260,7 @@ def process_document_attempt(
         _mark_unexpected_failure(make_session, document_id, attempt_number, exc)
         return None
 
+    # Step 4: Persist terminal failure or schedule the bounded automatic retry.
     db = make_session()
     try:
         document = (
@@ -284,7 +327,14 @@ def process_document_with_retries(
     sleep: Callable[[float], None] = time.sleep,
     session_factory: Callable | None = None,
 ) -> None:
-    """Non-Celery fallback using the same retry counts and delay schedule."""
+    """
+    Non-Celery fallback using the same retry counts and delay schedule.
+    Inputs: document_id (uuid.UUID), sleep (Callable[[float], None]), session_factory
+        (Callable | None).
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     while True:
         delay = process_document_attempt(document_id, session_factory=session_factory)
         if delay is None:
@@ -299,7 +349,15 @@ def reprocess_documents_batch(
     limit: int = 5,
     processor: Callable[[uuid.UUID], None] = process_document_with_retries,
 ) -> dict:
-    """Explicitly reprocess one idempotent batch with at most five workers."""
+    """
+    Explicitly reprocess one idempotent batch with at most five workers.
+    Inputs: db, actor_id (uuid.UUID), limit (int), processor (Callable[[uuid.UUID],
+        None]).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses failed, needs_data_review, received.
+    """
     candidates = (
         db.query(Document)
         .filter(

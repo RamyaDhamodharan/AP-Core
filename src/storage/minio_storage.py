@@ -1,3 +1,11 @@
+"""
+Application module for minio storage.
+Flow: shared support code called by the application flow.
+Called by: scripts/evaluate.py, src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_supporting_document_routers.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import os
 from functools import lru_cache
 
@@ -7,6 +15,13 @@ from minio.error import S3Error
 
 @lru_cache(maxsize=1)
 def get_minio_client() -> Minio:
+    """
+    Return get minio client.
+    Inputs: no explicit inputs.
+    Output: Minio.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
     endpoint = endpoint.removeprefix("http://").removeprefix("https://")
 
@@ -21,10 +36,24 @@ def get_minio_client() -> Minio:
 
 
 def get_bucket_name() -> str:
+    """
+    Return get bucket name.
+    Inputs: no explicit inputs.
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return os.getenv("MINIO_BUCKET", "ap-documents")
 
 
 def ensure_bucket() -> None:
+    """
+    Handle ensure bucket.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     client = get_minio_client()
     bucket = get_bucket_name()
 
@@ -38,6 +67,13 @@ def ensure_bucket() -> None:
 
 
 def upload_file(object_key: str, content: bytes, content_type: str) -> None:
+    """
+    Accept upload file.
+    Inputs: object_key (str), content (bytes), content_type (str).
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     from io import BytesIO
 
     ensure_bucket()
@@ -52,6 +88,13 @@ def upload_file(object_key: str, content: bytes, content_type: str) -> None:
 
 
 def download_file(object_key: str) -> bytes:
+    """
+    Handle download file.
+    Inputs: object_key (str).
+    Output: bytes.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     client = get_minio_client()
     response = client.get_object(get_bucket_name(), object_key)
 
@@ -63,7 +106,13 @@ def download_file(object_key: str) -> bytes:
 
 
 def file_exists(object_key: str) -> bool:
-    """Return whether an object exists without exposing object contents."""
+    """
+    Return whether an object exists without exposing object contents.
+    Inputs: object_key (str).
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     try:
         get_minio_client().stat_object(get_bucket_name(), object_key)
         return True
@@ -74,11 +123,24 @@ def file_exists(object_key: str) -> bool:
 
 
 def delete_file(object_key: str) -> None:
+    """
+    Delete delete file.
+    Inputs: object_key (str).
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     get_minio_client().remove_object(get_bucket_name(), object_key)
 
 
 def move_file(source_key: str, destination_key: str) -> None:
-    """Copy, verify, then remove an object within the configured bucket."""
+    """
+    Copy, verify, then remove an object within the configured bucket.
+    Inputs: source_key (str), destination_key (str).
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     from minio.commonconfig import CopySource
 
     client = get_minio_client()

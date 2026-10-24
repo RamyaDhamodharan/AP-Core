@@ -1,3 +1,11 @@
+"""
+Application module for match run models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/command_center_routers.py,
+src/api/rest/routers/document_routers.py, src/api/rest/routers/invoice_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, Integer, UniqueConstraint, func, text
@@ -8,6 +16,12 @@ from src.models.vendor_models import Base
 
 
 class MatchRun(Base):
+    """
+    Represent the match_runs table used by the AP workflow.
+    Table: match_runs.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "match_runs"
     __table_args__ = (UniqueConstraint("invoice_id", "run_no", name="uq_match_run_no"),)
     id: Mapped[uuid.UUID] = mapped_column(

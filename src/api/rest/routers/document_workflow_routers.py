@@ -1,3 +1,12 @@
+"""
+Application module for document workflow routers.
+Flow: upload, parse, classify, extract, and document review.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, document_routers,
+document_workflow_models.
+Tables: audit_log, document_workflows, documents, goods_receipts, invoices,
+po_lines, purchase_orders.
+"""
 import uuid
 from datetime import UTC, datetime
 
@@ -102,6 +111,13 @@ def get_document_workflow(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> WorkflowResult:
+    """
+    Return get document workflow.
+    Inputs: document_id (uuid.UUID), db (Session), current_user (dict).
+    Output: WorkflowResult.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     owner_id = _actor_id(current_user)
     document = db.query(Document).filter(
         Document.id == document_id, *_document_owner_filters(owner_id)
@@ -120,6 +136,15 @@ def decide_document_workflow(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> WorkflowDecisionResponse:
+    """
+    Handle decide document workflow.
+    Inputs: document_id (uuid.UUID), payload (WorkflowDecisionRequest), db (Session),
+        current_user (dict).
+    Output: WorkflowDecisionResponse.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, matching, on_hold, paid, rejected.
+    """
     actor_id = _actor_id(current_user)
     document = db.scalar(
         select(Document)

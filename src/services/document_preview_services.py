@@ -1,4 +1,10 @@
-"""Generate and cache safe, derived previews for supported documents."""
+"""
+Generate and cache safe, derived previews for supported documents.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py.
+Calls: document_models, minio_storage.
+Tables: documents.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +27,10 @@ _locks_guard = threading.Lock()
 
 
 class DocumentPreviewError(Exception):
+    """
+    Describe an error raised by document preview services.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
@@ -37,6 +47,13 @@ def _source_hash(document: Document) -> str:
 
 
 def preview_object_key(document: Document) -> str:
+    """
+    Handle preview object key.
+    Inputs: document (Document).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return f"derived/previews/{document.id}/{_source_hash(document)}.pdf"
 
 
@@ -120,6 +137,13 @@ def _convert_docx(content: bytes, document_id: uuid.UUID) -> bytes:
 
 
 def get_docx_preview(document: Document) -> bytes:
+    """
+    Return get docx preview.
+    Inputs: document (Document).
+    Output: bytes.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if Path(document.original_filename).suffix.casefold() != ".docx":
         raise DocumentPreviewError(
             "preview_unsupported", "This file type does not support a preview."

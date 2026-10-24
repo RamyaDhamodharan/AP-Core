@@ -1,3 +1,11 @@
+"""
+Application module for session db.
+Flow: database session setup for API and worker calls.
+Called by: scripts/backfill_invoices.py, scripts/create_admin.py,
+scripts/evaluate.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import os
 
 from dotenv import load_dotenv
@@ -24,6 +32,13 @@ SessionLocal = sessionmaker(
 
 
 def get_db():
+    """
+    Return get db.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     db = SessionLocal()
     try:
         yield db

@@ -1,4 +1,10 @@
-"""Idempotently seed vendors, purchase orders, and goods receipts from CSV/XLSX."""
+"""
+Idempotently seed vendors, purchase orders, and goods receipts from CSV/XLSX.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: goods_receipt_models, purchase_order_models, session_db, vendor_models.
+Tables: goods_receipt_lines, goods_receipts, po_lines, purchase_orders, vendors.
+"""
 
 from __future__ import annotations
 
@@ -92,11 +98,25 @@ def _counted(db, items, create_one):
 
 
 def import_vendors(db, rows):
+    """
+    Handle import vendors.
+    Inputs: db, rows.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     from sqlalchemy import func
 
     from src.models.vendor_models import Vendor
 
     def create(row):
+        """
+        Create create.
+        Inputs: row.
+        Output: the value or None returned by its body.
+        Effects: reads database rows; writes or commits database rows.
+        Results: no workflow status or reason code directly.
+        """
         name = str(_value(row, "name", "vendor", "vendor_name", default="")).strip()
         if not name:
             raise ValueError("Vendor name is required")
@@ -130,6 +150,13 @@ def import_vendors(db, rows):
 
 
 def import_purchase_orders(db, rows):
+    """
+    Handle import purchase orders.
+    Inputs: db, rows.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
     from src.models.vendor_models import Vendor
 
@@ -144,6 +171,13 @@ def import_purchase_orders(db, rows):
             grouped[number].append(row)
 
     def create(group):
+        """
+        Create create.
+        Inputs: group.
+        Output: the value or None returned by its body.
+        Effects: reads database rows; writes or commits database rows.
+        Results: no workflow status or reason code directly.
+        """
         number, lines = group
         if number.startswith("__invalid_"):
             raise ValueError("PO number is required")
@@ -208,6 +242,13 @@ def import_purchase_orders(db, rows):
 
 
 def import_goods_receipts(db, rows):
+    """
+    Handle import goods receipts.
+    Inputs: db, rows.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
     from src.models.purchase_order_models import PurchaseOrder
 
@@ -219,6 +260,13 @@ def import_goods_receipts(db, rows):
         grouped[number or f"__invalid_{len(grouped)}"].append(row)
 
     def create(group):
+        """
+        Create create.
+        Inputs: group.
+        Output: the value or None returned by its body.
+        Effects: reads database rows; writes or commits database rows.
+        Results: no workflow status or reason code directly.
+        """
         number, lines = group
         if number.startswith("__invalid_"):
             raise ValueError("Goods receipt number is required")
@@ -292,6 +340,13 @@ def _print_summary(label, summary):
 
 
 def main(argv=None) -> int:
+    """
+    Handle main.
+    Inputs: argv.
+    Output: int.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--folder", type=Path, required=True)
     parser.add_argument("--vendors", default="vendors.csv")

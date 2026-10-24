@@ -1,4 +1,11 @@
-"""Validation helpers for macro-free Office Open XML Word documents."""
+"""
+Validation helpers for macro-free Office Open XML Word documents.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/services/document_ingest_services.py,
+src/services/email_polling_services.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +26,13 @@ _DOCX_MAIN_CONTENT_TYPE = (
 
 
 def is_valid_docx(filename: str, content_type: str | None, content: bytes) -> bool:
-    """Verify the extension, declared MIME type, and bounded OOXML ZIP structure."""
+    """
+    Verify the extension, declared MIME type, and bounded OOXML ZIP structure.
+    Inputs: filename (str), content_type (str | None), content (bytes).
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if Path(filename).suffix.casefold() != ".docx":
         return False
     declared_type = (content_type or "").split(";", 1)[0].strip().casefold()

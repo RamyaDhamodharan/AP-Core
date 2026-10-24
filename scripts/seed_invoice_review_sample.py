@@ -1,4 +1,10 @@
-"""Idempotently seed the PO and receipt used in the invoice review walkthrough."""
+"""
+Idempotently seed the PO and receipt used in the invoice review walkthrough.
+Flow: command-line setup, import, maintenance, or evaluation.
+Called by: the framework, CLI, or application entry point.
+Calls: goods_receipt_models, purchase_order_models, session_db, vendor_models.
+Tables: goods_receipt_lines, goods_receipts, po_lines, purchase_orders, vendors.
+"""
 
 from datetime import date
 from decimal import Decimal
@@ -20,6 +26,13 @@ LINE_TOTAL = QUANTITY * UNIT_PRICE
 
 
 def seed() -> None:
+    """
+    Handle seed.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     with SessionLocal.begin() as db:
         vendor = db.query(Vendor).filter(Vendor.tax_id == VENDOR_TAX_ID).first()
         if vendor is None:

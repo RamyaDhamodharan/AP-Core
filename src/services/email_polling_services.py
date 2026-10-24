@@ -1,4 +1,14 @@
-"""Read-only Gmail IMAP polling with UID checkpoints and safe attachment intake."""
+"""
+Read-only Gmail IMAP polling with UID checkpoints and safe attachment intake.
+Flow: shared business-flow service called by API routes and workers.
+Called by: scripts/backfill_invoices.py,
+src/api/rest/routers/email_polling_routers.py,
+src/services/document_recovery_services.py.
+Calls: audit_models, dispatch, document_ingest_services, document_models,
+docx_validation_services.
+Tables: audit_log, documents, email_messages, email_poll_state, notifications,
+vendor_aliases, vendors.
+"""
 
 import contextlib
 import email
@@ -131,14 +141,35 @@ class _HTMLText(html.parser.HTMLParser):
         self._skip_depth = 0
 
     def handle_starttag(self, tag, attrs):
+        """
+        Handle handle starttag.
+        Inputs: tag, attrs.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if tag.casefold() in {"script", "style"}:
             self._skip_depth += 1
 
     def handle_endtag(self, tag):
+        """
+        Handle handle endtag.
+        Inputs: tag.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if tag.casefold() in {"script", "style"} and self._skip_depth:
             self._skip_depth -= 1
 
     def handle_data(self, data):
+        """
+        Handle handle data.
+        Inputs: data.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not self._skip_depth:
             self.parts.append(data)
 
@@ -196,7 +227,10 @@ def _uidvalidity(client) -> int:
 
 
 class IMAPConnectionError(RuntimeError):
-    """A mailbox connection failure that must fail the whole poll run."""
+    """
+    A mailbox connection failure that must fail the whole poll run.
+    Use: shared persistence or validation contract for this flow stage.
+    """
 
 
 def _is_imap_connection_failure(exc: Exception) -> bool:
@@ -401,7 +435,13 @@ def _record_run(
 
 
 def poll_email_with_lock(db, *, force_uids: set[int] | None = None) -> dict:
-    """Run the poll under the existing shared Redis lock."""
+    """
+    Run the poll under the existing shared Redis lock.
+    Inputs: db, force_uids (set[int] | None).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses failed.
+    """
     from redis import Redis
 
     started_at = time.monotonic()
@@ -467,7 +507,13 @@ def poll_email_messages(
     sleep=time.sleep,
     force_uids: set[int] | None = None,
 ) -> dict:
-    """Fetch new UIDs read-only, committing each parent before its checkpoint."""
+    """
+    Fetch new UIDs read-only, committing each parent before its checkpoint.
+    Inputs: db, imap_factory, sleep, force_uids (set[int] | None).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses failed.
+    """
     started_at = time.monotonic()
     host = os.getenv("IMAP_HOST", "").strip()
     username = os.getenv("IMAP_USER", "").strip()

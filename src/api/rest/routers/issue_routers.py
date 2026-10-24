@@ -1,3 +1,12 @@
+"""
+Application module for issue routers.
+Flow: HTTP request handling before service calls and response formatting.
+Called by: src/api/rest/routers/email_draft_routers.py.
+Calls: audit_models, dependencies, document_models, email_draft_services,
+follow_up_models.
+Tables: audit_log, documents, follow_ups, invoice_issues, invoices, issue_events,
+notifications, users, vendors.
+"""
 import os
 import uuid
 from datetime import UTC, datetime
@@ -95,44 +104,90 @@ def _audit(db, issue, action, user_id, reason, old, new):
 
 
 class NoteRequest(BaseModel):
+    """
+    Validate the noterequest API data shape.
+    Fields: note.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     note: str = Field(min_length=1, max_length=4000)
 
     @field_validator("note")
     @classmethod
     def note_not_blank(cls, value):
+        """
+        Handle note not blank.
+        Inputs: value.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not value.strip():
             raise ValueError("A non-empty note is required")
         return value.strip()
 
 
 class AssignRequest(BaseModel):
+    """
+    Validate the assignrequest API data shape.
+    Fields: owner_user_id.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     owner_user_id: uuid.UUID | None = None
 
 
 class ReassignRequest(BaseModel):
+    """
+    Validate the reassignrequest API data shape.
+    Fields: owner_user_id, reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     owner_user_id: uuid.UUID
     reason: str = Field(min_length=1, max_length=2000)
 
     @field_validator("reason")
     @classmethod
     def reason_not_blank(cls, value):
+        """
+        Handle reason not blank.
+        Inputs: value.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not value.strip():
             raise ValueError("A reason is required")
         return value.strip()
 
 
 class EscalateRequest(BaseModel):
+    """
+    Validate the escalaterequest API data shape.
+    Fields: reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     reason: str = Field(min_length=1, max_length=2000)
 
     @field_validator("reason")
     @classmethod
     def reason_not_blank(cls, value):
+        """
+        Handle reason not blank.
+        Inputs: value.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if not value.strip():
             raise ValueError("A reason is required")
         return value.strip()
 
 
 class DraftRequest(BaseModel):
+    """
+    Validate the draftrequest API data shape.
+    Fields: kind.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     kind: str = "clarification_request"
 
 
@@ -149,6 +204,15 @@ def list_issues(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    List list issues.
+    Inputs: status (str | None), owner (uuid.UUID | None), vendor (uuid.UUID | None),
+        type (str | None), invoice (uuid.UUID | None), overdue (bool | None), page
+        (int), page_size (int), db (Session), ….
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     query = db.query(InvoiceIssue).join(Invoice, InvoiceIssue.invoice_id == Invoice.id)
     if status:
         query = query.filter(InvoiceIssue.status == status)
@@ -191,6 +255,13 @@ def get_issue(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    Return get issue.
+    Inputs: issue_id (uuid.UUID), db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     return _serialize(db, _get(db, issue_id), True)
 
 
@@ -201,6 +272,13 @@ def comment_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Handle comment issue.
+    Inputs: issue_id (uuid.UUID), request (NoteRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     uid = _uid(user)
     add_issue_event(db, issue, "comment", uid, request.note)
@@ -266,6 +344,13 @@ def assign_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Assign assign issue.
+    Inputs: issue_id (uuid.UUID), request (AssignRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     _assign(issue, db, _uid(user), request.owner_user_id, None, "assigned")
     db.commit()
@@ -279,6 +364,13 @@ def reassign_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Reassign reassign issue.
+    Inputs: issue_id (uuid.UUID), request (ReassignRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     _assign(
         issue,
@@ -299,6 +391,13 @@ def escalate_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Escalate escalate issue.
+    Inputs: issue_id (uuid.UUID), request (EscalateRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     uid = _uid(user)
     old = {"status": issue.status}
@@ -353,6 +452,13 @@ def contact_vendor(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Handle contact vendor.
+    Inputs: issue_id (uuid.UUID), request (DraftRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     invoice = db.get(Invoice, issue.invoice_id)
     if request.kind not in {
@@ -422,6 +528,13 @@ def resolve_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Resolve resolve issue.
+    Inputs: issue_id (uuid.UUID), request (NoteRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return _finish(issue_id, "resolved", "resolved", request.note, db, user)
 
 
@@ -432,6 +545,13 @@ def dismiss_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Handle dismiss issue.
+    Inputs: issue_id (uuid.UUID), request (NoteRequest), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return _finish(issue_id, "dismissed", "dismissed", request.note, db, user)
 
 
@@ -482,6 +602,13 @@ def reopen_issue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Handle reopen issue.
+    Inputs: issue_id (uuid.UUID), db (Session), user (dict).
+    Output: the value or None returned by its body.
+    Effects: writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = _get(db, issue_id)
     if issue.status not in {"resolved", "dismissed"}:
         raise HTTPException(

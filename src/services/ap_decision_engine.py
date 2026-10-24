@@ -1,4 +1,12 @@
-"""Deterministic, Decimal-only AP matching decision rules."""
+"""
+Deterministic, Decimal-only AP matching decision rules.
+Flow: invoice-to-PO and goods-receipt matching.
+Called by: src/services/invoice_matching_services.py.
+Calls: document_workflow_services, goods_receipt_models,
+invoice_confidence_services, invoice_models, invoice_number_services.
+Tables: goods_receipt_lines, goods_receipts, invoice_lines, invoices, po_lines,
+purchase_orders.
+"""
 
 import os
 from decimal import Decimal
@@ -82,7 +90,16 @@ def _json_safe(value):
 
 
 def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
-    """Return a complete saved-ready outcome; descriptions never auto-link lines."""
+    """
+    Return a complete saved-ready outcome; descriptions never auto-link lines.
+    Inputs: db (Session), invoice (Invoice), owner_id.
+    Output: dict.
+    Effects: reads database rows.
+    Results: reason codes AMBIGUOUS_PO, CURRENCY_MISMATCH, HEADER_TOTAL_VARIANCE,
+        LINE_NOT_ON_PO, LINE_TOTAL_VARIANCE, LOW_CONFIDENCE, MISSING_GR, MISSING_PO;
+        statuses needs_review, ready_to_pay.
+    """
+    # Step 1: Resolve only an exact normalized PO number; ambiguous numbers need review.
     issues = []
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
@@ -120,6 +137,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 2: Load invoice, PO and receipt lines for quantity and SKU evidence.
     lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
     if not lines:
         issues.append(
@@ -164,6 +182,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 grline.po_line_id, Decimal(0)
             ) + _d(grline.accepted_qty)
 
+    # Step 3: Check vendor ownership and matching currencies before comparing amounts.
     invoice_vendor_id = getattr(invoice, "vendor_id", None)
     if po and (not invoice_vendor_id or invoice_vendor_id != po.vendor_id):
         issues.append(
@@ -189,6 +208,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 4: Compare each line; an exact 2 percent price difference passes tolerance.
     for index, line in enumerate(lines, 1):
         reference = line.item_code or line.description or str(index)
         qty, price = _d(line.qty), _d(line.unit_price)
@@ -269,6 +289,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                     )
                 )
 
+    # Step 5: Reconcile tax, subtotal, header total, and duplicate invoice evidence.
     expected_tax = _d(po.tax_amount) if po else None
     actual_tax = _d(getattr(invoice, "tax_amount", None))
     if po and (
@@ -356,6 +377,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 6: Require at least 85 percent confidence for every material field.
     confidence = getattr(invoice, "field_confidence", None) or {}
     overall_percent = overall_confidence_percent(confidence)
     low_fields = []

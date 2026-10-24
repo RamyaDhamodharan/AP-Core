@@ -1,4 +1,12 @@
-"""Idempotent reminder scheduling and delivery for invoices and issues."""
+"""
+Idempotent reminder scheduling and delivery for invoices and issues.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/worker/tasks.py.
+Calls: audit_models, dispatch, document_models, email_draft_services,
+follow_up_models.
+Tables: audit_log, documents, follow_ups, invoice_issues, invoices, issue_events,
+notifications, users, vendors.
+"""
 
 import os
 from datetime import UTC, datetime, time, timedelta
@@ -113,6 +121,13 @@ def _vendor_wait_started_at(db, issue):
 
 
 def schedule_follow_ups(db: Session, now: datetime | None = None) -> int:
+    """
+    Handle schedule follow ups.
+    Inputs: db (Session), now (datetime | None).
+    Output: int.
+    Effects: reads database rows.
+    Results: statuses overdue, paid, rejected.
+    """
     now = now or datetime.now(UTC)
     today = now.astimezone(_timezone()).date()
     count = 0
@@ -301,6 +316,13 @@ def _create_vendor_draft(db, row, issue, now):
 
 
 def run_follow_ups(db: Session, now: datetime | None = None) -> dict:
+    """
+    Run run follow ups.
+    Inputs: db (Session), now (datetime | None).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses overdue.
+    """
     now = now or datetime.now(UTC)
     schedule_follow_ups(db, now)
     due_rows = (
@@ -392,6 +414,14 @@ def run_follow_ups(db: Session, now: datetime | None = None) -> dict:
 
 
 def mark_overdue(db: Session, now: datetime | None = None) -> int:
+    """
+    Mark mark overdue.
+    Inputs: db (Session), now (datetime | None).
+    Output: int.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, overdue.
+    """
     now = now or datetime.now(UTC)
     today = now.astimezone(_timezone()).date()
     rows = (

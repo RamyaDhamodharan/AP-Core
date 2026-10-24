@@ -1,4 +1,12 @@
-"""Central invoice lifecycle transitions and their legacy status projection."""
+"""
+Central invoice lifecycle transitions and their legacy status projection.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/document_workflow_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: invoice_models, invoice_state_history_models, match_run_models.
+Tables: invoice_state_history, invoices, match_runs.
+"""
 
 from datetime import UTC, datetime
 from uuid import UUID
@@ -94,7 +102,16 @@ def transition_invoice(
     force: bool = False,
     allow_exception: bool = False,
 ) -> InvoiceStateHistory:
-    """Apply an allowed status change and persist state history in the transaction."""
+    """
+    Apply an allowed status change and persist state history in the transaction.
+    Inputs: db (Session), invoice (Invoice), to_status (str), changed_by (UUID | None),
+        reason (str | None), force (bool), allow_exception (bool).
+    Output: InvoiceStateHistory.
+    Effects: reads database rows; writes or commits database rows; may add invoice
+        timeline entries.
+    Results: statuses approved, failed, match_approved, match_issues, matching,
+        needs_review, needs_vendor_review, no_match.
+    """
     if to_status not in WORKFLOW_STATUSES:
         raise HTTPException(status_code=422, detail="Unknown invoice workflow status")
     if to_status in {"approved", "paid"} and not (
@@ -179,6 +196,14 @@ def transition_invoice(
 
 
 def legacy_workflow_status(invoice: Invoice) -> str:
+    """
+    Handle legacy workflow status.
+    Inputs: invoice (Invoice).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: statuses match_issues, matching, needs_po_confirmation,
+        needs_vendor_review, no_match, pending, received, verifying.
+    """
     workflow_status = getattr(invoice, "workflow_status", None)
     if workflow_status in WORKFLOW_STATUSES:
         return workflow_status

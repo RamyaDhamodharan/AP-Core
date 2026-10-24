@@ -1,3 +1,11 @@
+"""
+Application module for invoice supporting document models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/invoice_routers.py,
+src/api/rest/routers/invoice_supporting_document_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 
@@ -19,6 +27,12 @@ from src.models.vendor_models import Base
 
 
 class InvoiceSupportingDocument(Base):
+    """
+    Represent the invoice_supporting_documents table used by the AP workflow.
+    Table: invoice_supporting_documents.
+    Status values: other.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoice_supporting_documents"
     __table_args__ = (
         Index("ix_invoice_supporting_documents_invoice", "invoice_id"),

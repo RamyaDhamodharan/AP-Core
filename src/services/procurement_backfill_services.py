@@ -1,4 +1,13 @@
-"""Idempotently persist extracted PO and goods receipt records for review."""
+"""
+Idempotently persist extracted PO and goods receipt records for review.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/goods_receipt_routers.py,
+src/api/rest/routers/purchase_order_routers.py.
+Calls: audit_models, document_models, document_routers, goods_receipt_models,
+llm_pipeline_services.
+Tables: audit_log, documents, goods_receipts, purchase_orders.
+"""
 
 import logging
 import traceback
@@ -24,6 +33,14 @@ def _same_number(column, value: str):
 def backfill_procurement_documents(
     db: Session, actor_id: uuid.UUID | None = None
 ) -> dict:
+    """
+    Handle backfill procurement documents.
+    Inputs: db (Session), actor_id (uuid.UUID | None).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses extracted, failed, needs_data_review.
+    """
     from src.api.rest.routers.document_routers import (
         _document_failure_message,
         _find_duplicate_purchase_order,

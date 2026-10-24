@@ -1,4 +1,11 @@
-"""Validated percentage tolerance configuration shared by API and workers."""
+"""
+Validated percentage tolerance configuration shared by API and workers.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/app.py, src/services/document_workflow_services.py,
+src/worker/celery_app.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 import os
 from decimal import Decimal, InvalidOperation
@@ -7,7 +14,13 @@ MAX_TOLERANCE_PERCENT = Decimal("2")
 
 
 def read_tolerance_percent(name: str, default: str) -> Decimal:
-    """Read a percentage value in [0, 2], raising a startup-friendly error."""
+    """
+    Read a percentage value in [0, 2], raising a startup-friendly error.
+    Inputs: name (str), default (str).
+    Output: Decimal.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     raw = os.getenv(name, default)
     try:
         value = Decimal(raw)
@@ -19,6 +32,13 @@ def read_tolerance_percent(name: str, default: str) -> Decimal:
 
 
 def read_nonnegative_decimal(name: str, default: str) -> Decimal:
+    """
+    Handle read nonnegative decimal.
+    Inputs: name (str), default (str).
+    Output: Decimal.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     raw = os.getenv(name, default)
     try:
         value = Decimal(raw)
@@ -30,10 +50,24 @@ def read_nonnegative_decimal(name: str, default: str) -> Decimal:
 
 
 def tolerance_fraction(name: str, default: str) -> Decimal:
+    """
+    Handle tolerance fraction.
+    Inputs: name (str), default (str).
+    Output: Decimal.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return read_tolerance_percent(name, default) / Decimal(100)
 
 
 def validate_tolerance_config() -> None:
+    """
+    Validate validate tolerance config.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     for name, default in (
         ("INVOICE_UNIT_PRICE_TOLERANCE_PCT", "2"),
         ("TAX_TOLERANCE_PERCENT", "0.5"),

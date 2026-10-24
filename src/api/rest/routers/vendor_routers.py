@@ -1,3 +1,12 @@
+"""
+Application module for vendor routers.
+Flow: vendor lookup, resolution, and maintenance.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, document_routers,
+goods_receipt_models.
+Tables: audit_log, documents, goods_receipts, invoices, purchase_orders,
+vendor_aliases, vendors.
+"""
 import uuid
 from typing import Annotated
 
@@ -171,7 +180,14 @@ def resolve_extracted_records_for_vendor(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Link previously extracted rows matching a newly confirmed vendor."""
+    """
+    Link previously extracted rows matching a newly confirmed vendor.
+    Inputs: vendor_id (uuid.UUID), identity (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     vendor = db.get(Vendor, vendor_id)
     if vendor is None or not vendor.is_active:
         raise HTTPException(status_code=404, detail="Active vendor not found")
@@ -339,6 +355,15 @@ def list_vendors(
     page_size: Annotated[int | None, Query(ge=1, le=100)] = None,
     db: Session = Depends(get_db),
 ) -> list[Vendor]:
+    """
+    List list vendors.
+    Inputs: search (Annotated[str | None, Query(max_length=200)]), page (Annotated[int |
+        None, Query(ge=1)]), page_size (Annotated[int | None, Query(ge=1, le=100)]), db
+        (Session).
+    Output: list[Vendor].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     statement = select(Vendor)
     if search is not None:
         search = search.strip()
@@ -377,7 +402,13 @@ def backfill_unresolved_vendors(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """Admin-safe, idempotent repair for records carrying a stale new-vendor flag."""
+    """
+    Admin-safe, idempotent repair for records carrying a stale new-vendor flag.
+    Inputs: db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendors = db.query(Vendor).filter(Vendor.is_active.is_(True)).all()
     totals = {"documents": 0, "purchase_orders": 0, "goods_receipts": 0, "invoices": 0}
     for vendor in vendors:
@@ -398,6 +429,14 @@ def resolve_extracted_vendor(
     tax_id: Annotated[str | None, Query(max_length=30)] = None,
     db: Session = Depends(get_db),
 ) -> dict:
+    """
+    Resolve resolve extracted vendor.
+    Inputs: name (Annotated[str | None, Query(max_length=200)]), tax_id (Annotated[str |
+        None, Query(max_length=30)]), db (Session).
+    Output: dict.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendor = resolve_vendor(db, name, tax_id=tax_id)
     if vendor is not None:
         return {
@@ -427,6 +466,13 @@ def get_vendor(
     vendor_id: uuid.UUID,
     db: Session = Depends(get_db),
 ) -> Vendor:
+    """
+    Return get vendor.
+    Inputs: vendor_id (uuid.UUID), db (Session).
+    Output: Vendor.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendor = db.get(Vendor, vendor_id)
     if vendor is None:
         raise HTTPException(status_code=404, detail="Vendor not found")
@@ -444,6 +490,13 @@ def create_vendor(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> Vendor:
+    """
+    Create create vendor.
+    Inputs: payload (VendorCreate), db (Session), current_user (dict).
+    Output: Vendor.
+    Effects: writes or commits database rows; may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     if _duplicate_vendor(db, payload.name):
         raise HTTPException(
             status_code=409,
@@ -511,6 +564,14 @@ def update_vendor(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> Vendor:
+    """
+    Update update vendor.
+    Inputs: vendor_id (uuid.UUID), payload (VendorUpdate), db (Session), current_user
+        (dict).
+    Output: Vendor.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendor = db.get(Vendor, vendor_id)
     if vendor is None:
         raise HTTPException(status_code=404, detail="Vendor not found")
@@ -564,7 +625,13 @@ def deactivate_vendor(
     vendor_id: uuid.UUID,
     db: Session = Depends(get_db),
 ) -> Vendor:
-    """Deactivate a vendor without breaking historical record references."""
+    """
+    Deactivate a vendor without breaking historical record references.
+    Inputs: vendor_id (uuid.UUID), db (Session).
+    Output: Vendor.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendor = db.get(Vendor, vendor_id)
     if vendor is None:
         raise HTTPException(status_code=404, detail="Vendor not found")
@@ -584,6 +651,13 @@ def list_vendor_aliases(
     vendor_id: uuid.UUID,
     db: Session = Depends(get_db),
 ) -> list[VendorAlias]:
+    """
+    List list vendor aliases.
+    Inputs: vendor_id (uuid.UUID), db (Session).
+    Output: list[VendorAlias].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     if db.get(Vendor, vendor_id) is None:
         raise HTTPException(status_code=404, detail="Vendor not found")
     return (
@@ -606,6 +680,14 @@ def create_vendor_alias(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> VendorAlias:
+    """
+    Create create vendor alias.
+    Inputs: vendor_id (uuid.UUID), payload (VendorAliasCreate), db (Session),
+        current_user (dict).
+    Output: VendorAlias.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     _get_active_vendor_or_conflict(db, vendor_id)
     _validate_alias_mapping(db, payload.alias, vendor_id)
 
@@ -639,6 +721,14 @@ def update_vendor_alias(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> VendorAlias:
+    """
+    Update update vendor alias.
+    Inputs: vendor_id (uuid.UUID), alias_id (uuid.UUID), payload (VendorAliasUpdate), db
+        (Session), current_user (dict).
+    Output: VendorAlias.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     alias = db.get(VendorAlias, alias_id)
     if alias is None or alias.vendor_id != vendor_id:
         raise HTTPException(status_code=404, detail="Vendor alias not found")
@@ -688,6 +778,14 @@ def deactivate_vendor_alias(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> VendorAlias:
+    """
+    Deactivate deactivate vendor alias.
+    Inputs: vendor_id (uuid.UUID), alias_id (uuid.UUID), db (Session), current_user
+        (dict).
+    Output: VendorAlias.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     alias = db.get(VendorAlias, alias_id)
     if alias is None or alias.vendor_id != vendor_id:
         raise HTTPException(status_code=404, detail="Vendor alias not found")

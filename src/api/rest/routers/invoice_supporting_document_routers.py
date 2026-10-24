@@ -1,3 +1,11 @@
+"""
+Application module for invoice supporting document routers.
+Flow: invoice matching, review, approval, and payment.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, invoice_models,
+invoice_supporting_document_models, invoice_supporting_document_schemas.
+Tables: audit_log, invoice_supporting_documents, invoices, users.
+"""
 import hashlib
 import io
 import logging
@@ -182,6 +190,15 @@ async def upload_invoice_supporting_documents(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    """
+    Accept upload invoice supporting documents.
+    Inputs: invoice_id (uuid.UUID), files (Annotated[list[UploadFile], File(...)]),
+        category (Annotated[str, Form(...)]), description (Annotated[str | None,
+        Form()]), db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses duplicate_blocked.
+    """
     invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -400,6 +417,14 @@ def list_invoice_supporting_documents(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
+    """
+    List list invoice supporting documents.
+    Inputs: invoice_id (uuid.UUID), include_deleted (bool), db (Session), current_user
+        (dict).
+    Output: list[dict].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     if db.query(Invoice).filter(Invoice.id == invoice_id).first() is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     if include_deleted and current_user.get("role") != "admin":
@@ -427,6 +452,14 @@ def download_invoice_supporting_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle download invoice supporting document.
+    Inputs: invoice_id (uuid.UUID), document_id (uuid.UUID), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     if db.query(Invoice).filter(Invoice.id == invoice_id).first() is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     user_id = _actor_id(current_user)
@@ -488,6 +521,14 @@ def delete_invoice_supporting_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    """
+    Delete delete invoice supporting document.
+    Inputs: invoice_id (uuid.UUID), document_id (uuid.UUID), reason (Annotated[str,
+        Body(embed=True)]), db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     if db.query(Invoice).filter(Invoice.id == invoice_id).first() is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     reason = reason.strip()

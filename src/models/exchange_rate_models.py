@@ -1,3 +1,10 @@
+"""
+Application module for exchange rate models.
+Flow: shared database records used through intake, matching, and review.
+Called by: the framework, CLI, or application entry point.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 
 from sqlalchemy import (
@@ -17,6 +24,12 @@ from src.models.vendor_models import Base
 
 
 class ExchangeRate(Base):
+    """
+    Represent the exchange_rates table used by the AP workflow.
+    Table: exchange_rates.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "exchange_rates"
     __table_args__ = (
         UniqueConstraint(

@@ -1,3 +1,11 @@
+"""
+Application module for email draft routers.
+Flow: email intake, polling, and message review.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, email_draft_models, email_draft_services,
+invoice_issue_models.
+Tables: audit_log, email_draft_events, email_drafts, invoice_issues, invoices.
+"""
 import uuid
 from typing import Annotated
 
@@ -24,10 +32,20 @@ router = APIRouter(prefix="/api", tags=["Email drafts"])
 
 
 class GenerateDraft(BaseModel):
+    """
+    Represent generatedraft in the application flow.
+    Fields: kind.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     kind: str
 
 
 class EditDraft(BaseModel):
+    """
+    Represent editdraft in the application flow.
+    Fields: subject, body, to_addresses, cc_addresses.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     subject: str | None = Field(default=None, min_length=1, max_length=500)
     body: str | None = Field(default=None, min_length=1)
     to_addresses: list[str] | None = None
@@ -35,6 +53,11 @@ class EditDraft(BaseModel):
 
 
 class SendDraftRequest(BaseModel):
+    """
+    Validate the senddraftrequest API data shape.
+    Fields: reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     reason: str | None = Field(default=None, max_length=1000)
 
 
@@ -106,6 +129,15 @@ def list_email_drafts(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    List list email drafts.
+    Inputs: status (str | None), invoice_id (uuid.UUID | None), issue_id (uuid.UUID |
+        None), kind (str | None), page (Annotated[int, Query(ge=1)]), page_size
+        (Annotated[int, Query(ge=1, le=100)]), db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     query = db.query(EmailDraft)
     for column, value in (
         (EmailDraft.status, status),
@@ -136,6 +168,13 @@ def get_email_draft(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    Return get email draft.
+    Inputs: draft_id (uuid.UUID), db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     draft = db.get(EmailDraft, draft_id)
     if draft is None:
         raise HTTPException(status_code=404, detail="Email draft not found")
@@ -155,6 +194,14 @@ def generate_invoice_email_draft(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle generate invoice email draft.
+    Inputs: invoice_id (uuid.UUID), request (GenerateDraft), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -173,6 +220,14 @@ def generate_issue_email_draft(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle generate issue email draft.
+    Inputs: issue_id (uuid.UUID), request (GenerateDraft), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     issue = db.get(InvoiceIssue, issue_id)
     if issue is None:
         raise HTTPException(status_code=404, detail="Issue not found")
@@ -188,6 +243,14 @@ def edit_email_draft(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle edit email draft.
+    Inputs: draft_id (uuid.UUID), request (EditDraft), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses failed.
+    """
     draft = db.query(EmailDraft).filter_by(id=draft_id).with_for_update().first()
     if draft is None:
         raise HTTPException(status_code=404, detail="Email draft not found")
@@ -220,6 +283,15 @@ def send_email_draft(
     current_user: dict = Depends(get_current_user),
     request: SendDraftRequest | None = None,
 ):
+    """
+    Send send email draft.
+    Inputs: draft_id (uuid.UUID), db (Session), current_user (dict), request
+        (SendDraftRequest | None).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may send or queue email.
+    Results: no workflow status or reason code directly.
+    """
     draft = db.query(EmailDraft).filter_by(id=draft_id).with_for_update().first()
     if draft is None:
         raise HTTPException(status_code=404, detail="Email draft not found")
@@ -271,6 +343,13 @@ def discard_email_draft(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle discard email draft.
+    Inputs: draft_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     draft = db.query(EmailDraft).filter_by(id=draft_id).with_for_update().first()
     if draft is None:
         raise HTTPException(status_code=404, detail="Email draft not found")
@@ -296,6 +375,13 @@ def regenerate_email_draft(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle regenerate email draft.
+    Inputs: draft_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     draft = db.query(EmailDraft).filter_by(id=draft_id).with_for_update().first()
     if draft is None:
         raise HTTPException(status_code=404, detail="Email draft not found")

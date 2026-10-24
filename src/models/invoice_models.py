@@ -1,3 +1,11 @@
+"""
+Application module for invoice models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/evaluate.py, scripts/seed_demo.py,
+src/api/rest/routers/audit_routers.py.
+Calls: invoice_number_services, vendor_models.
+Tables: invoices.
+"""
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -23,6 +31,15 @@ from src.models.vendor_models import Base
 
 
 class Invoice(Base):
+    """
+    Represent the invoices table used by the AP workflow.
+    Table: invoices.
+    Status values: approved, failed, match_approved, match_issues, matching,
+        needs_po_confirmation, needs_review, needs_vendor_review, no_match, on_hold,
+        overdue, paid, pending, reading, ready_to_pay, received, rejected, resubmitted,
+        verifying, waiting_for_po.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoices"
     __table_args__ = (
         Index("ix_invoices_due_date", "due_date"),
@@ -190,6 +207,12 @@ class Invoice(Base):
 
 
 class InvoiceLine(Base):
+    """
+    Represent the invoice_lines table used by the AP workflow.
+    Table: invoice_lines.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoice_lines"
 
     id: Mapped[uuid.UUID] = mapped_column(

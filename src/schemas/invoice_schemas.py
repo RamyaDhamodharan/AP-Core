@@ -1,3 +1,10 @@
+"""
+Application module for invoice schemas.
+Flow: validated request and response data for the API flow.
+Called by: src/api/rest/routers/invoice_routers.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -36,6 +43,11 @@ InvoiceWorkflowStatus = Literal[
 
 
 class InvoiceReviewRequest(BaseModel):
+    """
+    Validate the invoicereviewrequest API data shape.
+    Fields: decision, comment, reason, override_reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     decision: InvoiceFinalStatus
     comment: str | None = None
     reason: str | None = None
@@ -43,6 +55,11 @@ class InvoiceReviewRequest(BaseModel):
 
 
 class InvoiceReviewResponse(BaseModel):
+    """
+    Validate the invoicereviewresponse API data shape.
+    Fields: invoice_id, final_status, final_by, final_at.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     invoice_id: UUID
     final_status: InvoiceFinalStatus
     final_by: UUID
@@ -50,6 +67,13 @@ class InvoiceReviewResponse(BaseModel):
 
 
 class InvoiceDashboardItem(BaseModel):
+    """
+    Represent invoicedashboarditem in the application flow.
+    Fields: invoice_id, source_document_id, received_at, processing_status, source,
+        email_sender, email_subject, invoice_no, vendor_name, invoice_date, due_date,
+        total_amount, and more
+    Use: shared persistence or validation contract for this flow stage.
+    """
     invoice_id: UUID
     source_document_id: UUID | None = None
     received_at: datetime | None = None
@@ -77,6 +101,11 @@ class InvoiceDashboardItem(BaseModel):
 
 
 class InvoiceDashboardResponse(BaseModel):
+    """
+    Validate the invoicedashboardresponse API data shape.
+    Fields: items, total, page, page_size.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     items: list[InvoiceDashboardItem]
     total: int
     page: int

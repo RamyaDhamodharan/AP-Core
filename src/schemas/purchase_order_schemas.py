@@ -1,3 +1,11 @@
+"""
+Application module for purchase order schemas.
+Flow: validated request and response data for the API flow.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/purchase_order_routers.py.
+Calls: vendor_schemas.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -9,6 +17,12 @@ from src.schemas.vendor_schemas import VendorCreate
 
 
 class PurchaseOrderLineResponse(BaseModel):
+    """
+    Validate the purchaseorderlineresponse API data shape.
+    Fields: id, po_id, item_code, description, uom, qty, unit_price, line_amount,
+        field_confidence.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -23,6 +37,13 @@ class PurchaseOrderLineResponse(BaseModel):
 
 
 class PurchaseOrderResponse(BaseModel):
+    """
+    Validate the purchaseorderresponse API data shape.
+    Fields: id, po_number, version_no, is_current, vendor_id, vendor_name,
+        source_document_id, po_date, currency, subtotal, tax_amount, total_amount, and
+        more
+    Use: shared persistence or validation contract for this flow stage.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -49,6 +70,11 @@ class PurchaseOrderResponse(BaseModel):
 
 
 class PurchaseOrderListResponse(BaseModel):
+    """
+    Validate the purchaseorderlistresponse API data shape.
+    Fields: items, total, page, page_size, counts.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     items: list[PurchaseOrderResponse]
     total: int
     page: int
@@ -57,11 +83,23 @@ class PurchaseOrderListResponse(BaseModel):
 
 
 class PurchaseOrderVendorResolutionRequest(BaseModel):
+    """
+    Validate the purchaseordervendorresolutionrequest API data shape.
+    Fields: vendor_id, new_vendor.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     vendor_id: uuid.UUID | None = None
     new_vendor: VendorCreate | None = None
 
     @model_validator(mode="after")
     def validate_vendor_choice(self):
+        """
+        Validate validate vendor choice.
+        Inputs: no explicit inputs.
+        Output: the value or None returned by its body.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         if (self.vendor_id is None) == (self.new_vendor is None):
             raise ValueError("Select an existing vendor or provide a new vendor")
         if self.new_vendor and not any(
@@ -78,4 +116,9 @@ class PurchaseOrderVendorResolutionRequest(BaseModel):
 
 
 class PurchaseOrderVendorReassignmentRequest(BaseModel):
+    """
+    Validate the purchaseordervendorreassignmentrequest API data shape.
+    Fields: vendor_id.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     vendor_id: uuid.UUID

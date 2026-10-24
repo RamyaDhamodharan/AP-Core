@@ -1,4 +1,11 @@
-"""Issue synchronization and audit helpers for invoice review findings."""
+"""
+Issue synchronization and audit helpers for invoice review findings.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_routers.py, src/api/rest/routers/issue_routers.py.
+Calls: audit_models, invoice_issue_models, invoice_models, user_models.
+Tables: audit_log, invoice_issues, invoices, issue_events, users.
+"""
 
 import os
 from datetime import UTC, datetime, timedelta
@@ -81,6 +88,13 @@ def _assignment(db: Session, exclude=None):
 def add_issue_event(
     db: Session, issue: InvoiceIssue, event_type: str, user_id=None, note=None
 ):
+    """
+    Handle add issue event.
+    Inputs: db (Session), issue (InvoiceIssue), event_type (str), user_id, note.
+    Output: the value or None returned by its body.
+    Effects: writes or commits database rows; may add audit entries.
+    Results: no workflow status or reason code directly.
+    """
     db.add(
         IssueEvent(issue_id=issue.id, event_type=event_type, user_id=user_id, note=note)
     )
@@ -111,7 +125,14 @@ def sync_invoice_issues(
     user_id=None,
     missing_document_types: list[str] | None = None,
 ):
-    """Upsert findings and resolve active issues absent from the latest match."""
+    """
+    Upsert findings and resolve active issues absent from the latest match.
+    Inputs: db (Session), invoice (Invoice), checks (list), user_id,
+        missing_document_types (list[str] | None).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     findings = {}
     for check in checks:
         if check.get("outcome") not in {"mismatch", "not_possible"}:

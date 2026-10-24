@@ -1,3 +1,10 @@
+"""
+Application module for user models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/create_admin.py, scripts/evaluate.py, scripts/seed_admin.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 
 from sqlalchemy import Boolean, ForeignKey, String, text
@@ -8,6 +15,12 @@ from src.models.vendor_models import Base
 
 
 class User(Base):
+    """
+    Represent the users table used by the AP workflow.
+    Table: users.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "users"
     __table_args__ = {"schema": "auth"}
 

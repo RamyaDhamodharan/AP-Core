@@ -1,3 +1,11 @@
+"""
+Application module for purchase order models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/seed_demo.py, scripts/seed_import.py,
+scripts/seed_invoice_review_sample.py.
+Calls: vendor_models.
+Tables: purchase_orders, vendors.
+"""
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -23,6 +31,12 @@ from src.models.vendor_models import Base, Vendor
 
 
 class PurchaseOrder(Base):
+    """
+    Represent the purchase_orders table used by the AP workflow.
+    Table: purchase_orders.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "purchase_orders"
     __table_args__ = (
         UniqueConstraint("po_number", "version_no", name="uq_po_version"),
@@ -101,10 +115,24 @@ class PurchaseOrder(Base):
 
     @property
     def vendor_pending(self) -> bool:
+        """
+        Handle vendor pending.
+        Inputs: no explicit inputs.
+        Output: bool.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         return self.vendor_id is None
 
     @property
     def verification_status(self) -> str:
+        """
+        Handle verification status.
+        Inputs: no explicit inputs.
+        Output: str.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         return (
             "needs_verification"
             if self.needs_verification or self.vendor_id is None
@@ -113,10 +141,23 @@ class PurchaseOrder(Base):
 
     @property
     def vendor_name(self) -> str | None:
+        """
+        Handle vendor name.
+        Inputs: no explicit inputs.
+        Output: str | None.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         return self.vendor.name if self.vendor is not None else None
 
 
 class PurchaseOrderLine(Base):
+    """
+    Represent the po_lines table used by the AP workflow.
+    Table: po_lines.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "po_lines"
 
     id: Mapped[uuid.UUID] = mapped_column(

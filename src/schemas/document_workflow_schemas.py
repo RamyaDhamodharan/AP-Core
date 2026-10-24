@@ -1,3 +1,11 @@
+"""
+Application module for document workflow schemas.
+Flow: validated request and response data for the API flow.
+Called by: src/api/rest/routers/document_workflow_routers.py,
+src/api/rest/routers/invoice_routers.py, src/services/document_workflow_services.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -18,18 +26,34 @@ WorkflowStatus = Literal[
 
 
 class WorkflowDocument(BaseModel):
+    """
+    Represent workflowdocument in the application flow.
+    Fields: id, type, reference.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     id: uuid.UUID
     type: str
     reference: str | None = None
 
 
 class WorkflowCandidate(BaseModel):
+    """
+    Represent workflowcandidate in the application flow.
+    Fields: record_type, id, evidence.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     record_type: Literal["purchase_order", "goods_receipt", "invoice"]
     id: uuid.UUID
     evidence: dict[str, str | int | Decimal | None]
 
 
 class WorkflowCheck(BaseModel):
+    """
+    Represent workflowcheck in the application flow.
+    Fields: finding_id, category, finding_status, evidence_record_ids, name,
+        reason_code, outcome, severity, expected, actual, difference, reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     finding_id: str | None = None
     category: str | None = None
     finding_status: Literal["supported", "open", "not_verifiable"] | None = None
@@ -45,6 +69,14 @@ class WorkflowCheck(BaseModel):
 
 
 class WorkflowResult(BaseModel):
+    """
+    Represent workflowresult in the application flow.
+    Fields: document_id, status, available_documents, missing_document_types,
+        candidates, checks, recommended_next_actions, human_review_required,
+        human_decision_required, invoice_approval_required, decision, decision_reason,
+        and more
+    Use: shared persistence or validation contract for this flow stage.
+    """
     document_id: uuid.UUID
     status: WorkflowStatus
     available_documents: list[WorkflowDocument]
@@ -65,6 +97,13 @@ class WorkflowResult(BaseModel):
 
 
 class InvoiceRecommendation(BaseModel):
+    """
+    Represent invoicerecommendation in the application flow.
+    Fields: invoice_id, processing_status, matching_status, review_status,
+        approval_status, payment_status, supporting_records, missing_document_types,
+        candidates, checks, discrepancies, reason_codes, and more
+    Use: shared persistence or validation contract for this flow stage.
+    """
     invoice_id: uuid.UUID
     processing_status: str
     matching_status: str
@@ -83,6 +122,11 @@ class InvoiceRecommendation(BaseModel):
 
 
 class WorkflowDecisionRequest(BaseModel):
+    """
+    Validate the workflowdecisionrequest API data shape.
+    Fields: action, candidate_id, candidate_type, reason.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     action: Literal[
         "confirm_candidate",
         "reject_candidate",
@@ -96,6 +140,11 @@ class WorkflowDecisionRequest(BaseModel):
 
 
 class WorkflowDecisionResponse(BaseModel):
+    """
+    Validate the workflowdecisionresponse API data shape.
+    Fields: workflow, decision, decided_by, decided_at.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     workflow: WorkflowResult
     decision: str
     decided_by: uuid.UUID

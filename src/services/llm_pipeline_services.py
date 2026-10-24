@@ -1,3 +1,11 @@
+"""
+Application module for llm pipeline services.
+Flow: document classification, extraction, and validation.
+Called by: src/api/rest/app.py, src/api/rest/routers/document_routers.py,
+src/services/email_invoice_backfill_services.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 import base64
 import json
 import logging
@@ -21,7 +29,13 @@ _E2E_PAYLOAD_PATTERN = re.compile(
 
 
 def validate_llm_provider_config() -> None:
-    """Reject the local stub outside E2E and require it for E2E deployments."""
+    """
+    Reject the local stub outside E2E and require it for E2E deployments.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     app_env = os.getenv("APP_ENV", "").casefold()
     provider = os.getenv("LLM_PROVIDER", "").casefold()
     if provider == "stub" and app_env != "e2e":
@@ -31,7 +45,13 @@ def validate_llm_provider_config() -> None:
 
 
 def is_e2e_stub_enabled() -> bool:
-    """Whether deterministic synthetic-document parsing is enabled."""
+    """
+    Whether deterministic synthetic-document parsing is enabled.
+    Inputs: no explicit inputs.
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     validate_llm_provider_config()
     return (
         os.getenv("APP_ENV", "").casefold() == "e2e"
@@ -68,7 +88,13 @@ def _e2e_payload(raw_text: str) -> dict[str, Any]:
 
 
 def extract_e2e_test_document_text(content: bytes) -> str:
-    """Read synthetic PDFs without loading or downloading Docling models."""
+    """
+    Read synthetic PDFs without loading or downloading Docling models.
+    Inputs: content (bytes).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if not _e2e_mock_enabled():
         raise RuntimeError("The local E2E document parser is test-only")
 
@@ -87,7 +113,13 @@ def extract_e2e_test_document_text(content: bytes) -> str:
 def classify_document(
     raw_text: str, *, with_confidence: bool = False
 ) -> str | tuple[str, float]:
-    """Classify document text using OpenRouter Luna Decisions."""
+    """
+    Classify document text using OpenRouter Luna Decisions.
+    Inputs: raw_text (str), with_confidence (bool).
+    Output: str | tuple[str, float].
+    Effects: does not write database rows or queue work directly.
+    Results: statuses other.
+    """
     if _e2e_mock_enabled():
         doc_type = str(_e2e_payload(raw_text).get("document_type", "")).lower()
         if doc_type == "gr":
@@ -263,7 +295,13 @@ def extract_document(
     raw_text: str,
     doc_type: str,
 ) -> dict[str, Any]:
-    """Extract document fields with primary and fallback Groq models."""
+    """
+    Extract document fields with primary and fallback Groq models.
+    Inputs: raw_text (str), doc_type (str).
+    Output: dict[str, Any].
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if _e2e_mock_enabled():
         payload = _e2e_payload(raw_text)
         payload_type = str(payload.get("document_type", "")).lower()
@@ -353,7 +391,13 @@ def validate_extracted_data(
     data: dict[str, Any],
     doc_type: str,
 ) -> list[str]:
-    """Return review issues without modifying extracted values."""
+    """
+    Return review issues without modifying extracted values.
+    Inputs: data (dict[str, Any]), doc_type (str).
+    Output: list[str].
+    Effects: does not write database rows or queue work directly.
+    Results: statuses other.
+    """
     issues: list[str] = []
 
     if not isinstance(data, dict):
@@ -451,6 +495,13 @@ def validate_extracted_data(
 
 
 def test_validate_extracted_data_accepts_valid_invoice():
+    """
+    Test test validate extracted data accepts valid invoice.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "document_type": "invoice",
         "vendor": "ABC Supplies",
@@ -466,6 +517,13 @@ def test_validate_extracted_data_accepts_valid_invoice():
 
 
 def test_validate_extracted_data_detects_missing_invoice_number():
+    """
+    Test test validate extracted data detects missing invoice number.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "vendor": "ABC Supplies",
         "invoice_date": "2026-10-01",
@@ -478,6 +536,13 @@ def test_validate_extracted_data_detects_missing_invoice_number():
 
 
 def test_validate_extracted_data_detects_amount_mismatch():
+    """
+    Test test validate extracted data detects amount mismatch.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "vendor": "ABC Supplies",
         "invoice_number": "INV-101",
@@ -493,6 +558,13 @@ def test_validate_extracted_data_detects_amount_mismatch():
 
 
 def test_validate_extracted_data_detects_invalid_total():
+    """
+    Test test validate extracted data detects invalid total.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "vendor": "ABC Supplies",
         "invoice_number": "INV-101",
@@ -506,6 +578,13 @@ def test_validate_extracted_data_detects_invalid_total():
 
 
 def test_validate_extracted_data_accepts_valid_purchase_order():
+    """
+    Test test validate extracted data accepts valid purchase order.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "document_type": "po",
         "vendor": "ABC Supplies",
@@ -517,6 +596,13 @@ def test_validate_extracted_data_accepts_valid_purchase_order():
 
 
 def test_validate_extracted_data_rejects_invalid_line_items():
+    """
+    Test test validate extracted data rejects invalid line items.
+    Inputs: no explicit inputs.
+    Output: the value or None returned by its body.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     data = {
         "vendor": "ABC Supplies",
         "invoice_number": "INV-101",

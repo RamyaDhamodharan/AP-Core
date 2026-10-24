@@ -1,3 +1,12 @@
+"""
+Application module for email models.
+Flow: shared database records used through intake, matching, and review.
+Called by: scripts/backfill_invoices.py,
+src/api/rest/routers/email_polling_routers.py,
+src/services/document_recovery_services.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from typing import Any
@@ -19,6 +28,12 @@ from src.models.vendor_models import Base
 
 
 class EmailPollState(Base):
+    """
+    Represent the email_poll_state table used by the AP workflow.
+    Table: email_poll_state.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "email_poll_state"
     __table_args__ = {"schema": "core"}
 
@@ -37,6 +52,12 @@ class EmailPollState(Base):
 
 
 class EmailMessage(Base):
+    """
+    Represent the email_messages table used by the AP workflow.
+    Table: email_messages.
+    Status values: received.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "email_messages"
     __table_args__ = (
         UniqueConstraint("message_id", name="uq_email_messages_message_id"),

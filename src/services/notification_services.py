@@ -1,3 +1,10 @@
+"""
+Application module for notification services.
+Flow: shared business-flow service called by API routes and workers.
+Called by: the framework, CLI, or application entry point.
+Calls: standard-library or framework helpers.
+Tables: email_messages.
+"""
 import os
 import smtplib
 from datetime import UTC, datetime
@@ -5,6 +12,13 @@ from email.message import EmailMessage
 
 
 def send_notification(notification) -> bool:
+    """
+    Send send notification.
+    Inputs: notification.
+    Output: bool.
+    Effects: may send or queue email.
+    Results: statuses failed.
+    """
     allowed = {
         item.strip().casefold()
         for item in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")

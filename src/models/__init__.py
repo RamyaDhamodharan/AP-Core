@@ -1,3 +1,10 @@
+"""
+Application module for   init  .
+Flow: shared database records used through intake, matching, and review.
+Called by: the framework, CLI, or application entry point.
+Calls: models.
+Tables: no database tables directly.
+"""
 from src.models import audit_models as audit_models
 from src.models import document_models as document_models
 from src.models import document_workflow_models as document_workflow_models

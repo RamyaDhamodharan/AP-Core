@@ -1,3 +1,14 @@
+"""
+Application module for document workflow services.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/document_workflow_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: document_models, document_workflow_models, document_workflow_schemas,
+goods_receipt_models, invoice_confidence_services.
+Tables: document_workflows, documents, goods_receipts, invoice_lines, invoices,
+po_lines, purchase_orders, vendors.
+"""
 import uuid
 from decimal import Decimal
 
@@ -104,7 +115,15 @@ def compare_available_records(
     po_lines: list[PurchaseOrderLine],
     invoice_lines: list[InvoiceLine],
 ) -> list[WorkflowCheck]:
-    """Compare only evidence that is present; missing evidence is never a pass."""
+    """
+    Compare only evidence that is present; missing evidence is never a pass.
+    Inputs: db (Session | None), invoice (Invoice | None), purchase_order (PurchaseOrder
+        | None), receipts (list[GoodsReceipt]), po_lines (list[PurchaseOrderLine]),
+        invoice_lines (list[InvoiceLine]).
+    Output: list[WorkflowCheck].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     checks: list[WorkflowCheck] = []
 
     def check(
@@ -117,6 +136,14 @@ def compare_available_records(
         difference=None,
         severity: str | None = None,
     ) -> None:
+        """
+        Check check.
+        Inputs: name (str), outcome (str), reason (str), expected, actual, difference,
+            severity (str | None).
+        Output: None.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         checks.append(
             WorkflowCheck(
                 name=name,
@@ -665,7 +692,15 @@ def compare_available_records(
 def evaluate_document_workflow(
     db: Session, document_id, *, owner_id=None
 ) -> WorkflowResult:
-    """Build a deterministic current workflow view for any uploaded document."""
+    """
+    Build a deterministic current workflow view for any uploaded document.
+    Inputs: db (Session), document_id, owner_id.
+    Output: WorkflowResult.
+    Effects: reads database rows.
+    Results: statuses classified, failed, incomplete, needs_data_review,
+        needs_vendor_review, parsed, parsing, received.
+    """
+    # Step 1: Load saved extraction and any human decision for this document.
     document = db.get(Document, document_id)
     if document is None:
         raise LookupError("Document not found")
@@ -682,6 +717,7 @@ def evaluate_document_workflow(
         else None
     )
 
+    # Step 2: Resolve links from stored IDs first, then exact document evidence.
     extraction = (
         document.extracted_json if isinstance(document.extracted_json, dict) else {}
     )
@@ -749,6 +785,7 @@ def evaluate_document_workflow(
                     )
                     .first()
                 )
+    # Step 3: Keep multiple exact candidates ambiguous so a person must confirm.
     if purchase_order is None and po_number:
         candidates = (
             db.query(PurchaseOrder)
@@ -809,6 +846,7 @@ def evaluate_document_workflow(
             .all()
         )
 
+    # Step 4: Gather receipt and line evidence for the linked PO and invoice.
     related_receipt_documents = _receipt_documents_for_reference(
         db,
         purchase_order.po_number if purchase_order is not None else po_number,
@@ -827,6 +865,7 @@ def evaluate_document_workflow(
         if invoice is not None
         else []
     )
+    # Step 5: Detect duplicate records separately so they remain visible findings.
     duplicate_invoices: list[Invoice] = []
     if invoice is not None and invoice.vendor_id and invoice.invoice_no:
         normalized_no = getattr(invoice, "invoice_no_normalized", None) or (
@@ -1219,6 +1258,7 @@ def evaluate_document_workflow(
                     ),
                 )
             )
+    # Step 6: Derive one workflow status from processing, missing, and match evidence.
     if ambiguous:
         status = "awaiting_human_decision"
         checks.append(
@@ -1259,6 +1299,7 @@ def evaluate_document_workflow(
     else:
         status = "awaiting_related_documents"
 
+    # Step 7: Return candidates and suggested next actions without changing records.
     candidates = [
         WorkflowCandidate(
             record_type="purchase_order",
@@ -1440,7 +1481,13 @@ def _annotate_findings(
 def recommend_invoice_review(
     db: Session, invoice: Invoice, *, owner_id
 ) -> InvoiceRecommendation:
-    """Return a deterministic recommendation using only uploader-owned records."""
+    """
+    Return a deterministic recommendation using only uploader-owned records.
+    Inputs: db (Session), invoice (Invoice), owner_id.
+    Output: InvoiceRecommendation.
+    Effects: reads database rows.
+    Results: statuses failed, incomplete, needs_data_review, needs_vendor_review.
+    """
     if invoice.source_document_id is not None:
         source = (
             db.query(Document)
@@ -1705,7 +1752,13 @@ def recommend_invoice_review(
 
 
 def refresh_related_workflows(db: Session, document_id) -> list[WorkflowResult]:
-    """Refresh this document and any currently discoverable related source docs."""
+    """
+    Refresh this document and any currently discoverable related source docs.
+    Inputs: db (Session), document_id.
+    Output: list[WorkflowResult].
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses on_hold.
+    """
     anchor = evaluate_document_workflow(db, document_id)
     document_ids = {anchor.document_id}
     for available in anchor.available_documents:

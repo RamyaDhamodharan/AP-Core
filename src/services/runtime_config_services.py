@@ -1,4 +1,10 @@
-"""Runtime checks for configuration that commonly fails inside containers."""
+"""
+Runtime checks for configuration that commonly fails inside containers.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/app.py, src/worker/celery_app.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 import logging
 import os
@@ -9,6 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 def is_running_in_container() -> bool:
+    """
+    Handle is running in container.
+    Inputs: no explicit inputs.
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
 
 
@@ -21,6 +34,13 @@ def _is_localhost_endpoint(value: str) -> bool:
 
 
 def warn_if_container_redis_url_is_localhost() -> None:
+    """
+    Handle warn if container redis url is localhost.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     app_env = os.getenv("APP_ENV", "").casefold()
     if app_env == "dev" or not is_running_in_container():
         return
@@ -35,6 +55,13 @@ def warn_if_container_redis_url_is_localhost() -> None:
 
 
 def warn_if_container_minio_endpoint_is_localhost() -> None:
+    """
+    Handle warn if container minio endpoint is localhost.
+    Inputs: no explicit inputs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     app_env = os.getenv("APP_ENV", "").casefold()
     if app_env == "dev" or not is_running_in_container():
         return

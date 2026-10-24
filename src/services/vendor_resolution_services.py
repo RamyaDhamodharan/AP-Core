@@ -1,3 +1,12 @@
+"""
+Application module for vendor resolution services.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/document_workflow_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: vendor_models.
+Tables: vendor_aliases, vendors.
+"""
 import re
 import uuid
 from difflib import SequenceMatcher
@@ -10,6 +19,13 @@ from src.models.vendor_models import Vendor, VendorAlias
 
 
 def normalize_vendor_name(value: object) -> str:
+    """
+    Normalize normalize vendor name.
+    Inputs: value (object).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if value is None:
         return ""
     normalized = re.sub(r"[^a-z0-9\s]", " ", str(value).casefold())
@@ -30,6 +46,13 @@ def find_canonical_name_conflict(
     *,
     exclude_vendor_id: uuid.UUID | None = None,
 ) -> Vendor | None:
+    """
+    Find find canonical name conflict.
+    Inputs: db (Session), name (str), exclude_vendor_id (uuid.UUID | None).
+    Output: Vendor | None.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     normalized_name = normalize_vendor_name(name)
     if not normalized_name:
         return None
@@ -45,6 +68,13 @@ def find_active_alias_conflict(
     *,
     exclude_vendor_id: uuid.UUID | None = None,
 ) -> VendorAlias | None:
+    """
+    Find find active alias conflict.
+    Inputs: db (Session), name (str), exclude_vendor_id (uuid.UUID | None).
+    Output: VendorAlias | None.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     normalized_name = normalize_vendor_name(name)
     if not normalized_name:
         return None
@@ -63,6 +93,13 @@ def resolve_vendor(
     *,
     tax_id: object = None,
 ) -> Vendor | None:
+    """
+    Resolve resolve vendor.
+    Inputs: db (Session), name (object), tax_id (object).
+    Output: Vendor | None.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     normalized_tax_id = re.sub(r"[^a-z0-9]", "", str(tax_id or "").casefold())
     if normalized_tax_id:
         matches = (
@@ -122,7 +159,13 @@ def suggest_vendor_candidates(
     *,
     threshold: float = 0.90,
 ) -> list[Vendor]:
-    """Return high-similarity active vendors without linking them."""
+    """
+    Return high-similarity active vendors without linking them.
+    Inputs: db (Session), name (object), threshold (float).
+    Output: list[Vendor].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     normalized = normalize_vendor_name(name)
     if not normalized:
         return []

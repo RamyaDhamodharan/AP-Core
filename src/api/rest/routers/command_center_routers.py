@@ -1,4 +1,11 @@
-"""Command center invoice buckets, summaries, and assignment choices."""
+"""
+Command center invoice buckets, summaries, and assignment choices.
+Flow: HTTP request handling before service calls and response formatting.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, document_models, invoice_issue_models,
+invoice_models.
+Tables: audit_log, documents, invoice_issues, invoices, match_runs, vendors.
+"""
 
 import uuid
 from datetime import date
@@ -87,6 +94,13 @@ def _bucket_filter(name, today):
 def command_center_summary(
     db: Session = Depends(get_db), _user: dict = Depends(get_current_user)
 ):
+    """
+    Handle command center summary.
+    Inputs: db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses needs_review, overdue, ready_to_pay, rejected.
+    """
     today = _app_local_today()
     result = {}
     for bucket in (
@@ -140,6 +154,19 @@ def command_center_bills(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    """
+    Handle command center bills.
+    Inputs: bucket (Annotated[         str,         Query(
+        pattern="^(ready_to_pay|needs_review|overdue|rejected|needs_attention|all)$"
+        ),     ]), vendor_id (uuid.UUID | None), workflow_status (str | None),
+        doc_bucket (str | None), due_date_from (date | None), due_date_to (date | None),
+        amount_min (Decimal | None), amount_max (Decimal | None), gl_code (str | None),
+        ….
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses approved, match_approved, match_issues, no_match, on_hold,
+        overdue, paid, rejected.
+    """
     if due_date_from and due_date_to and due_date_from > due_date_to:
         raise HTTPException(
             status_code=422, detail="due_date_from must not exceed due_date_to"

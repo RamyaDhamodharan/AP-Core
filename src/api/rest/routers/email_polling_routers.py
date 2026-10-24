@@ -1,4 +1,11 @@
-"""Admin endpoints for on-demand email polling and poll status."""
+"""
+Admin endpoints for on-demand email polling and poll status.
+Flow: email intake, polling, and message review.
+Called by: the framework, CLI, or application entry point.
+Calls: audit_models, dependencies, dispatch, docling_model_services,
+document_models.
+Tables: audit_log, documents, email_messages, email_poll_state, invoices.
+"""
 
 import os
 from collections import Counter
@@ -45,7 +52,14 @@ def backfill_email_invoices(
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_role("admin")),
 ):
-    """Backfill extracted invoices and safely queue exhausted email retries."""
+    """
+    Backfill extracted invoices and safely queue exhausted email retries.
+    Inputs: background_tasks (BackgroundTasks), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may queue or retry
+        background work.
+    Results: statuses failed, received.
+    """
     from src.services.email_invoice_backfill_services import (
         backfill_extracted_invoices,
     )
@@ -94,7 +108,14 @@ def recover_stuck_documents(
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_role("admin")),
 ):
-    """Run the audited stuck-document recovery/backfill on demand."""
+    """
+    Run the audited stuck-document recovery/backfill on demand.
+    Inputs: db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     from src.services.document_recovery_services import sweep_stuck_documents
 
     swept = sweep_stuck_documents(db)
@@ -120,6 +141,14 @@ def run_email_poll(
     db: Session = Depends(get_db),
     current_user: dict = Depends(_require_finance_staff),
 ):
+    """
+    Run run email poll.
+    Inputs: db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     db.add(
         AuditLog(
             action="email_poll_requested",
@@ -141,6 +170,13 @@ def email_poll_status(
     db: Session = Depends(get_db),
     _user: dict = Depends(_require_finance_staff),
 ):
+    """
+    Handle email poll status.
+    Inputs: db (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses failed, processed.
+    """
     mailbox = os.getenv("IMAP_USER", "").strip()
     folder = os.getenv("IMAP_FOLDER", "INBOX").strip() or "INBOX"
     state = db.query(EmailPollState).filter_by(mailbox=mailbox, folder=folder).first()
@@ -219,6 +255,14 @@ def email_poll_messages(
     db: Session = Depends(get_db),
     _user: dict = Depends(_require_finance_staff),
 ):
+    """
+    Handle email poll messages.
+    Inputs: limit (int), offset (int), status (str | None), reason (str | None), db
+        (Session), _user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses failed, ignored.
+    """
     query = db.query(EmailMessage)
     if status == "skipped":
         query = query.filter(EmailMessage.status == "ignored")
@@ -308,6 +352,15 @@ def retry_email_message(
     db: Session = Depends(get_db),
     current_user: dict = Depends(_require_finance_staff),
 ):
+    """
+    Retry retry email message.
+    Inputs: message_id (UUID), background_tasks (BackgroundTasks), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: statuses failed, needs_data_review, received.
+    """
     row = (
         db.query(EmailMessage)
         .filter(EmailMessage.id == message_id)

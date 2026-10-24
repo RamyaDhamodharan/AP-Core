@@ -1,4 +1,14 @@
-"""Template-backed, human-reviewed vendor email outbox."""
+"""
+Template-backed, human-reviewed vendor email outbox.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/email_draft_routers.py, src/api/rest/routers/issue_routers.py.
+Calls: audit_models, document_models, email_draft_models, invoice_issue_models,
+invoice_issue_services.
+Tables: audit_log, documents, email_draft_events, email_drafts, email_messages,
+invoice_issues, invoice_lines, invoices, notifications, po_lines, purchase_orders,
+users, vendors.
+"""
 
 import email.utils
 import html
@@ -41,6 +51,13 @@ SUPPORTED_KINDS = {
 
 
 def allowed_recipients() -> set[str]:
+    """
+    Handle allowed recipients.
+    Inputs: no explicit inputs.
+    Output: set[str].
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     return {
         value.strip().casefold()
         for value in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
@@ -135,6 +152,13 @@ def _template(kind: str, facts: dict[str, object]) -> tuple[str, str]:
 
 
 def invoice_facts(db: Session, invoice: Invoice) -> dict[str, object]:
+    """
+    Handle invoice facts.
+    Inputs: db (Session), invoice (Invoice).
+    Output: dict[str, object].
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     vendor = db.get(Vendor, invoice.vendor_id) if invoice.vendor_id else None
     po = db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None
     facts: dict[str, object] = {
@@ -253,6 +277,13 @@ def _event(
 def create_invoice_draft(
     db: Session, invoice: Invoice, kind: str, user_id=None
 ) -> EmailDraft:
+    """
+    Create create invoice draft.
+    Inputs: db (Session), invoice (Invoice), kind (str), user_id.
+    Output: EmailDraft.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     if kind not in SUPPORTED_KINDS:
         raise ValueError("Unsupported email draft kind")
     facts = invoice_facts(db, invoice)
@@ -297,7 +328,13 @@ def create_invoice_draft(
 
 
 def create_no_match_draft(db: Session, invoice: Invoice, sender: str) -> EmailDraft:
-    """Create a reviewable no-match email draft; never send during processing."""
+    """
+    Create a reviewable no-match email draft; never send during processing.
+    Inputs: db (Session), invoice (Invoice), sender (str).
+    Output: EmailDraft.
+    Effects: writes or commits database rows.
+    Results: statuses no_match.
+    """
     reason = "No purchase order / unknown vendor"
     recipient = sender.strip()
     recipients = [recipient] if recipient else []
@@ -335,7 +372,14 @@ def create_issue_draft(
     recipient: str | None,
     user_id=None,
 ) -> EmailDraft:
-    """Issue-facing factory is available until the issues table/API lands."""
+    """
+    Issue-facing factory is available until the issues table/API lands.
+    Inputs: db (Session), issue_id (uuid.UUID), kind (str), facts (dict[str, object]),
+        recipient (str | None), user_id.
+    Output: EmailDraft.
+    Effects: writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     if kind not in SUPPORTED_KINDS:
         raise ValueError("Unsupported email draft kind")
     subject, body = _template(kind, facts)
@@ -395,6 +439,14 @@ def _transient_smtp_failure(exc: Exception) -> bool:
 def send_draft(
     db: Session, draft: EmailDraft, user_id=None, *, sleep=time.sleep
 ) -> bool:
+    """
+    Send send draft.
+    Inputs: db (Session), draft (EmailDraft), user_id, sleep.
+    Output: bool.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may send or queue email.
+    Results: statuses failed.
+    """
     if draft.status == "sent":
         raise ValueError("This email draft has already been sent")
     if draft.status == "discarded":
@@ -520,7 +572,13 @@ def send_draft(
 
 
 def match_reply(db: Session, subject: str, in_reply_to: str | None):
-    """Find a sent draft by reference token in the subject or message linkage."""
+    """
+    Find a sent draft by reference token in the subject or message linkage.
+    Inputs: db (Session), subject (str), in_reply_to (str | None).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
 
     query = db.query(EmailDraft).filter(EmailDraft.status == "sent")
     predicates = []
@@ -547,6 +605,14 @@ def record_vendor_reply(
     message_id: str,
     document_id=None,
 ):
+    """
+    Handle record vendor reply.
+    Inputs: db (Session), draft (EmailDraft), sender (str), subject (str), message_id
+        (str), document_id.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: no workflow status or reason code directly.
+    """
     _event(
         db,
         draft,
@@ -600,7 +666,13 @@ def record_vendor_reply(
 
 
 def ensure_notification_draft(db: Session, notification):
-    """Mirror legacy queued notification rows into the common outbox."""
+    """
+    Mirror legacy queued notification rows into the common outbox.
+    Inputs: db (Session), notification.
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows.
+    Results: statuses no_match.
+    """
     draft = (
         db.query(EmailDraft)
         .filter_by(

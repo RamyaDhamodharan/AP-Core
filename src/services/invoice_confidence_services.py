@@ -1,4 +1,11 @@
-"""Normalization helpers for extraction confidence and verification gating."""
+"""
+Normalization helpers for extraction confidence and verification gating.
+Flow: shared business-flow service called by API routes and workers.
+Called by: src/api/rest/routers/document_routers.py,
+src/api/rest/routers/invoice_routers.py, src/services/ap_decision_engine.py.
+Calls: standard-library or framework helpers.
+Tables: no database tables directly.
+"""
 
 import os
 from decimal import ROUND_HALF_UP, Decimal
@@ -20,17 +27,29 @@ LINE_CONFIDENCE_FIELDS = ("qty", "unit_price", "line_amount")
 
 
 def overall_confidence_percent(confidence: dict[str, Any] | None) -> int:
-    """Return the deterministic invoice confidence percentage.
+    """
+    Return the deterministic invoice confidence percentage.
 
     Formula: take the minimum score across the ten material header fields;
     when line items exist, average every material line-field score and take
     the lower of the header minimum and that line average. Missing or invalid
     values score 0. Scores in the 0..1 range are treated as fractions.
     The final percentage is rounded half up to an integer.
+    Inputs: confidence (dict[str, Any] | None).
+    Output: int.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
     """
     confidence = confidence if isinstance(confidence, dict) else {}
 
     def score(raw: Any) -> Decimal:
+        """
+        Score score.
+        Inputs: raw (Any).
+        Output: Decimal.
+        Effects: does not write database rows or queue work directly.
+        Results: no workflow status or reason code directly.
+        """
         value = (
             raw.get("confidence", raw.get("score"))
             if isinstance(raw, dict)
@@ -62,6 +81,13 @@ def overall_confidence_percent(confidence: dict[str, Any] | None) -> int:
 
 
 def confidence_threshold() -> float:
+    """
+    Handle confidence threshold.
+    Inputs: no explicit inputs.
+    Output: float.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     try:
         return min(100.0, max(0.0, float(os.getenv("FIELD_CONFIDENCE_MIN", "85"))))
     except ValueError:
@@ -86,6 +112,13 @@ def _confidence_entry(value: Any, present: bool) -> dict[str, Any]:
 
 
 def normalize_invoice_confidence(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize normalize invoice confidence.
+    Inputs: data (dict[str, Any]).
+    Output: dict[str, Any].
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     raw = data.get("field_confidence") or data.get("confidence") or {}
     raw = raw if isinstance(raw, dict) else {}
     normalized = {
@@ -110,6 +143,13 @@ def normalize_invoice_confidence(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def requires_verification(confidence: dict[str, Any]) -> bool:
+    """
+    Handle requires verification.
+    Inputs: confidence (dict[str, Any]).
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if not confidence:
         return True
     threshold = confidence_threshold()
@@ -132,6 +172,13 @@ def requires_verification(confidence: dict[str, Any]) -> bool:
 
 
 def confidence_unavailable(confidence: dict[str, Any] | None) -> bool:
+    """
+    Handle confidence unavailable.
+    Inputs: confidence (dict[str, Any] | None).
+    Output: bool.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if not confidence or any(
         field not in confidence for field in INVOICE_CONFIDENCE_FIELDS
     ):
@@ -156,7 +203,13 @@ def confidence_unavailable(confidence: dict[str, Any] | None) -> bool:
 
 
 def confidence_level(confidence: dict[str, Any] | None) -> str:
-    """Return a display-safe confidence label without exposing a score."""
+    """
+    Return a display-safe confidence label without exposing a score.
+    Inputs: confidence (dict[str, Any] | None).
+    Output: str.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     if not confidence:
         return "unknown"
     if any(field not in confidence for field in INVOICE_CONFIDENCE_FIELDS):

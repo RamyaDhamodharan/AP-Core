@@ -1,4 +1,11 @@
-"""Celery application for background document processing."""
+"""
+Celery application for background document processing.
+Flow: shared support code called by the application flow.
+Called by: src/worker/tasks.py.
+Calls: docling_model_services, llm_pipeline_services, runtime_config_services,
+tolerance_config_services.
+Tables: no database tables directly.
+"""
 
 import logging
 import os
@@ -25,6 +32,13 @@ validate_tolerance_config()
 
 @worker_init.connect
 def log_docling_model_availability(**_kwargs) -> None:
+    """
+    Handle log docling model availability.
+    Inputs: **_kwargs.
+    Output: None.
+    Effects: does not write database rows or queue work directly.
+    Results: no workflow status or reason code directly.
+    """
     logger.info(
         "Docling OCR/layout models available: %s",
         "yes" if docling_models_available() else "no",

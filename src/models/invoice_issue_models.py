@@ -1,3 +1,12 @@
+"""
+Application module for invoice issue models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/command_center_routers.py,
+src/api/rest/routers/email_draft_routers.py,
+src/api/rest/routers/invoice_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 
@@ -9,6 +18,12 @@ from src.models.vendor_models import Base
 
 
 class InvoiceIssue(Base):
+    """
+    Represent the invoice_issues table used by the AP workflow.
+    Table: invoice_issues.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "invoice_issues"
     __table_args__ = (
         Index("ix_invoice_issues_status_due", "status", "due_at"),
@@ -54,6 +69,12 @@ class InvoiceIssue(Base):
 
 
 class IssueEvent(Base):
+    """
+    Represent the issue_events table used by the AP workflow.
+    Table: issue_events.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "issue_events"
     __table_args__ = (Index("ix_issue_events_timeline", "issue_id", "created_at"),)
 

@@ -1,3 +1,10 @@
+"""
+Application module for payment models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/invoice_routers.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -20,6 +27,12 @@ from src.models.vendor_models import Base
 
 
 class Payment(Base):
+    """
+    Represent the payments table used by the AP workflow.
+    Table: payments.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
     __tablename__ = "payments"
     __table_args__ = (
         Index(

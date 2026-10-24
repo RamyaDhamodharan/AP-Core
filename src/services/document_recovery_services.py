@@ -1,4 +1,12 @@
-"""Recover documents whose background task stopped unexpectedly."""
+"""
+Recover documents whose background task stopped unexpectedly.
+Flow: stuck document recovery and retry queueing.
+Called by: src/api/rest/routers/email_polling_routers.py, src/worker/dispatch.py,
+src/worker/tasks.py.
+Calls: audit_models, document_ingest_services, document_models,
+document_retry_services, email_models.
+Tables: audit_log, documents, email_messages.
+"""
 
 import hashlib
 import json
@@ -19,7 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 def recover_raw_email_document(document_id: uuid.UUID) -> None:
-    """Recover attachments for one raw email document after an explicit retry."""
+    """
+    Recover attachments for one raw email document after an explicit retry.
+    Inputs: document_id (uuid.UUID).
+    Output: None.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses failed, ignored, processed.
+    """
     from src.db.session_db import SessionLocal
     from src.services.email_polling_services import _sanitize_exception_message
 
@@ -205,6 +220,14 @@ def _recover_raw_email(db, document: Document) -> str:
 
 
 def sweep_stuck_documents(db, *, now: datetime | None = None) -> int:
+    """
+    Handle sweep stuck documents.
+    Inputs: db, now (datetime | None).
+    Output: int.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: statuses classified, failed, ignored, parsed, parsing, processed, received.
+    """
     current = now or datetime.now(UTC)
     timeout_minutes = max(1, int(os.getenv("DOCUMENT_STUCK_TIMEOUT_MINUTES", "15")))
     from src.services.document_retry_services import MAX_AUTOMATIC_RETRIES

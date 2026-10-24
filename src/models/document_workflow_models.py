@@ -1,3 +1,11 @@
+"""
+Application module for document workflow models.
+Flow: shared database records used through intake, matching, and review.
+Called by: src/api/rest/routers/document_workflow_routers.py,
+src/services/document_workflow_services.py.
+Calls: vendor_models.
+Tables: no database tables directly.
+"""
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,7 +18,12 @@ from src.models.vendor_models import Base
 
 
 class DocumentWorkflow(Base):
-    """Latest deterministic review snapshot and human decision for one source doc."""
+    """
+    Latest deterministic review snapshot and human decision for one source doc.
+    Table: document_workflows.
+    Status values: this table has no status enum.
+    Use: shared persistence or validation contract for this flow stage.
+    """
 
     __tablename__ = "document_workflows"
     __table_args__ = (

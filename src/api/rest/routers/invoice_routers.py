@@ -1,3 +1,14 @@
+"""
+Application module for invoice routers.
+Flow: invoice matching, review, approval, and payment.
+Called by: src/api/rest/routers/command_center_routers.py.
+Calls: audit_models, dependencies, dispatch, document_models,
+document_workflow_schemas.
+Tables: audit_log, documents, email_draft_events, email_drafts, follow_ups,
+goods_receipts, invoice_discrepancies, invoice_issues, invoice_lines,
+invoice_matches, invoice_state_history, invoice_supporting_documents, invoices,
+match_runs, notifications, payments, purchase_orders, users, vendors.
+"""
 import os
 import uuid
 from datetime import UTC, date, datetime
@@ -128,6 +139,13 @@ def three_way_match_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    """
+    Handle three way match invoice.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows.
+    Results: reason codes MISSING_GR; statuses matching, processed, ready_to_pay.
+    """
     owner_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -210,6 +228,13 @@ def get_invoice_recommendation(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> InvoiceRecommendation:
+    """
+    Return get invoice recommendation.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: InvoiceRecommendation.
+    Effects: reads database rows.
+    Results: reason codes MISSING_GR; statuses matching, ready_to_pay.
+    """
     owner_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -572,6 +597,17 @@ def list_invoices(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> InvoiceDashboardResponse:
+    """
+    List list invoices.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), match_status (InvoiceMatchStatus | None), status (InvoiceStatus |
+        None), source (Literal["email", "upload"] | None), final_status
+        (InvoiceFinalStatus | None), vendor_id (uuid.UUID | None), po_id (uuid.UUID |
+        None), invoice_date_from (date | None), ….
+    Output: InvoiceDashboardResponse.
+    Effects: reads database rows.
+    Results: statuses approved, rejected.
+    """
     filters = _dashboard_query_parameters(
         match_status=match_status,
         final_status=final_status,
@@ -628,6 +664,13 @@ def get_invoice_verification(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    """
+    Return get invoice verification.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     owner_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -696,6 +739,14 @@ def verify_invoice_fields(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    """
+    Handle verify invoice fields.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: dict.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries; may queue or retry background work.
+    Results: statuses matching, no_match, rejected, resubmitted, verifying.
+    """
     actor_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -942,6 +993,15 @@ def get_invoice_detail(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Return get invoice detail.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: reason codes CURRENCY_MISMATCH, HEADER_TOTAL_VARIANCE, LINE_NOT_ON_PO,
+        LINE_TOTAL_VARIANCE, LOW_CONFIDENCE, MISSING_GR, MISSING_PO, POSSIBLE_DUPLICATE;
+        statuses received.
+    """
     owner_id = _owner_id(current_user)
     row = (
         db.query(Invoice, Document)
@@ -1277,6 +1337,14 @@ def invoice_match_candidates(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle invoice match candidates.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses needs_review, rejected.
+    """
     invoice, owner_id = _review_invoice_or_404(db, invoice_id, current_user)
     rows = (
         db.query(InvoiceMatch, PurchaseOrder)
@@ -1365,6 +1433,14 @@ def confirm_invoice_match(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Confirm confirm invoice match.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
     try:
         po_id = uuid.UUID(str(payload.get("po_id", "")))
@@ -1425,6 +1501,14 @@ def reject_invoice_match(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Reject reject invoice match.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: statuses rejected.
+    """
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
     try:
         po_id = uuid.UUID(str(payload.get("po_id", "")))
@@ -1468,6 +1552,16 @@ def approve_invoice_exception(
     # Exception approval is intentionally narrower than normal approval. These
     # discrepancies can be accepted by a reviewer with a recorded reason; the
     # identity, integrity, and duplicate checks must still be resolved first.
+    """
+    Approve approve invoice exception.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: reason codes AMBIGUOUS_PO, CURRENCY_MISMATCH, HEADER_TOTAL_VARIANCE,
+        LINE_NOT_ON_PO, LINE_TOTAL_VARIANCE, LOW_CONFIDENCE, MISSING_GR, MISSING_PO;
+        statuses approved, needs_review, on_hold, paid, ready_to_pay, rejected.
+    """
     allowed_exception_codes = {
         "MISSING_GR",
         "QUANTITY_VARIANCE",
@@ -1661,6 +1755,17 @@ def list_invoice_review_queue(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> InvoiceDashboardResponse:
+    """
+    List list invoice review queue.
+    Inputs: page (Annotated[int, Query(ge=1)]), page_size (Annotated[int, Query(ge=1,
+        le=100)]), match_status (InvoiceMatchStatus | None), final_status
+        (InvoiceFinalStatus | None), vendor_id (uuid.UUID | None), invoice_date_from
+        (date | None), invoice_date_to (date | None), due_date (date | None),
+        due_date_from (date | None), ….
+    Output: InvoiceDashboardResponse.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     filters = _dashboard_query_parameters(
         match_status=match_status,
         final_status=final_status,
@@ -1692,6 +1797,15 @@ def review_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> InvoiceReviewResponse:
+    """
+    Handle review invoice.
+    Inputs: invoice_id (uuid.UUID), payload (InvoiceReviewRequest), db (Session),
+        current_user (dict).
+    Output: InvoiceReviewResponse.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, on_hold, ready_to_pay, rejected.
+    """
     reviewer_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -1847,6 +1961,14 @@ def approve_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Approve approve invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict | None), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses approved.
+    """
     return review_invoice(
         invoice_id,
         InvoiceReviewRequest(
@@ -1866,6 +1988,13 @@ def reject_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Reject reject invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses rejected.
+    """
     return review_invoice(
         invoice_id,
         InvoiceReviewRequest(decision="rejected", reason=payload.get("reason")),
@@ -1881,6 +2010,13 @@ def hold_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle hold invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: statuses on_hold.
+    """
     return review_invoice(
         invoice_id,
         InvoiceReviewRequest(decision="on_hold", reason=payload.get("reason")),
@@ -1896,6 +2032,14 @@ def resubmit_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle resubmit invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses matching, pending, rejected, resubmitted.
+    """
     actor_id = _owner_id(current_user)
     old = db.query(Invoice).filter(Invoice.id == invoice_id).with_for_update().first()
     if old is None:
@@ -2062,6 +2206,13 @@ def list_match_runs(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    List list match runs.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows.
+    Results: no workflow status or reason code directly.
+    """
     if db.get(Invoice, invoice_id) is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return (
@@ -2078,6 +2229,14 @@ def invoice_timeline(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle invoice timeline.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; may add audit entries; may add invoice timeline
+        entries.
+    Results: statuses failed.
+    """
     if db.get(Invoice, invoice_id) is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     invoice = db.get(Invoice, invoice_id)
@@ -2163,6 +2322,13 @@ def invoice_state_history(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle invoice state history.
+    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; may add invoice timeline entries.
+    Results: no workflow status or reason code directly.
+    """
     if db.get(Invoice, invoice_id) is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return (
@@ -2180,6 +2346,14 @@ def record_invoice_payment(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle record invoice payment.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, other, overdue, paid.
+    """
     from datetime import date as date_type
 
     paid_date_value = payload.get("paid_date")
@@ -2282,6 +2456,14 @@ def void_invoice_payment(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle void invoice payment.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, paid.
+    """
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         raise HTTPException(
@@ -2350,6 +2532,15 @@ def release_invoice_hold(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Handle release invoice hold.
+    Inputs: invoice_id (uuid.UUID), payload (dict | None), db (Session), current_user
+        (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries.
+    Results: statuses approved, on_hold.
+    """
     invoice = db.query(Invoice).filter_by(id=invoice_id).with_for_update().first()
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -2385,6 +2576,14 @@ def escalate_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Escalate escalate invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: no workflow status or reason code directly.
+    """
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required to escalate")
@@ -2456,6 +2655,14 @@ def reassign_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Reassign reassign invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries.
+    Results: no workflow status or reason code directly.
+    """
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required to reassign")
@@ -2528,6 +2735,15 @@ def run_invoice_match(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Run run invoice match.
+    Inputs: invoice_id (uuid.UUID), background_tasks (BackgroundTasks), db (Session),
+        current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may queue or retry
+        background work.
+    Results: no workflow status or reason code directly.
+    """
     user_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice).filter(Invoice.id == invoice_id).with_for_update().first()
@@ -2556,6 +2772,15 @@ def update_invoice(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Update update invoice.
+    Inputs: invoice_id (uuid.UUID), payload (dict), background_tasks (BackgroundTasks),
+        db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may queue or retry background work.
+    Results: no workflow status or reason code directly.
+    """
     user_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
@@ -2673,6 +2898,15 @@ def confirm_invoice_po(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Confirm confirm invoice po.
+    Inputs: invoice_id (uuid.UUID), payload (dict), background_tasks (BackgroundTasks),
+        db (Session), current_user (dict).
+    Output: the value or None returned by its body.
+    Effects: reads database rows; writes or commits database rows; may add audit
+        entries; may add invoice timeline entries; may queue or retry background work.
+    Results: statuses approved, matching, on_hold, paid, rejected.
+    """
     user_id = _owner_id(current_user)
     invoice = (
         db.query(Invoice)
