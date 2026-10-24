@@ -223,11 +223,12 @@ def test_concurrent_canonical_invoice_number_insert_has_one_duplicate_winner(
                 )
                 return "duplicate" if duplicate is not None else "unhandled conflict"
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(insert, ["INV-001", "inv 001"]))
-
-    assert sorted(outcomes) == ["created", "duplicate"]
-    with Session(test_engine) as cleanup:
-        cleanup.query(Invoice).filter_by(vendor_id=vendor_id).delete()
-        cleanup.query(Vendor).filter_by(id=vendor_id).delete()
-        cleanup.commit()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(insert, ["INV-001", "inv 001"]))
+        assert sorted(outcomes) == ["created", "duplicate"]
+    finally:
+        with Session(test_engine) as cleanup:
+            cleanup.query(Invoice).filter_by(vendor_id=vendor_id).delete()
+            cleanup.query(Vendor).filter_by(id=vendor_id).delete()
+            cleanup.commit()
