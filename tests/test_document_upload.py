@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from src.api.rest.app import app
@@ -39,6 +40,49 @@ def teardown_db():
     app.dependency_overrides.pop(get_current_user, None)
 
 
+def _request_document_file(monkeypatch, *, disposition=None):
+    document_id = uuid.uuid4()
+    document = SimpleNamespace(
+        id=document_id,
+        storage_path="documents/invoice/original/invoice.pdf",
+        original_filename="invoice.pdf",
+        mime="application/octet-stream",
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = document
+    setup_db(monkeypatch, db)
+    monkeypatch.setattr(document_routers, "download_file", lambda _path: b"%PDF")
+    params = {"disposition": disposition} if disposition else None
+    try:
+        return client.get(f"/api/documents/{document_id}/file", params=params)
+    finally:
+        teardown_db()
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_disposition"),
+    [(None, "attachment"), ("inline", "inline")],
+)
+def test_original_file_disposition_and_content_type(
+    monkeypatch, disposition, expected_disposition
+):
+    response = _request_document_file(monkeypatch, disposition=disposition)
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].startswith(
+        f"{expected_disposition};"
+    )
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_original_file_rejects_unknown_disposition(monkeypatch):
+    response = _request_document_file(monkeypatch, disposition="preview")
+
+    assert response.status_code == 422
+
+
 def test_upload_valid_pdf(monkeypatch):
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = None
@@ -66,6 +110,24 @@ def test_upload_valid_pdf(monkeypatch):
 
     assert any(isinstance(call.args[0], Document) for call in db.add.call_args_list)
     db.commit.assert_called_once()
+
+
+def test_upload_rejects_more_than_five_files_before_ingest(monkeypatch):
+    db = MagicMock()
+    setup_db(monkeypatch, db)
+    files = [
+        ("file", (f"invoice-{index}.pdf", b"%PDF-1.4", "application/pdf"))
+        for index in range(6)
+    ]
+
+    try:
+        response = client.post("/api/documents/upload", files=files)
+    finally:
+        teardown_db()
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "You can upload up to 5 files at a time"
+    db.add.assert_not_called()
 
 
 def test_upload_extract_pipeline_matches_and_approves_without_manual_route(monkeypatch):

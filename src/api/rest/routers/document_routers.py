@@ -11,7 +11,8 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -786,6 +787,11 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    if len(files) > 5:
+        raise HTTPException(
+            status_code=422,
+            detail="You can upload up to 5 files at a time",
+        )
     results = []
     user_id = uuid.UUID(str(current_user["sub"]))
     max_upload_size = int(os.getenv("EMAIL_ATTACHMENT_MAX_BYTES", str(MAX_FILE_SIZE)))
@@ -2764,6 +2770,7 @@ def parse_document(
 @router.get("/{document_id}/file")
 def get_document_file(
     document_id: uuid.UUID,
+    disposition: Literal["inline", "attachment"] = Query(default="attachment"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2790,13 +2797,22 @@ def get_document_file(
         raise HTTPException(
             status_code=502, detail="Original file could not be retrieved"
         ) from exc
+    extension = Path(document.original_filename).suffix.lower()
+    media_type = {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".eml": "message/rfc822",
+        ".txt": "text/plain",
+    }.get(extension, "application/octet-stream")
+    filename = quote(document.original_filename, safe="")
     return Response(
         content=content,
-        media_type="application/octet-stream",
+        media_type=media_type,
         headers={
-            "Content-Disposition": (
-                f'attachment; filename="{document.original_filename}"'
-            ),
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{filename}",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
