@@ -159,6 +159,7 @@ def resolve_extracted_records_for_vendor(
         for value in (vendor.tax_id, identity.get("tax_id"))
         if _normalize_tax_id(value)
     }
+    create_alias = bool(identity.get("create_alias"))
     summary = {"documents": 0, "purchase_orders": 0, "goods_receipts": 0, "invoices": 0}
     documents = (
         db.query(Document)
@@ -179,6 +180,23 @@ def resolve_extracted_records_for_vendor(
             or _normalize_tax_id(raw_tax_id) in tax_ids
         ):
             continue
+        if create_alias and raw_name:
+            alias_norm = normalize_vendor_name(str(raw_name))
+            if alias_norm and alias_norm != normalize_vendor_name(vendor.name):
+                existing_alias = (
+                    db.query(VendorAlias)
+                    .filter(VendorAlias.alias_norm == alias_norm)
+                    .first()
+                )
+                if existing_alias is None:
+                    db.add(
+                        VendorAlias(
+                            vendor_id=vendor.id,
+                            alias_norm=alias_norm,
+                            created_by=actor_id,
+                            updated_by=actor_id,
+                        )
+                    )
         summary["documents"] += 1
         invoice = (
             db.query(Invoice)
