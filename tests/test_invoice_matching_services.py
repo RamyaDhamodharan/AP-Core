@@ -4,9 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from src.models.audit_models import AuditLog
+from src.models.email_draft_models import EmailDraft
 from src.models.invoice_state_history_models import InvoiceStateHistory
 from src.models.match_run_models import MatchRun
-from src.models.email_draft_models import EmailDraft
 from src.services import invoice_matching_services as matching
 
 
@@ -283,7 +283,7 @@ def test_rerun_does_not_rewrite_approved_or_paid_invoice(monkeypatch):
         assert invoice.status == legacy_status
 
 
-def test_no_match_draft_failure_does_not_block_auto_reject(monkeypatch):
+def test_no_match_draft_failure_does_not_block_auto_reject(monkeypatch, caplog):
     monkeypatch.setenv("EMAIL_NO_MATCH_AUTO_REJECT", "true")
     monkeypatch.setenv("TEST_MAILBOX_ALLOWLIST", "allowed@example.test")
     db, invoice, _document, invoice_id = _no_match_fixture(monkeypatch, source="email")
@@ -297,3 +297,8 @@ def test_no_match_draft_failure_does_not_block_auto_reject(monkeypatch):
     assert run.result == "no_match"
     assert invoice.workflow_status == "rejected"
     assert invoice.status == "rejected"
+    warning = next(
+        record for record in caplog.records
+        if record.message == "No-match email draft could not be created"
+    )
+    assert warning.exc_info is not None

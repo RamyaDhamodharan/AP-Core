@@ -25,10 +25,8 @@ def test_audit_log_admin_accepts_join_filters_and_sort_direction():
     query = MagicMock()
     query.filter.return_value = query
     query.count.return_value = 0
-    (
     result_page = query.order_by.return_value.offset.return_value.limit.return_value
     result_page.all.return_value = []
-    ) = []
     db = MagicMock()
     db.query.return_value = query
     app.dependency_overrides[get_current_user] = lambda: {

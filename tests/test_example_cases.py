@@ -15,9 +15,9 @@ from src.api.rest.dependencies import get_current_user
 from src.api.rest.routers import invoice_routers
 from src.db.session_db import get_db
 from src.models.audit_models import AuditLog
+from src.models.email_draft_models import EmailDraft
 from src.models.invoice_models import Invoice
 from src.models.invoice_state_history_models import InvoiceStateHistory
-from src.models.email_draft_models import EmailDraft
 from src.services.document_ingest_services import IngestResult
 from src.services.llm_pipeline_services import classify_document, extract_document
 
@@ -212,6 +212,7 @@ def test_case_5_unknown_vendor_rejected_and_sender_draft_created(monkeypatch):
         vendor_id=None,
     )
     document = SimpleNamespace(id=uuid.uuid4(), email_sender=sender)
+    invoice.source_document_id = document.id
     db = MagicMock()
     _auto_reject_unmatched_invoice(db, invoice, document)
     drafts = [
@@ -360,6 +361,9 @@ def test_case_8_wrong_gl_rejected_and_resubmitted_with_correct_gl(monkeypatch):
         uuid.uuid4(),
     )
     _api(db)
+    monkeypatch.setattr(
+        invoice_routers, "find_duplicate_invoice", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(invoice_routers, "run_match_for_invoice", lambda *_a: None)
     try:
         response = client.post(

@@ -1,8 +1,8 @@
 """Add normalized invoice number keys for duplicate detection."""
 
-from alembic import op
 from sqlalchemy import text
 
+from alembic import op
 from src.services.invoice_number_services import normalize_invoice_no
 
 revision = "20261023_0022"

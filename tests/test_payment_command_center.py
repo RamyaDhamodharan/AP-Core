@@ -5,12 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
-
 from sqlalchemy.dialects import postgresql
 
-from src.api.rest.routers import command_center_routers
 from src.api.rest.app import app
 from src.api.rest.dependencies import get_current_user
+from src.api.rest.routers import command_center_routers
 from src.db.session_db import get_db
 from src.services import follow_up_services
 
@@ -61,15 +60,19 @@ def test_overdue_bucket_reports_timezone_date_difference(monkeypatch):
 def test_command_center_sort_direction_and_invalid_value(monkeypatch):
     user_id = uuid.uuid4()
     db = MagicMock()
-    total_query = MagicMock()
-    items_query = MagicMock()
-    db.query.side_effect = [total_query, items_query]
-    total_query.outerjoin.return_value.filter.return_value.scalar.return_value = 0
-    item_query = items_query.outerjoin.return_value.outerjoin.return_value
-    (
-        item_query.filter.return_value.order_by.return_value.offset.return_value
-        .limit.return_value.all.return_value
-    ) = []
+
+    def prepare_query_pair():
+        total_query, items_query = MagicMock(), MagicMock()
+        db.query.side_effect = [total_query, items_query]
+        total_query.outerjoin.return_value.filter.return_value.scalar.return_value = 0
+        item_query = items_query.outerjoin.return_value.outerjoin.return_value
+        (
+            item_query.filter.return_value.order_by.return_value.offset.return_value
+            .limit.return_value.all.return_value
+        ) = []
+        return item_query
+
+    asc_query = prepare_query_pair()
     app.dependency_overrides[get_current_user] = lambda: {"sub": str(user_id)}
     app.dependency_overrides[get_db] = lambda: db
     try:
@@ -77,17 +80,28 @@ def test_command_center_sort_direction_and_invalid_value(monkeypatch):
         valid = client.get(
             "/api/command-center/bills", params={"sort_dir": "asc"}
         )
+        asc_order = str(
+            asc_query.filter.return_value.order_by.call_args.args[0].compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        desc_query = prepare_query_pair()
+        descending = client.get(
+            "/api/command-center/bills", params={"sort_dir": "desc"}
+        )
         invalid = client.get(
             "/api/command-center/bills", params={"sort_dir": "sideways"}
         )
         assert valid.status_code == 200
+        assert descending.status_code == 200
         assert invalid.status_code == 422
-        ordering = str(
-            item_query.order_by.call_args.args[0].compile(
+        desc_order = str(
+            desc_query.filter.return_value.order_by.call_args.args[0].compile(
                 dialect=postgresql.dialect()
             )
         )
-        assert "invoices.created_at ASC" in ordering
+        assert "invoices.created_at ASC" in asc_order
+        assert "invoices.created_at DESC" in desc_order
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         app.dependency_overrides.pop(get_db, None)
