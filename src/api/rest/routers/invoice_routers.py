@@ -1112,6 +1112,8 @@ def get_invoice_detail(
     ]
     return {
         "invoice_id": str(invoice.id),
+        "match_run_id": str(saved_run.id) if saved_run else None,
+        "updated_at": getattr(invoice, "updated_at", None),
         "source_document_id": str(invoice.source_document_id)
         if invoice.source_document_id
         else None,
@@ -1455,10 +1457,67 @@ def approve_invoice_exception(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    # Exception approval is intentionally narrower than normal approval. These
+    # discrepancies can be accepted by a reviewer with a recorded reason; the
+    # identity, integrity, and duplicate checks must still be resolved first.
+    allowed_exception_codes = {
+        "MISSING_GR",
+        "QUANTITY_VARIANCE",
+        "PRICE_VARIANCE",
+        "LINE_TOTAL_VARIANCE",
+        "TAX_VARIANCE",
+        "HEADER_TOTAL_VARIANCE",
+    }
+    blocked_exception_messages = {
+        "MISSING_PO": (
+            "Resolve the missing purchase order before approving an exception."
+        ),
+        "AMBIGUOUS_PO": (
+            "Choose the correct purchase order before approving an exception."
+        ),
+        "VENDOR_MISMATCH": (
+            "Resolve the vendor mismatch before approving an exception."
+        ),
+        "LINE_NOT_ON_PO": (
+            "Resolve invoice lines that are not on the purchase order "
+            "before approving an exception."
+        ),
+        "CURRENCY_MISMATCH": (
+            "Resolve the currency mismatch before approving an exception."
+        ),
+        "POSSIBLE_DUPLICATE": (
+            "Resolve the possible duplicate invoice before approving an exception."
+        ),
+        "LOW_CONFIDENCE": (
+            "Verify the low-confidence fields before approving an exception."
+        ),
+    }
     reason = str(payload.get("reason") or "").strip()
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required")
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    if invoice.final_status or invoice.status in {
+        "ready_to_pay",
+        "on_hold",
+        "rejected",
+    } or getattr(invoice, "workflow_status", None) in {
+        "approved",
+        "paid",
+        "on_hold",
+        "rejected",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This invoice has already been decided. "
+                "Refresh to see the current decision."
+            ),
+        )
+    if getattr(invoice, "vendor_id", None) is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Resolve the invoice vendor before approving an exception.",
+        )
     saved_run = (
         db.get(MatchRun, invoice.final_run_id)
         if getattr(invoice, "final_run_id", None)
@@ -1467,19 +1526,89 @@ def approve_invoice_exception(
     saved_outcome = (
         (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
     )
-    if not saved_outcome or saved_outcome.get("outcome") != "ready_to_pay":
+    expected_run_id = payload.get("expected_match_run_id", payload.get("match_run_id"))
+    if expected_run_id is not None:
+        try:
+            expected_run_id = uuid.UUID(str(expected_run_id))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid match run ID") from exc
+        if saved_run is None or saved_run.id != expected_run_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This invoice changed while you were reviewing it. "
+                    "Refresh and review the latest data."
+                ),
+            )
+    expected_updated_at = payload.get("expected_updated_at")
+    if expected_updated_at is not None:
+        try:
+            expected_updated_at = datetime.fromisoformat(
+                str(expected_updated_at).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="Invalid invoice timestamp"
+            ) from exc
+        current_updated_at = getattr(invoice, "updated_at", None)
+        if current_updated_at is not None and current_updated_at != expected_updated_at:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This invoice changed while you were reviewing it. "
+                    "Refresh and review the latest data."
+                ),
+            )
+    discrepancies = (
+        saved_outcome.get("discrepancies", [])
+        if isinstance(saved_outcome, dict)
+        else []
+    )
+    reason_codes = [
+        str(item.get("code"))
+        for item in discrepancies
+        if isinstance(item, dict) and item.get("code")
+    ]
+    if not reason_codes or not saved_outcome:
         raise HTTPException(
             status_code=409,
-            detail="Invoice cannot be approved until all matching rules pass",
+            detail=(
+                "Exception approval is not available because no saved discrepancy "
+                "is available. Re-run matching and review the invoice."
+            ),
         )
     if invoice.status != "needs_review":
         raise HTTPException(
             status_code=409,
-            detail="Exception approval is only available for invoices that need review",
+            detail=(
+                "Exception approval is only available for invoices that need "
+                "review. Refresh and try again."
+            ),
+        )
+    blocked_codes = [
+        code for code in reason_codes if code not in allowed_exception_codes
+    ]
+    if blocked_codes:
+        code = blocked_codes[0]
+        raise HTTPException(
+            status_code=409,
+            detail=blocked_exception_messages.get(
+                code,
+                (
+                    f"Exception approval is not allowed for reason code {code}. "
+                    "Resolve the discrepancy first."
+                ),
+            ),
         )
     old_status = invoice.status
     transition_invoice(
-        db, invoice, "approved", changed_by=actor_id, reason=reason, force=True
+        db,
+        invoice,
+        "approved",
+        changed_by=actor_id,
+        reason=reason,
+        force=True,
+        allow_exception=True,
     )
     invoice.status = "ready_to_pay"
     invoice.final_by = actor_id
@@ -1491,7 +1620,10 @@ def approve_invoice_exception(
             entity_type="invoice",
             entity_id=invoice.id,
             old_value={"status": old_status},
-            new_value={"status": "ready_to_pay"},
+            new_value={
+                "status": "ready_to_pay",
+                "reason_codes": reason_codes,
+            },
             reason=reason,
             message="Approved with exception by reviewer",
             created_by=actor_id,

@@ -92,11 +92,14 @@ def transition_invoice(
     changed_by: UUID | None = None,
     reason: str | None = None,
     force: bool = False,
+    allow_exception: bool = False,
 ) -> InvoiceStateHistory:
     """Apply an allowed status change and persist state history in the transaction."""
     if to_status not in WORKFLOW_STATUSES:
         raise HTTPException(status_code=422, detail="Unknown invoice workflow status")
-    if to_status in {"approved", "paid"}:
+    if to_status in {"approved", "paid"} and not (
+        allow_exception and to_status == "approved"
+    ):
         run_id = getattr(invoice, "final_run_id", None)
         run = db.get(MatchRun, run_id) if run_id else None
         outcome = (run.rules_used or {}).get("match_outcome") if run else None
