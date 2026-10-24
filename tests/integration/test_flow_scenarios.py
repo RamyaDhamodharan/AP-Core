@@ -137,6 +137,8 @@ def test_saved_flow_scenario_reason_codes(
         invoice.po_number_raw = None
         invoice.vendor_id = None
     elif scenario == "ambiguous_po":
+        # Exercise PO-number ambiguity rather than an already confirmed PO ID.
+        invoice.po_id = None
         db_factories["purchase_order"](
             vendor, po_number=po.po_number, currency="USD", is_current=True
         )
@@ -437,22 +439,20 @@ def test_po_amendment_versions_and_reruns_invoice_match(
 
 
 def test_two_concurrent_edits_are_serialized_and_both_rematched(
-    test_engine, monkeypatch
+    test_engine, db_user_factory, monkeypatch
 ):
     from fastapi import BackgroundTasks
     from sqlalchemy.orm import Session
 
     from src.api.rest.routers.invoice_routers import update_invoice
-    from src.models.user_models import User
-
     monkeypatch.setenv("NO_MATCH_AUTO_REJECT", "false")
     seed = Session(test_engine)
-    user = User(
+    user = db_user_factory(
+        seed,
+        "associate",
         name="Flow race test",
         email=f"flow-race-{uuid.uuid4()}@example.test",
-        role="associate",
     )
-    seed.add(user)
     seed.flush()
     invoice = Invoice(
         invoice_no=f"FLOW-RACE-{uuid.uuid4()}",

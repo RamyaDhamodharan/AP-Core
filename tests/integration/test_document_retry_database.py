@@ -1,8 +1,21 @@
 import uuid
 
+from sqlalchemy import text
+
 from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.services import document_retry_services
+
+
+def test_user_factory_sets_auth_owned_placeholder_hash(db_session, db_factories):
+    user = db_factories["associate"]()
+
+    saved_hash = db_session.execute(
+        text("SELECT password_hash FROM auth.users WHERE id = :user_id"),
+        {"user_id": user.id},
+    ).scalar_one()
+
+    assert saved_hash == "integration-dummy-not-a-secret"
 
 
 def test_process_document_attempt_leaves_processing_document_failed(

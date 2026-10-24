@@ -203,6 +203,7 @@ def test_case_7_mark_overdue_creates_history_alert_and_follow_up(
 
 
 def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_rate):
+    invoice_date = date(2026, 10, 1)
     user = db_factories["associate"]()
     vendor = db_factories["vendor"]()
     po = db_factories["purchase_order"](
@@ -258,7 +259,7 @@ def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_r
                 from_currency="EUR",
                 to_currency="USD",
                 rate=Decimal("1.100000"),
-                rate_date=date.today(),
+                rate_date=invoice_date,
                 created_by=user.id,
             )
         )
@@ -268,7 +269,7 @@ def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_r
         "vendor": vendor.name,
         "invoice_number": f"INV-CURRENCY-{uuid.uuid4()}",
         "order_number": po.po_number,
-        "invoice_date": "2026-10-01",
+        "invoice_date": invoice_date.isoformat(),
         "currency": "EUR",
         "subtotal": "90.90" if with_exchange_rate else "100.00",
         "tax": "0.00",
@@ -295,7 +296,7 @@ def _run_currency_mismatch_pipeline(db_session, db_factories, *, with_exchange_r
     discrepancy = (
         db_session.query(InvoiceDiscrepancy)
         .filter_by(invoice_id=invoice.id, field="currency")
-        .one()
+        .one_or_none()
     )
     return document, invoice, run, discrepancy
 
@@ -310,6 +311,7 @@ def test_currency_mismatch_persists_invoice_and_keeps_document_extracted(
     assert db_session.get(Invoice, invoice.id) is invoice
     assert run.result == "match_issues"
     assert invoice.status == "needs_review"
+    assert discrepancy is not None
     assert discrepancy.reason == "Currency mismatch: invoice EUR, PO USD"
     assert discrepancy.invoice_value == "EUR"
     assert discrepancy.po_value == "USD"

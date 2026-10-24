@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
@@ -56,11 +56,50 @@ def db_session(test_engine):
 
 
 @pytest.fixture
-def db_factories(db_session):
+def db_user_factory():
+    from src.models.user_models import User
+
+    def create_user(db_session, role="associate", **values):
+        user_id = uuid.uuid4()
+        name = values.pop("name", role.title())
+        email = values.pop("email", f"{role}-{uuid.uuid4()}@example.test")
+        is_active = values.pop("is_active", True)
+        must_change_password = values.pop("must_change_password", False)
+        created_by = values.pop("created_by", None)
+        updated_by = values.pop("updated_by", None)
+        # The Auth-owned required column is intentionally absent from Core's
+        # model, so populate it only in this test factory with a dummy value.
+        db_session.execute(
+            text(
+                "INSERT INTO auth.users "
+                "(id, name, email, role, password_hash, is_active, "
+                "must_change_password, created_by, updated_by) "
+                "VALUES (:id, :name, :email, CAST(:role AS auth.user_role), "
+                ":password_hash, :is_active, :must_change_password, "
+                ":created_by, :updated_by)"
+            ),
+            {
+                "id": user_id,
+                "name": name,
+                "email": email,
+                "role": role,
+                "password_hash": "integration-dummy-not-a-secret",
+                "is_active": is_active,
+                "must_change_password": must_change_password,
+                "created_by": created_by,
+                "updated_by": updated_by,
+            },
+        )
+        return db_session.get(User, user_id)
+
+    return create_user
+
+
+@pytest.fixture
+def db_factories(db_session, db_user_factory):
     from src.models.goods_receipt_models import GoodsReceipt, GoodsReceiptLine
     from src.models.invoice_models import Invoice, InvoiceLine
     from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
-    from src.models.user_models import User
     from src.models.vendor_models import Vendor
 
     def persist(row):
@@ -74,14 +113,7 @@ def db_factories(db_session):
         )
 
     def user(role="associate", **values):
-        return persist(
-            User(
-                name=values.pop("name", role.title()),
-                email=values.pop("email", f"{role}-{uuid.uuid4()}@example.test"),
-                role=role,
-                **values,
-            )
-        )
+        return db_user_factory(db_session, role, **values)
 
     def purchase_order(vendor_row, *, lines=None, **values):
         row = PurchaseOrder(
