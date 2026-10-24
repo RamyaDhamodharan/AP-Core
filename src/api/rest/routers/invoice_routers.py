@@ -1498,8 +1498,7 @@ def resubmit_invoice(
         source_document_id=old.source_document_id,
         resubmitted_from_id=old.id,
         invoice_no=old.invoice_no,
-        invoice_no_normalized=old.invoice_no_normalized
-        or normalize_invoice_no(old.invoice_no),
+        invoice_no_normalized=normalize_invoice_no(old.invoice_no),
         version_no=old.version_no + 1,
         is_current=True,
         vendor_id=old.vendor_id,
