@@ -26,6 +26,8 @@ ISSUE_NAMES = {
     "vendor": ("unknown_vendor", "The invoice vendor could not be resolved"),
     "duplicate": ("duplicate_invoice", "A duplicate invoice was detected"),
     "confidence": ("low_confidence", "One or more extracted fields need verification"),
+    "line_not_on_po": ("line_not_on_po", "An invoice line is not on the PO"),
+    "line_total": ("line_total_variance", "An invoice line total does not reconcile"),
 }
 
 

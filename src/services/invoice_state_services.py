@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from src.models.invoice_models import Invoice
 from src.models.invoice_state_history_models import InvoiceStateHistory
+from src.models.match_run_models import MatchRun
 
 WORKFLOW_STATUSES = {
     "received",
@@ -95,6 +96,15 @@ def transition_invoice(
     """Apply an allowed status change and persist state history in the transaction."""
     if to_status not in WORKFLOW_STATUSES:
         raise HTTPException(status_code=422, detail="Unknown invoice workflow status")
+    if to_status in {"approved", "paid"}:
+        run_id = getattr(invoice, "final_run_id", None)
+        run = db.get(MatchRun, run_id) if run_id else None
+        outcome = (run.rules_used or {}).get("match_outcome") if run else None
+        if not outcome or outcome.get("outcome") != "ready_to_pay":
+            raise HTTPException(
+                status_code=409,
+                detail="Invoice cannot be approved until all matching rules pass",
+            )
     current = getattr(invoice, "workflow_status", None) or legacy_workflow_status(
         invoice
     )

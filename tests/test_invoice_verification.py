@@ -108,7 +108,7 @@ def test_verify_edits_audit_old_new_reason_and_associate_can_continue(monkeypatc
     }
     monkeypatch.setattr(
         "src.api.rest.routers.invoice_routers.run_match_for_invoice",
-        lambda *_args: None,
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         "src.api.rest.routers.invoice_routers.find_duplicate_invoice",

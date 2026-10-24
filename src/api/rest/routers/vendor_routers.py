@@ -253,6 +253,26 @@ def update_vendor(
     return vendor
 
 
+@router.delete(
+    "/{vendor_id}",
+    response_model=VendorResponse,
+    dependencies=[Depends(require_role("admin"))],
+)
+def deactivate_vendor(
+    vendor_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> Vendor:
+    """Deactivate a vendor without breaking historical record references."""
+    vendor = db.get(Vendor, vendor_id)
+    if vendor is None:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    vendor.is_active = False
+    db.add(vendor)
+    db.commit()
+    db.refresh(vendor)
+    return vendor
+
+
 @router.get(
     "/{vendor_id}/aliases",
     response_model=list[VendorAliasResponse],

@@ -347,8 +347,14 @@ def test_upload_extract_pipeline_matches_and_approves_without_manual_route(
     )
     monkeypatch.setattr(
         invoice_matching_services,
-        "recommend_invoice_review",
-        lambda *_args, **_kwargs: SimpleNamespace(checks=[]),
+        "evaluate_invoice",
+        lambda *_args, **_kwargs: {
+            "rule_set_version": "ap-match-v1",
+            "outcome": "ready_to_pay",
+            "discrepancies": [],
+            "low_confidence_fields": [],
+            "inputs_summary": {},
+        },
     )
 
     def process_document(document_id):

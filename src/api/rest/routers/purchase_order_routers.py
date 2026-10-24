@@ -5,13 +5,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from src.api.rest.dependencies import get_current_user
+from src.api.rest.dependencies import get_current_user, require_role
 from src.db.session_db import get_db
+from src.models.audit_models import AuditLog
 from src.models.document_models import Document
 from src.models.purchase_order_models import PurchaseOrder
+from src.models.vendor_models import Vendor
 from src.schemas.purchase_order_schemas import (
     PurchaseOrderListResponse,
     PurchaseOrderResponse,
+    PurchaseOrderVendorReassignmentRequest,
 )
 
 router = APIRouter(
@@ -94,3 +97,54 @@ def get_purchase_order(
     if order is None:
         raise HTTPException(status_code=404, detail="Purchase order not found")
     return order
+
+
+@router.patch(
+    "/{po_id}/vendor",
+    response_model=PurchaseOrderResponse,
+    dependencies=[Depends(require_role("admin"))],
+)
+def reassign_purchase_order_vendor(
+    po_id: uuid.UUID,
+    payload: PurchaseOrderVendorReassignmentRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        owner_id = uuid.UUID(str(current_user["sub"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Authenticated user ID is invalid"
+        ) from exc
+    order = db.scalar(
+        _query()
+        .where(PurchaseOrder.id == po_id, _owner_filter(owner_id))
+        .with_for_update()
+    )
+    if order is None:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    vendor = db.get(Vendor, payload.vendor_id)
+    if vendor is None:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    if not vendor.is_active:
+        raise HTTPException(status_code=409, detail="Vendor is inactive")
+    old_vendor_id = order.vendor_id
+    order.vendor_id = vendor.id
+    db.add(
+        AuditLog(
+            action="purchase_order_vendor_reassigned",
+            entity_type="purchase_order",
+            entity_id=order.id,
+            old_value={"vendor_id": str(old_vendor_id) if old_vendor_id else None},
+            new_value={"vendor_id": str(vendor.id), "vendor_name": vendor.name},
+            created_by=owner_id,
+            updated_by=owner_id,
+        )
+    )
+    db.commit()
+    return db.scalar(
+        _query().where(
+            PurchaseOrder.id == order.id,
+            _owner_filter(owner_id),
+        )
+    )

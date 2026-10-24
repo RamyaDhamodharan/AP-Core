@@ -67,8 +67,7 @@ def test_command_center_sort_direction_and_invalid_value(monkeypatch):
         total_query.outerjoin.return_value.filter.return_value.scalar.return_value = 0
         item_query = items_query.outerjoin.return_value.outerjoin.return_value
         (
-            item_query.filter.return_value.order_by.return_value.offset.return_value
-            .limit.return_value.all.return_value
+            item_query.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value
         ) = []
         return item_query
 
@@ -77,9 +76,7 @@ def test_command_center_sort_direction_and_invalid_value(monkeypatch):
     app.dependency_overrides[get_db] = lambda: db
     try:
         client = TestClient(app)
-        valid = client.get(
-            "/api/command-center/bills", params={"sort_dir": "asc"}
-        )
+        valid = client.get("/api/command-center/bills", params={"sort_dir": "asc"})
         asc_order = str(
             asc_query.filter.return_value.order_by.call_args.args[0].compile(
                 dialect=postgresql.dialect()
@@ -117,7 +114,7 @@ def test_bucket_conditions_cover_unpaid_and_status_rules():
         )
         for bucket in ("ready_to_pay", "overdue", "rejected", "needs_attention")
     }
-    assert "workflow_status = 'approved'" in compiled["ready_to_pay"]
+    assert "status = 'ready_to_pay'" in compiled["ready_to_pay"]
     assert "paid_at IS NULL" in compiled["ready_to_pay"]
     assert "due_date < '2026-10-22'" in compiled["overdue"]
     assert "final_status != 'rejected'" in compiled["overdue"]

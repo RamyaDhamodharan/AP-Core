@@ -431,6 +431,20 @@ def test_three_way_match_endpoint_does_not_change_invoice_approval(monkeypatch):
         "recommend_invoice_review",
         lambda _db, _invoice, owner_id: recommendation,
     )
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            id=uuid.uuid4(),
+            rules_used={
+                "match_outcome": {
+                    "outcome": "ready_to_pay",
+                    "rule_set_version": "ap-match-v1",
+                    "discrepancies": [],
+                }
+            },
+        ),
+    )
     db.add = MagicMock()
     user_id = uuid.uuid4()
     app.dependency_overrides[get_db] = lambda: db
@@ -443,4 +457,4 @@ def test_three_way_match_endpoint_does_not_change_invoice_approval(monkeypatch):
     assert response.status_code == 200
     assert response.json()["matched"] is True
     assert invoice.final_status == "approved"
-    db.commit.assert_not_called()
+    db.commit.assert_called_once()

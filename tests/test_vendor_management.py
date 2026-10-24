@@ -179,6 +179,23 @@ def test_get_vendor_returns_existing_vendor():
     db.get.assert_called_once_with(Vendor, vendor.id)
 
 
+def test_delete_vendor_deactivates_without_removing_record():
+    vendor = _vendor()
+    db, teardown = _setup()
+    db.get.return_value = vendor
+
+    try:
+        response = client.delete(f"/api/vendors/{vendor.id}")
+    finally:
+        teardown()
+
+    assert response.status_code == 200
+    assert response.json()["is_active"] is False
+    assert vendor.is_active is False
+    db.delete.assert_not_called()
+    db.commit.assert_called_once()
+
+
 @pytest.mark.parametrize("method", ("get", "patch"))
 def test_vendor_detail_and_update_return_not_found(method):
     db, teardown = _setup()

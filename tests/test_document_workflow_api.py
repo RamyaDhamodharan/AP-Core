@@ -127,6 +127,25 @@ def test_invoice_match_endpoint_returns_partial_workflow_without_approval(monkey
         "recommend_invoice_review",
         lambda _db, _invoice, owner_id: recommendation,
     )
+    monkeypatch.setattr(
+        invoice_routers,
+        "run_match_for_invoice",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            id=uuid.uuid4(),
+            rules_used={
+                "match_outcome": {
+                    "outcome": "needs_review",
+                    "rule_set_version": "ap-match-v1",
+                    "discrepancies": [
+                        {
+                            "code": "MISSING_GR",
+                            "message": "No goods receipt is recorded for this PO.",
+                        }
+                    ],
+                }
+            },
+        ),
+    )
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: {"sub": str(uuid.uuid4())}
     try:
@@ -136,7 +155,7 @@ def test_invoice_match_endpoint_returns_partial_workflow_without_approval(monkey
         app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "partial_match"
+    assert response.json()["status"] == "review_required"
     assert response.json()["matched"] is False
     assert response.json()["invoice_approval_required"] is True
     assert invoice.final_status == "on_hold"

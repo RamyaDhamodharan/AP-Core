@@ -33,8 +33,12 @@ def test_transition_writes_history_and_legacy_statuses():
         workflow_status="match_approved",
         match_status="pending",
         final_status=None,
+        final_run_id=uuid.uuid4(),
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     user_id = uuid.uuid4()
 
     history = transition_invoice(
@@ -132,8 +136,12 @@ def test_associate_can_record_payment_once_without_external_payment():
         payment_reference=None,
         updated_by=None,
         total_amount=Decimal("125.50"),
+        final_run_id=uuid.uuid4(),
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     (
         db.query.return_value.filter_by.return_value.with_for_update.return_value.first.return_value
     ) = invoice
@@ -173,6 +181,7 @@ def test_void_payment_requires_reason_and_restores_ready_to_pay_state():
         payment_method="upi",
         payment_reference="UPI-REF",
         updated_by=None,
+        final_run_id=uuid.uuid4(),
     )
     payment = SimpleNamespace(
         id=uuid.uuid4(),
@@ -184,6 +193,9 @@ def test_void_payment_requires_reason_and_restores_ready_to_pay_state():
         void_reason=None,
     )
     db = MagicMock()
+    db.get.return_value = SimpleNamespace(
+        rules_used={"match_outcome": {"outcome": "ready_to_pay"}}
+    )
     invoice_query, payment_query = MagicMock(), MagicMock()
     db.query.side_effect = [invoice_query, payment_query]
     invoice_lock = invoice_query.filter_by.return_value.with_for_update.return_value

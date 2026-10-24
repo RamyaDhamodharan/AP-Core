@@ -69,3 +69,7 @@ class PurchaseOrderVendorResolutionRequest(BaseModel):
                 "A new vendor requires a tax ID, contact email, or contact phone"
             )
         return self
+
+
+class PurchaseOrderVendorReassignmentRequest(BaseModel):
+    vendor_id: uuid.UUID

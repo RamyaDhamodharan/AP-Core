@@ -38,7 +38,7 @@ from src.schemas.invoice_schemas import (
     InvoiceStatus,
     InvoiceWorkflowStatus,
 )
-from src.services.document_workflow_services import (
+from src.services.document_workflow_services import (  # noqa: F401
     recommend_invoice_review,
 )
 from src.services.invoice_confidence_services import (
@@ -124,25 +124,65 @@ def three_way_match_invoice(
     )
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    recommendation = recommend_invoice_review(db, invoice, owner_id=owner_id)
-    checks = [item.model_dump(mode="json") for item in recommendation.checks]
+    run = run_match_for_invoice(db, invoice.id, owner_id, force=True)
+    db.commit()
+    outcome = ((run.rules_used or {}).get("match_outcome") if run else None) or {}
+    issues = outcome.get("discrepancies", [])
+    ready = outcome.get("outcome") == "ready_to_pay"
+    supporting = recommend_invoice_review(db, invoice, owner_id=owner_id)
+    reason_codes = [item.get("code", "") for item in issues]
+    next_action = (
+        "Continue with payment approval."
+        if ready
+        else "Review the saved discrepancies and verify the invoice."
+    )
+    missing_documents = ["goods_receipt"] if "MISSING_GR" in reason_codes else []
+    api_checks = [
+        {
+            **item,
+            "name": item.get("code", "matching").casefold(),
+            "outcome": "mismatch",
+            "severity": "error",
+            "actual": item.get("invoice_value"),
+            "expected": item.get("expected_value"),
+            "reason": item.get("message", "Matching requires review."),
+        }
+        for item in issues
+    ]
     return {
-        **recommendation.model_dump(mode="json"),
-        "matched": recommendation.matching_status == "matched",
-        "requires_review": recommendation.human_review_required,
-        "issues": [
-            item.reason
-            for item in recommendation.checks
-            if item.outcome in {"mismatch", "not_possible"}
+        "invoice_id": str(invoice.id),
+        "match_run_id": str(run.id) if run else None,
+        "rule_set_version": outcome.get("rule_set_version"),
+        "processing_status": getattr(supporting, "processing_status", None)
+        or "processed",
+        "matching_status": "matched" if ready else "review_required",
+        "review_status": "clear" if ready else "review_required",
+        "approval_status": "ready_to_pay" if ready else "not_approved",
+        "payment_status": "unknown",
+        "supporting_records": [
+            item.model_dump(mode="json")
+            for item in getattr(supporting, "supporting_records", [])
         ],
-        "status": recommendation.matching_status,
+        "missing_document_types": missing_documents,
+        "candidates": [
+            item.model_dump(mode="json")
+            for item in getattr(supporting, "candidates", [])
+        ],
+        "matched": ready,
+        "requires_review": not ready,
+        "issues": [item.get("message") for item in issues],
+        "status": "matched" if ready else "review_required",
+        "checks": api_checks,
+        "discrepancies": api_checks,
+        "reason_codes": reason_codes,
+        "next_recommended_action": next_action,
+        "human_review_required": not ready,
         "available_documents": [
-            item.model_dump(mode="json") for item in recommendation.supporting_records
+            item.model_dump(mode="json")
+            for item in getattr(supporting, "supporting_records", [])
         ],
-        "checks": checks,
-        "recommended_next_actions": [recommendation.next_recommended_action],
-        "human_decision_required": recommendation.matching_status
-        in {"review_required", "awaiting_human_decision"},
+        "recommended_next_actions": [next_action],
+        "human_decision_required": not ready,
         "invoice_approval_required": True,
     }
 
@@ -166,7 +206,49 @@ def get_invoice_recommendation(
     )
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return recommend_invoice_review(db, invoice, owner_id=owner_id)
+    run = db.get(MatchRun, invoice.final_run_id) if invoice.final_run_id else None
+    outcome = ((run.rules_used or {}).get("match_outcome") if run else None) or {}
+    codes = [item.get("code", "") for item in outcome.get("discrepancies", [])]
+    checks = []
+    for item in outcome.get("discrepancies", []):
+        checks.append(
+            {
+                "name": item.get("code", "matching").lower(),
+                "reason_code": item.get("code"),
+                "outcome": "mismatch",
+                "severity": "error",
+                "actual": str(item.get("invoice_value"))
+                if item.get("invoice_value") is not None
+                else None,
+                "expected": str(item.get("expected_value"))
+                if item.get("expected_value") is not None
+                else None,
+                "difference": str(item.get("difference"))
+                if item.get("difference") is not None
+                else None,
+                "reason": item.get("message", "Matching requires review."),
+            }
+        )
+    ready = outcome.get("outcome") == "ready_to_pay"
+    return InvoiceRecommendation(
+        invoice_id=invoice.id,
+        processing_status="completed" if run else "not_matched",
+        matching_status="matched" if ready else "review_required",
+        review_status="clear" if ready else "review_required",
+        approval_status="ready_to_pay" if ready else "not_approved",
+        supporting_records=[],
+        missing_document_types=["goods_receipt"] if "MISSING_GR" in codes else [],
+        candidates=[],
+        checks=checks,
+        discrepancies=checks,
+        reason_codes=codes,
+        next_recommended_action=(
+            "Continue with payment approval."
+            if ready
+            else "Review the saved discrepancies and verify the invoice."
+        ),
+        human_review_required=not ready,
+    )
 
 
 _UNRESOLVED_MATCH_STATUSES = {
@@ -784,7 +866,7 @@ def verify_invoice_fields(
             reason=reason or "Associate verified invoice fields",
         )
     if invoice.po_id and invoice.vendor_id:
-        run_match_for_invoice(db, invoice.id, actor_id)
+        run_match_for_invoice(db, invoice.id, actor_id, force=True)
     else:
         transition_invoice(
             db,
@@ -866,6 +948,14 @@ def get_invoice_detail(
         normalized_confidence[field] = value
         if value < confidence_threshold():
             low_confidence_fields.append(field)
+    saved_run = (
+        db.get(MatchRun, invoice.final_run_id)
+        if getattr(invoice, "final_run_id", None)
+        else None
+    )
+    saved_match_outcome = (
+        (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
+    )
     return {
         "invoice_id": str(invoice.id),
         "source_document_id": str(invoice.source_document_id)
@@ -926,6 +1016,10 @@ def get_invoice_detail(
             )
             .all()
         ],
+        "match_outcome": saved_match_outcome,
+        "match_rule_set_version": (
+            (saved_run.rules_used or {}).get("rule_set_version") if saved_run else None
+        ),
         "confidence": normalized_confidence,
         "field_confidence": getattr(invoice, "field_confidence", None)
         or normalized_confidence,
@@ -1084,7 +1178,7 @@ def confirm_invoice_match(
     candidate.confirmed_by = actor_id
     from src.services.invoice_matching_services import run_match_for_invoice
 
-    run = run_match_for_invoice(db, invoice.id, actor_id)
+    run = run_match_for_invoice(db, invoice.id, actor_id, force=True)
     db.add(
         AuditLog(
             action="invoice_match_confirmed",
@@ -1160,6 +1254,19 @@ def approve_invoice_exception(
     if not reason:
         raise HTTPException(status_code=422, detail="A reason is required")
     invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    saved_run = (
+        db.get(MatchRun, invoice.final_run_id)
+        if getattr(invoice, "final_run_id", None)
+        else None
+    )
+    saved_outcome = (
+        (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
+    )
+    if not saved_outcome or saved_outcome.get("outcome") != "ready_to_pay":
+        raise HTTPException(
+            status_code=409,
+            detail="Invoice cannot be approved until all matching rules pass",
+        )
     if invoice.status != "needs_review":
         raise HTTPException(
             status_code=409,
@@ -1305,15 +1412,19 @@ def review_invoice(
                 )
             )
 
-    if payload.decision == "approved" and not has_issue_override:
-        recommendation = recommend_invoice_review(db, invoice, owner_id=reviewer_id)
-        if any(
-            check.outcome != "passed" and check.severity == "error"
-            for check in recommendation.checks
-        ):
+    if payload.decision == "approved":
+        saved_run = (
+            db.get(MatchRun, invoice.final_run_id)
+            if getattr(invoice, "final_run_id", None)
+            else None
+        )
+        saved_outcome = (
+            (saved_run.rules_used or {}).get("match_outcome") if saved_run else None
+        )
+        if not saved_outcome or saved_outcome.get("outcome") != "ready_to_pay":
             raise HTTPException(
                 status_code=409,
-                detail="Invoice cannot be approved while critical findings remain open",
+                detail="Invoice cannot be approved until all matching rules pass",
             )
 
     if (
@@ -2078,7 +2189,7 @@ def run_invoice_match(
     )
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    run = run_match_for_invoice(db, invoice.id, user_id)
+    run = run_match_for_invoice(db, invoice.id, user_id, force=True)
     db.commit()
     if run is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -2120,6 +2231,7 @@ def update_invoice(
         "total_amount",
         "po_number_raw",
         "owner_user_id",
+        "vendor_id",
     }
     changes = {key: value for key, value in payload.items() if key in allowed}
     if not changes:
@@ -2132,6 +2244,24 @@ def update_invoice(
         changes.get("invoice_no", invoice.invoice_no),
         exclude_invoice_id=invoice.id,
     )
+    if "vendor_id" in changes:
+        if current_user.get("role") != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Only administrators can change an invoice vendor",
+            )
+        if changes["vendor_id"] is not None:
+            try:
+                changes["vendor_id"] = uuid.UUID(str(changes["vendor_id"]))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid vendor ID"
+                ) from exc
+            vendor = db.get(Vendor, changes["vendor_id"])
+            if vendor is None:
+                raise HTTPException(status_code=404, detail="Vendor not found")
+            if not vendor.is_active:
+                raise HTTPException(status_code=409, detail="Vendor is inactive")
     old = {
         key: str(getattr(invoice, key)) if getattr(invoice, key) is not None else None
         for key in changes
@@ -2163,7 +2293,7 @@ def update_invoice(
     }
     if matching_fields.intersection(changes):
         db.flush()
-        run_match_for_invoice(db, invoice.id, user_id)
+        run_match_for_invoice(db, invoice.id, user_id, force=True)
     new = {
         key: str(getattr(invoice, key)) if getattr(invoice, key) is not None else None
         for key in changes
@@ -2225,7 +2355,7 @@ def confirm_invoice_po(
             reason="Purchase order confirmed",
         )
     db.flush()
-    run_match_for_invoice(db, invoice.id, user_id)
+    run_match_for_invoice(db, invoice.id, user_id, force=True)
     db.add(
         AuditLog(
             action="invoice_po_confirmed",

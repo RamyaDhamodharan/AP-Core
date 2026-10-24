@@ -48,6 +48,12 @@ def _token(monkeypatch, role, user_id=None):
             "/api/vendors/00000000-0000-0000-0000-000000000001/aliases/00000000-0000-0000-0000-000000000002",
             None,
         ),
+        ("delete", "/api/vendors/00000000-0000-0000-0000-000000000001", None),
+        (
+            "patch",
+            "/api/purchase-orders/00000000-0000-0000-0000-000000000001/vendor",
+            {"vendor_id": "00000000-0000-0000-0000-000000000002"},
+        ),
     ],
 )
 def test_associate_token_cannot_mutate_vendors(
