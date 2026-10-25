@@ -1,4 +1,10 @@
-"""Deterministic, Decimal-only AP matching decision rules."""
+"""
+Application module for deterministic AP matching decision rules.
+Flow: evaluate 2-way and 3-way matching rules using strict Decimal math, detect discrepancies, and enforce tolerances.
+Called by: invoice_matching_services, celery worker tasks.
+Calls: invoice_confidence_services, invoice_number_services, po_matching_services, llm_matching_services.
+Tables: invoices, invoice_lines, purchase_orders, po_lines, goods_receipts, gr_lines.
+"""
 
 import logging
 import os
@@ -16,6 +22,7 @@ from src.services.invoice_confidence_services import overall_confidence_percent
 from src.services.invoice_number_services import find_duplicate_invoice
 from src.services.po_matching_services import normalize_value
 
+# Configurable matching rule parameters and decimal tolerances
 RULE_SET_VERSION = os.getenv("AP_MATCH_RULE_SET_VERSION", "ap-match-v1")
 PRICE_TOLERANCE = Decimal(os.getenv("AP_PRICE_TOLERANCE_PERCENT", "2")) / 100
 TAX_TOLERANCE = Decimal(os.getenv("TAX_TOLERANCE", "0.01"))
@@ -34,7 +41,8 @@ MATERIAL_FIELDS = (
 )
 
 
-def _d(value):
+def _d(value) -> Decimal | None:
+    """Safely convert any numeric or string value to Decimal, returning None on error."""
     if value is None:
         return None
     try:
@@ -43,7 +51,8 @@ def _d(value):
         return None
 
 
-def _score(raw):
+def _score(raw) -> Decimal | None:
+    """Extract and scale raw confidence values to 0-100 range."""
     value = raw.get("confidence") if isinstance(raw, dict) else raw
     try:
         score = Decimal(str(value))
@@ -61,7 +70,8 @@ def _issue(
     tolerance=None,
     line=None,
     action="Review the invoice and supporting records.",
-):
+) -> dict:
+    """Format a standardized discrepancy dictionary for persistence and frontend UI rendering."""
     return {
         "code": code,
         "message": message,
@@ -75,6 +85,7 @@ def _issue(
 
 
 def _json_safe(value):
+    """Recursively convert Decimal objects to strings for JSON serialization."""
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, dict):
@@ -85,7 +96,14 @@ def _json_safe(value):
 
 
 def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
-    """Return a complete saved-ready outcome; delegates to LLM matching engine with rule fallback."""
+    """
+    Evaluate an invoice against procurement records using deterministic decimal matching rules.
+    Inputs: db (Session), invoice (Invoice), owner_id (UUID | None).
+    Output: dict - outcome ('ready_to_pay' or 'needs_review'), confidence metrics, discrepancy list, inputs summary.
+    Effects: reads purchase_orders, po_lines, goods_receipts, gr_lines, invoice_lines.
+    Results: powers automated matching decisions and human review flags.
+    """
+    # Step 1: Delegate to LLM matching engine if enabled, falling back to deterministic rule engine
     try:
         from src.services.llm_matching_services import llm_evaluate_invoice_match
         llm_decision = llm_evaluate_invoice_match(db, invoice, owner_id=owner_id)
@@ -98,6 +116,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
     po_rows = []
     po_number_raw = getattr(invoice, "po_number_raw", None)
     po_ref = normalize_value(po_number_raw)
+
+    # Step 2: Validate PO existence and check for ambiguous duplicates
     if po_ref:
         po_rows = [
             po
@@ -131,6 +151,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 3: Check invoice line item presence
     lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
     if not lines:
         issues.append(
@@ -143,10 +164,11 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
     po_lines = (
-        db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).all()
-        if po
-        else []
+        po.lines if (po and getattr(po, "lines", None) is not None)
+        else (db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).all() if po else [])
     )
+
+    # Step 4: Check Goods Receipt existence and calculate cumulative accepted quantities
     receipts = (
         db.query(GoodsReceipt)
         .filter(GoodsReceipt.po_id == po.id, *_owner_scope(GoodsReceipt, owner_id))
@@ -175,6 +197,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 grline.po_line_id, Decimal(0)
             ) + _d(grline.accepted_qty)
 
+    # Step 5: Check vendor alignment
     invoice_vendor_id = getattr(invoice, "vendor_id", None)
     if po and (not invoice_vendor_id or invoice_vendor_id != po.vendor_id):
         issues.append(
@@ -186,6 +209,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 action="Correct the vendor or PO assignment.",
             )
         )
+
+    # Step 6: Check strict currency matching (no auto-conversion)
     currency = getattr(invoice, "currency", None)
     if po and (
         not currency or not po.currency or currency.upper() != po.currency.upper()
@@ -200,11 +225,13 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 7: Check line items (arithmetic, SKU mapping, quantity vs accepted, price vs tolerance)
     for index, line in enumerate(lines, 1):
         reference = line.item_code or line.description or str(index)
         qty, price = _d(line.qty), _d(line.unit_price)
         computed = qty * price if qty is not None and price is not None else None
         amount = _d(line.line_amount)
+        # Check qty * unit_price == line_amount
         if computed is not None and (amount is None or computed != amount):
             issues.append(
                 _issue(
@@ -224,6 +251,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             if normalize_value(line.item_code)
             and normalize_value(pl.item_code) == normalize_value(line.item_code)
         ]
+        # Check if line SKU exists on the PO
         if not candidates:
             issues.append(
                 _issue(
@@ -240,6 +268,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             continue
         pl = candidates[0]
         po_price = _d(pl.unit_price)
+        # Check billed qty <= received accepted qty on GRN
         if qty is not None and received.get(pl.id, Decimal(0)) < qty:
             issues.append(
                 _issue(
@@ -252,6 +281,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                     action="Verify the invoice quantity or receipt.",
                 )
             )
+        # Check unit price against allowed percentage tolerance (default 2%)
         if price is None or po_price is None:
             issues.append(
                 _issue(
@@ -280,6 +310,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                     )
                 )
 
+    # Step 8: Check tax amount within tolerance
     expected_tax = _d(po.tax_amount) if po else None
     actual_tax = _d(getattr(invoice, "tax_amount", None))
     if po and (
@@ -298,6 +329,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 action="Review tax amounts and tax treatment.",
             )
         )
+
+    # Step 9: Reconcile subtotal, tax, and header totals
     subtotal, total, tax = (
         _d(getattr(invoice, "subtotal", None)),
         _d(getattr(invoice, "total_amount", None)),
@@ -312,6 +345,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         if line_amounts and all(value is not None for value in line_amounts)
         else None
     )
+    # Check lines sum == subtotal
     if (
         subtotal is not None
         and computed_subtotal is not None
@@ -328,6 +362,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 action="Correct the invoice subtotal or line totals.",
             )
         )
+    # Check subtotal + tax == total
     if (
         subtotal is None
         or tax is None
@@ -347,6 +382,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
                 action="Correct the invoice header totals.",
             )
         )
+
+    # Step 10: Check duplicate invoice number for this vendor
     if (
         invoice_vendor_id
         and getattr(invoice, "invoice_no", None)
@@ -367,6 +404,7 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
             )
         )
 
+    # Step 11: Evaluate field confidence thresholds
     confidence = getattr(invoice, "field_confidence", None) or {}
     overall_percent = overall_confidence_percent(confidence)
     low_fields = []
@@ -423,6 +461,8 @@ def evaluate_invoice(db: Session, invoice: Invoice, owner_id=None) -> dict:
         if any(value == "medium" for value in confidence_levels.values())
         else "high"
     )
+
+    # Step 12: Assemble final outcome payload
     return {
         "rule_set_version": RULE_SET_VERSION,
         "outcome": "ready_to_pay" if not issues else "needs_review",

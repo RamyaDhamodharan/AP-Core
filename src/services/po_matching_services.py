@@ -1,3 +1,10 @@
+"""
+Application module for PO matching services.
+Flow: normalize extracted tokens/amounts, perform 2-way match on document POs, and advisory 3-way match against database POs and Goods Receipts.
+Called by: document_workflow_services, ap_decision_engine, invoice_routers.
+Calls: invoice_number_services, models.
+Tables: documents, invoices, invoice_lines, purchase_orders, po_lines, goods_receipts, gr_lines.
+"""
 import re
 from decimal import Decimal, InvalidOperation
 
@@ -9,22 +16,39 @@ from src.models.invoice_models import Invoice, InvoiceLine
 from src.models.purchase_order_models import PurchaseOrder, PurchaseOrderLine
 from src.services.invoice_number_services import normalize_invoice_no
 
+# Precompiled regex patterns for high-throughput string cleaning and amount parsing
+_MULTI_SPACE = re.compile(r"\s+")
+_CURRENCY_SYMBOLS = re.compile(r"[,$\s]")
+
 
 def normalize_value(value: object) -> str:
-    """Normalize text for case-insensitive comparison."""
+    """
+    Normalize text tokens for case-insensitive and whitespace-invariant comparison.
+    Inputs: value (object) - raw string, number, or identifier.
+    Output: str - normalized lowercase string with single spaces.
+    Effects: pure function, no database operations.
+    Results: uniform token for SKU, PO numbers, and descriptions.
+    """
     if value is None:
         return ""
-
-    return re.sub(r"\s+", " ", str(value)).strip().casefold()
+    # Collapse multiple spaces and convert to lowercase
+    return _MULTI_SPACE.sub(" ", str(value)).strip().casefold()
 
 
 def normalize_amount(value: object) -> Decimal | None:
-    """Convert a monetary value to Decimal safely."""
+    """
+    Convert a monetary value string or number to a Decimal safely.
+    Inputs: value (object) - currency string (e.g. '$1,234.50'), float, or int.
+    Output: Decimal | None - finite Decimal amount or None if unparseable.
+    Effects: pure function, no database operations.
+    Results: exact decimal representation without binary floating-point rounding errors.
+    """
     if value is None or isinstance(value, bool):
         return None
 
     try:
-        cleaned = re.sub(r"[,$\s]", "", str(value))
+        # Strip currency signs, commas, and whitespace
+        cleaned = _CURRENCY_SYMBOLS.sub("", str(value))
         amount = Decimal(cleaned)
 
         if not amount.is_finite():
@@ -41,15 +65,18 @@ def match_invoice_to_po(
     invoice_document_id,
 ) -> dict:
     """
-    Match an invoice against an extracted purchase order.
-
-    This initial version requires an exact vendor, PO number,
-    and total match. It does not support partial invoices.
+    Match an invoice against an extracted purchase order document in storage.
+    Inputs: db (Session), invoice_data (dict), invoice_document_id (UUID | str).
+    Output: dict with keys 'matched' (bool), 'reason' (str), 'po_document_id' (str | None).
+    Effects: reads database rows from 'documents' table.
+    Results: initial document-level PO matching result.
     """
+    # Step 1: Normalize incoming invoice fields
     vendor = normalize_value(invoice_data.get("vendor"))
     order_number = normalize_value(invoice_data.get("order_number"))
     invoice_total = normalize_amount(invoice_data.get("total"))
 
+    # Step 2: Validate mandatory match keys
     if not vendor:
         return {
             "matched": False,
@@ -71,6 +98,7 @@ def match_invoice_to_po(
             "po_document_id": None,
         }
 
+    # Step 3: Query extracted PO documents in storage
     purchase_orders = (
         db.query(Document)
         .filter(
@@ -80,6 +108,7 @@ def match_invoice_to_po(
         .all()
     )
 
+    # Step 4: Search for exact matching PO
     for po in purchase_orders:
         if po.id == invoice_document_id:
             continue
@@ -93,9 +122,11 @@ def match_invoice_to_po(
         po_number = normalize_value(po_data.get("order_number"))
         po_total = normalize_amount(po_data.get("total"))
 
+        # Skip POs with different order numbers
         if po_number != order_number:
             continue
 
+        # Check vendor alignment
         if po_vendor != vendor:
             return {
                 "matched": False,
@@ -103,6 +134,7 @@ def match_invoice_to_po(
                 "po_document_id": str(po.id),
             }
 
+        # Check PO total validity
         if po_total is None:
             return {
                 "matched": False,
@@ -110,6 +142,7 @@ def match_invoice_to_po(
                 "po_document_id": str(po.id),
             }
 
+        # Check exact total match
         if invoice_total != po_total:
             return {
                 "matched": False,
@@ -131,12 +164,15 @@ def match_invoice_to_po(
 
 
 def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
-    """Compare a persisted invoice with its current PO and posted receipts.
-
-    This is advisory only: every result is returned for human review and this
-    function never changes invoice approval state.
+    """
+    Compare a persisted invoice with its current PO and posted receipts.
+    Inputs: db (Session), invoice (Invoice).
+    Output: dict with keys 'matched' (bool), 'requires_review' (bool), 'issues' (list[str]), 'po_id' (str | None), 'goods_receipt_ids' (list[str]).
+    Effects: reads database rows from invoices, purchase_orders, po_lines, goods_receipts.
+    Results: advisory 3-way check; returns findings for human review without modifying invoice state.
     """
     issues: list[str] = []
+    # Step 1: Validate normalized invoice number and check duplicates
     invoice_no = getattr(invoice, "invoice_no_normalized", None) or (
         normalize_invoice_no(invoice.invoice_no)
     )
@@ -156,6 +192,7 @@ def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
         if duplicate:
             issues.append("Duplicate invoice detected for this vendor")
 
+    # Step 2: Validate PO linkage
     if not invoice.po_id:
         issues.append("Purchase order is missing or unresolved")
         return {
@@ -197,6 +234,7 @@ def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
     elif invoice.total_amount > po.total_amount:
         issues.append("Invoice total exceeds PO total")
 
+    # Step 3: Query Goods Receipts linked to this PO
     receipts = (
         db.query(GoodsReceipt)
         .options(selectinload(GoodsReceipt.lines))
@@ -215,6 +253,7 @@ def match_invoice_three_way(db: Session, invoice: Invoice) -> dict:
     if any(r.vendor_id != po.vendor_id for r in receipts):
         issues.append("Goods receipt vendor does not match purchase order vendor")
 
+    # Step 4: Compare PO lines and invoice lines against received quantities
     po_lines = (
         db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).all()
     )

@@ -1,5 +1,10 @@
-"""Issue synchronization and audit helpers for invoice review findings."""
-
+"""
+Application module for invoice issue synchronization and audit tracking services.
+Flow: translate matching check outcomes into persistent InvoiceIssue records, assign owners, record timeline events, and auto-resolve fixed issues.
+Called by: invoice_matching_services, issue_routers, celery tasks.
+Calls: audit_models, invoice_issue_models.
+Tables: invoice_issues, issue_events, audit_logs, users, invoices.
+"""
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -11,7 +16,10 @@ from src.models.invoice_issue_models import InvoiceIssue, IssueEvent
 from src.models.invoice_models import Invoice
 from src.models.user_models import User
 
+# Active statuses that indicate an issue remains unresolved
 ACTIVE = {"open", "in_progress", "waiting_vendor", "escalated"}
+
+# Canonical mapping from discrepancy token to issue_type identifier and descriptive label
 ISSUE_NAMES = {
     "price": ("price_variance", "Invoice price differs from purchase order"),
     "unit_price": ("price_variance", "Invoice price differs from purchase order"),
@@ -32,13 +40,25 @@ ISSUE_NAMES = {
 
 
 def _assignment(db: Session, exclude=None):
+    """
+    Select an active associate to assign as issue owner using the least-open workload strategy.
+    Inputs: db (Session), exclude (UUID | None) - optional user ID to exclude from assignment pool.
+    Output: UUID | None - ID of chosen associate user, or None if manual strategy is set.
+    Effects: queries database for active associates, open issue counts, and active invoice workloads.
+    Results: evenly distributes discrepancy review work among available associates.
+    """
+    # Step 1: Check if automated workload assignment is disabled
     if os.getenv("ASSIGNMENT_STRATEGY", "least_open").casefold() == "manual":
         return None
+
+    # Step 2: Query active associate accounts
     associates = (
         db.query(User).filter(User.role == "associate", User.is_active.is_(True)).all()
     )
     if not associates:
         return None
+
+    # Step 3: Count open issues currently assigned per associate
     counts = dict(
         db.query(InvoiceIssue.owner_user_id, func.count(InvoiceIssue.id))
         .filter(
@@ -47,6 +67,8 @@ def _assignment(db: Session, exclude=None):
         .group_by(InvoiceIssue.owner_user_id)
         .all()
     )
+
+    # Step 4: Count unfinalized invoices assigned per associate
     open_invoice_counts = dict(
         db.query(Invoice.owner_user_id, func.count(Invoice.id))
         .filter(
@@ -68,6 +90,8 @@ def _assignment(db: Session, exclude=None):
         .group_by(Invoice.owner_user_id)
         .all()
     )
+
+    # Step 5: Pick the associate with the lowest combined active workload
     pool = [user for user in associates if user.id != exclude] or associates
     return min(
         pool,
@@ -81,9 +105,18 @@ def _assignment(db: Session, exclude=None):
 def add_issue_event(
     db: Session, issue: InvoiceIssue, event_type: str, user_id=None, note=None
 ):
+    """
+    Record an immutable event and audit entry in the issue timeline.
+    Inputs: db (Session), issue (InvoiceIssue), event_type (str), user_id (UUID | None), note (str | None).
+    Output: None.
+    Effects: inserts rows into issue_events and audit_logs tables.
+    Results: builds an auditable history of status changes, notes, and resolutions.
+    """
+    # Step 1: Add timeline event
     db.add(
         IssueEvent(issue_id=issue.id, event_type=event_type, user_id=user_id, note=note)
     )
+    # Step 2: Record formal audit log
     db.add(
         AuditLog(
             action=f"invoice_issue_{event_type}",
@@ -111,8 +144,16 @@ def sync_invoice_issues(
     user_id=None,
     missing_document_types: list[str] | None = None,
 ):
-    """Upsert findings and resolve active issues absent from the latest match."""
+    """
+    Upsert active findings and automatically resolve issues no longer found in the latest match.
+    Inputs: db (Session), invoice (Invoice), checks (list[dict]), user_id (UUID | None), missing_document_types (list[str] | None).
+    Output: list[str] - list of active finding issue_types for the invoice.
+    Effects: creates or updates rows in invoice_issues, adds issue_events and audit_logs.
+    Results: keeps invoice issues in exact sync with current invoice state.
+    """
     findings = {}
+
+    # Step 1: Map match check failures to canonical issue types
     for check in checks:
         if check.get("outcome") not in {"mismatch", "not_possible"}:
             continue
@@ -129,6 +170,8 @@ def sync_invoice_issues(
             "actual": check.get("actual"),
             "severity": check.get("severity") or "warning",
         }
+
+    # Step 2: Enforce mandatory PO linkage check
     if not getattr(invoice, "po_id", None):
         findings.setdefault(
             "missing_po",
@@ -139,6 +182,8 @@ def sync_invoice_issues(
                 "severity": "error",
             },
         )
+
+    # Step 3: Enforce vendor resolution check
     if not getattr(invoice, "vendor_id", None):
         findings.setdefault(
             "unknown_vendor",
@@ -149,6 +194,8 @@ def sync_invoice_issues(
                 "severity": "error",
             },
         )
+
+    # Step 4: Enforce Goods Receipt evidence check
     if "goods_receipt" in (missing_document_types or []):
         findings.setdefault(
             "missing_receipt",
@@ -159,6 +206,8 @@ def sync_invoice_issues(
                 "severity": "warning",
             },
         )
+
+    # Step 5: Enforce extraction confidence threshold check
     confidence = getattr(invoice, "field_confidence", None) or {}
     threshold = int(os.getenv("FIELD_CONFIDENCE_MIN", "85"))
     confidence_values = {
@@ -187,12 +236,15 @@ def sync_invoice_issues(
             "severity": "warning",
         }
 
+    # Step 6: Query existing open issues for this invoice
     active_rows = (
         db.query(InvoiceIssue)
         .filter(InvoiceIssue.invoice_id == invoice.id, InvoiceIssue.status.in_(ACTIVE))
         .all()
     )
     by_type = {row.issue_type: row for row in active_rows}
+
+    # Step 7: Upsert findings - update existing or create new open issues
     for issue_type, finding in findings.items():
         issue = by_type.get(issue_type)
         if issue:
@@ -207,6 +259,7 @@ def sync_invoice_issues(
             )
             issue.severity = finding["severity"]
             continue
+        # Create brand-new issue with automatic associate workload assignment
         issue = InvoiceIssue(
             invoice_id=invoice.id,
             issue_type=issue_type,
@@ -225,6 +278,8 @@ def sync_invoice_issues(
         db.add(issue)
         db.flush()
         add_issue_event(db, issue, "created", user_id, issue.description)
+
+    # Step 8: Automatically resolve active issues that no longer appear in latest match
     for issue_type, issue in by_type.items():
         if issue_type not in findings:
             issue.status = "resolved"
@@ -233,5 +288,6 @@ def sync_invoice_issues(
                 "Automatically resolved: latest match no longer finds this difference"
             )
             add_issue_event(db, issue, "resolved", None, issue.resolution_note)
+
     db.flush()
     return list(findings)
