@@ -2228,17 +2228,17 @@ def invoice_timeline(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Handle invoice timeline.
-    Inputs: invoice_id (uuid.UUID), db (Session), current_user (dict).
-    Output: the value or None returned by its body.
-    Effects: reads database rows; may add audit entries; may add invoice timeline
-        entries.
-    Results: statuses failed.
-    """
-    if db.get(Invoice, invoice_id) is None:
+    invoice_row = (
+        db.query(Invoice)
+        .filter(
+            Invoice.id == invoice_id,
+            _invoice_owner_filter(_owner_id(current_user)),
+        )
+        .first()
+    )
+    if invoice_row is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    invoice = db.get(Invoice, invoice_id)
+    invoice = invoice_row
     audit_filter = (AuditLog.entity_type == "invoice") & (
         AuditLog.entity_id == invoice_id
     )
@@ -2255,6 +2255,31 @@ def invoice_timeline(
         .filter(EmailDraft.invoice_id == invoice_id)
         .all()
     )
+    match_runs = (
+        db.query(MatchRun)
+        .filter(MatchRun.invoice_id == invoice_id)
+        .order_by(MatchRun.run_no.asc())
+        .all()
+    )
+
+    po_ids = {run.po_id for run in match_runs if run.po_id}
+    if invoice.po_id:
+        po_ids.add(invoice.po_id)
+    purchase_orders = (
+        db.query(PurchaseOrder).filter(PurchaseOrder.id.in_(po_ids)).all()
+        if po_ids
+        else []
+    )
+    po_numbers = {po.id: po.po_number for po in purchase_orders}
+    receipts = (
+        db.query(GoodsReceipt).filter(GoodsReceipt.po_id.in_(po_ids)).all()
+        if po_ids
+        else []
+    )
+    receipt_numbers = {}
+    for receipt in receipts:
+        receipt_numbers.setdefault(receipt.po_id, []).append(receipt.gr_number)
+
     entries = [
         {
             "kind": "audit",
@@ -2271,10 +2296,12 @@ def invoice_timeline(
                     "message",
                     "created_by",
                     "created_at",
+                    "reason",
                     "step_name",
                     "duration_ms",
                     "input_ref",
                     "output_summary",
+                    "actor",
                 )
             },
         }
@@ -2291,8 +2318,10 @@ def invoice_timeline(
             "new_value": {"workflow_status": item.to_status, "reason": item.reason},
             "result": "success",
             "message": item.reason,
+            "reason": item.reason,
             "created_by": item.changed_by,
             "created_at": item.created_at,
+            "actor": str(item.changed_by) if item.changed_by else "system",
         }
         for item in states
     )
@@ -2309,10 +2338,176 @@ def invoice_timeline(
             "message": f"Outbound email {item.event_type.replace('_', ' ')}",
             "created_by": item.user_id,
             "created_at": item.created_at,
+            "actor": str(item.user_id) if item.user_id else "system",
         }
         for item in draft_events
     )
+    entries.extend(
+        {
+            "kind": "match_run",
+            "id": run.id,
+            "action": "invoice_match_run",
+            "entity_type": "invoice",
+            "entity_id": invoice_id,
+            "run_no": run.run_no,
+            "match_result": run.result,
+            "differences_summary": _match_run_differences_summary(
+                run.differences or []
+            ),
+            "result": _timeline_result(run.result),
+            "message": f"Invoice match run {run.run_no} completed",
+            "created_by": run.created_by,
+            "created_at": run.created_at,
+            "po_id": run.po_id,
+            "actor": str(run.created_by) if run.created_by else "system",
+        }
+        for run in match_runs
+    )
+
+    actor_ids = set()
+    for item in entries:
+        actor_id = _timeline_actor_id(item)
+        if actor_id:
+            actor_ids.add(actor_id)
+    users = (
+        db.query(User).filter(User.id.in_(actor_ids)).all() if actor_ids else []
+    )
+    names_by_id = {
+        user.id: (user.name or user.email or "Unknown user") for user in users
+    }
+
+    for item in entries:
+        actor_id = _timeline_actor_id(item)
+        item["actor_name"] = (
+            names_by_id.get(actor_id, "Unknown user") if actor_id else "System"
+        )
+        item["reason"] = _timeline_reason(item)
+        item["entry_type"] = _timeline_entry_type(item)
+        item["input_label"] = _timeline_input_label(
+            item, invoice, po_numbers, receipt_numbers
+        )
+        item["output_label"] = _timeline_output_label(item)
+        item["result"] = _timeline_result(item.get("result"))
+        item.pop("actor", None)
+
     return sorted(entries, key=lambda item: item["created_at"])
+
+
+def _timeline_actor_id(entry: dict):
+    if "actor" not in entry:
+        return None
+    actor = entry.get("actor")
+    if not actor or str(actor).casefold() == "system":
+        return None
+    try:
+        return uuid.UUID(str(actor))
+    except (TypeError, ValueError):
+        return None
+
+
+def _timeline_reason(entry: dict) -> str | None:
+    reason = entry.get("reason")
+    if reason:
+        return str(reason)[:500]
+    new_value = entry.get("new_value")
+    if isinstance(new_value, dict):
+        value = new_value.get("reason") or new_value.get("override_reason")
+        return str(value)[:500] if value else None
+    return None
+
+
+def _timeline_entry_type(entry: dict) -> str:
+    if entry.get("kind") == "email":
+        return "email"
+    if entry.get("kind") == "state_change":
+        return "state_change"
+    if entry.get("kind") == "match_run" or entry.get("step_name"):
+        return "pipeline_step"
+    return "user_action"
+
+
+def _timeline_result(value) -> str:
+    result = str(value or "").casefold()
+    if result in {"success", "match_ok", "match_approved", "passed"}:
+        return "success"
+    if result in {"error", "no_match", "failed", "rejected"}:
+        return "error"
+    return "warning"
+
+
+def _timeline_input_label(entry, invoice, po_numbers, receipt_numbers) -> str:
+    labels = ["Invoice"]
+    po_number = getattr(invoice, "po_number_raw", None)
+    po_id = entry.get("po_id") or getattr(invoice, "po_id", None)
+    po_number = po_number or po_numbers.get(po_id)
+    if po_number:
+        labels.append(str(po_number)[:80])
+    for receipt_number in receipt_numbers.get(po_id, [])[:2]:
+        labels.append(str(receipt_number)[:80])
+    if len(labels) == 1:
+        step = entry.get("step_name")
+        return f"Invoice · {_humanize_timeline_value(step)}" if step else "Invoice"
+    return ", ".join(labels)
+
+
+def _match_run_differences_summary(differences) -> str:
+    if not isinstance(differences, list) or not differences:
+        return "No differences recorded"
+    labels = []
+    for difference in differences:
+        if not isinstance(difference, dict):
+            continue
+        name = str(difference.get("name") or "").casefold()
+        if "price" in name or "amount" in name or "total" in name:
+            label = "Price or amount variance"
+        elif "quantity" in name or "receipt" in name:
+            label = "Quantity or receipt mismatch"
+        elif "tax" in name:
+            label = "Tax mismatch"
+        elif "vendor" in name:
+            label = "Vendor mismatch"
+        elif "currency" in name:
+            label = "Currency mismatch"
+        elif "po" in name or "match" in name:
+            label = "Purchase order match issue"
+        else:
+            label = "Other match issue"
+        if label not in labels:
+            labels.append(label)
+    if not labels:
+        return "Match differences recorded"
+    return "; ".join(labels[:3])
+
+
+def _timeline_output_label(entry) -> str:
+    if entry.get("kind") == "match_run":
+        return entry.get("differences_summary", "Match result recorded")
+    summary = entry.get("output_summary")
+    if not isinstance(summary, dict):
+        return "Activity recorded"
+    if "result" in summary:
+        return f"Match result: {_humanize_timeline_value(str(summary['result']))}"
+    if "doc_type" in summary:
+        return f"Classified as {_humanize_timeline_value(str(summary['doc_type']))}"
+    if "po_linked" in summary:
+        return (
+            "Purchase order linked"
+            if summary["po_linked"]
+            else "No purchase order linked"
+        )
+    if "resolved" in summary:
+        return "Reference resolved" if summary["resolved"] else "Reference needs review"
+    if summary.get("queued") is True:
+        return "Follow-up queued"
+    if "differences" in summary and isinstance(summary["differences"], int):
+        return f"{summary['differences']} match differences recorded"
+    return "Activity recorded"
+
+
+def _humanize_timeline_value(value: str | None) -> str:
+    if not value:
+        return "Activity"
+    return value.replace("_", " ").strip().capitalize()
 
 
 @router.get("/{invoice_id}/state-history")
