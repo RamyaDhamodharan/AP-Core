@@ -1,5 +1,10 @@
-"""Template-backed, human-reviewed vendor email outbox."""
-
+"""
+Application module for template-backed, human-reviewed vendor email outbox services.
+Flow: generate draft email notifications for invoice discrepancies, enforce test mailbox allowlists, send via SMTP upon explicit user action, and record vendor reply threads.
+Called by: follow_up_services, document_workflow_services, email_draft_routers.
+Calls: email_models, invoice_models, purchase_order_models, vendor_models.
+Tables: email_drafts, email_draft_events, audit_logs, invoices, purchase_orders, vendors, notifications.
+"""
 import email.utils
 import html
 import logging
@@ -22,6 +27,7 @@ from src.models.vendor_models import Vendor
 
 logger = logging.getLogger(__name__)
 
+# Supported business categories for vendor emails
 SUPPORTED_KINDS = {
     "price_variance",
     "quantity_mismatch",
@@ -41,6 +47,13 @@ SUPPORTED_KINDS = {
 
 
 def allowed_recipients() -> set[str]:
+    """
+    Return set of allowed recipient email addresses configured in TEST_MAILBOX_ALLOWLIST.
+    Inputs: none.
+    Output: set[str] - lowercase recipient emails allowed to receive outbound messages.
+    Effects: reads environment variable TEST_MAILBOX_ALLOWLIST.
+    Results: prevents accidental emails to real vendors in test or staging environments.
+    """
     return {
         value.strip().casefold()
         for value in os.getenv("TEST_MAILBOX_ALLOWLIST", "").split(",")
@@ -48,11 +61,19 @@ def allowed_recipients() -> set[str]:
     }
 
 
-def _money(value):
+def _money(value) -> str | None:
+    """Format decimal amount as a 2-decimal place string."""
     return f"{value:.2f}" if value is not None else None
 
 
 def _template(kind: str, facts: dict[str, object]) -> tuple[str, str]:
+    """
+    Generate professional email subject and body for a given discrepancy kind and invoice facts.
+    Inputs: kind (str), facts (dict[str, object]).
+    Output: tuple[str, str] - (subject, body).
+    Effects: pure template interpolation.
+    Results: formatted draft text for human review before transmission.
+    """
     labels = {
         "price_variance": "Price variance clarification",
         "quantity_mismatch": "Quantity mismatch clarification",
@@ -135,6 +156,14 @@ def _template(kind: str, facts: dict[str, object]) -> tuple[str, str]:
 
 
 def invoice_facts(db: Session, invoice: Invoice) -> dict[str, object]:
+    """
+    Extract factual details and line differences from an invoice and linked PO for email drafting.
+    Inputs: db (Session), invoice (Invoice).
+    Output: dict[str, object] - dictionary of invoice and PO comparison facts.
+    Effects: reads database rows from invoices, purchase_orders, po_lines, vendors.
+    Results: factual summary included in vendor email body.
+    """
+    # Step 1: Resolve header entities
     vendor = db.get(Vendor, invoice.vendor_id) if invoice.vendor_id else None
     po = db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None
     facts: dict[str, object] = {
@@ -149,6 +178,8 @@ def invoice_facts(db: Session, invoice: Invoice) -> dict[str, object]:
     if invoice.tax_amount is not None:
         facts["billed tax"] = _money(invoice.tax_amount)
     expected_tax = None
+
+    # Step 2: Compare against PO if linked
     if po:
         if po.total_amount is not None:
             facts["PO total"] = _money(po.total_amount)
@@ -164,12 +195,25 @@ def invoice_facts(db: Session, invoice: Invoice) -> dict[str, object]:
             facts["PO currency"] = po.currency.strip()
         if invoice.total_amount is not None and po.total_amount is not None:
             facts["total difference"] = _money(invoice.total_amount - po.total_amount)
+
+        # Batch query PO lines to eliminate N+1 query loop
         lines = db.query(InvoiceLine).filter(InvoiceLine.invoice_id == invoice.id).all()
+        po_line_ids = [line.po_line_id for line in lines if line.po_line_id]
+        if po_line_ids:
+            from src.models.purchase_order_models import PurchaseOrderLine
+
+            po_lines_by_id = {
+                pl.id: pl
+                for pl in db.query(PurchaseOrderLine)
+                .filter(PurchaseOrderLine.id.in_(po_line_ids))
+                .all()
+            }
+        else:
+            po_lines_by_id = {}
+
         for line in lines:
             if line.po_line_id:
-                from src.models.purchase_order_models import PurchaseOrderLine
-
-                po_line = db.get(PurchaseOrderLine, line.po_line_id)
+                po_line = po_lines_by_id.get(line.po_line_id)
                 if po_line:
                     line_name = line.description or line.item_code or line.id
                     facts[f"line {line_name} expected qty"] = str(po_line.qty)
@@ -225,6 +269,7 @@ def _event(
     document_id=None,
     message_id=None,
 ):
+    """Record an audit trail event for draft lifecycle transitions."""
     db.add(
         EmailDraftEvent(
             draft_id=draft.id,
@@ -253,16 +298,28 @@ def _event(
 def create_invoice_draft(
     db: Session, invoice: Invoice, kind: str, user_id=None
 ) -> EmailDraft:
+    """
+    Create a reviewable email draft for an invoice discrepancy.
+    Inputs: db (Session), invoice (Invoice), kind (str), user_id (UUID | None).
+    Output: EmailDraft - persisted draft in 'draft' status.
+    Effects: inserts row into email_drafts and email_draft_events.
+    Results: draft visible in frontend drawer for human review and transmission.
+    """
     if kind not in SUPPORTED_KINDS:
         raise ValueError("Unsupported email draft kind")
+    # Step 1: Assemble invoice comparison facts
     facts = invoice_facts(db, invoice)
     subject, body = _template(kind, facts)
+
+    # Step 2: Determine vendor contact recipient
     vendor = db.get(Vendor, invoice.vendor_id) if invoice.vendor_id else None
     recipient = vendor.contact_email if vendor and vendor.contact_email else None
     if not recipient and invoice.source_document_id:
         doc = db.get(Document, invoice.source_document_id)
         recipient = doc.email_sender if doc else None
     recipients = [recipient] if recipient else []
+
+    # Step 3: Construct reviewable draft record with thread tracking key
     ref = str(invoice.id).replace("-", "")[:8].upper()
     draft = EmailDraft(
         kind=kind,
@@ -297,7 +354,13 @@ def create_invoice_draft(
 
 
 def create_no_match_draft(db: Session, invoice: Invoice, sender: str) -> EmailDraft:
-    """Create a reviewable no-match email draft; never send during processing."""
+    """
+    Create a reviewable no-match email draft; never sent automatically during ingestion.
+    Inputs: db (Session), invoice (Invoice), sender (str).
+    Output: EmailDraft - persisted draft.
+    Effects: writes to email_drafts.
+    Results: allows reviewer to notify sender about missing PO or unknown vendor.
+    """
     reason = "No purchase order / unknown vendor"
     recipient = sender.strip()
     recipients = [recipient] if recipient else []
@@ -335,7 +398,7 @@ def create_issue_draft(
     recipient: str | None,
     user_id=None,
 ) -> EmailDraft:
-    """Issue-facing factory is available until the issues table/API lands."""
+    """Create a reviewable draft linked to an InvoiceIssue record."""
     if kind not in SUPPORTED_KINDS:
         raise ValueError("Unsupported email draft kind")
     subject, body = _template(kind, facts)
@@ -371,6 +434,7 @@ def create_issue_draft(
 
 
 def _is_allowlisted(draft: EmailDraft) -> bool:
+    """Check if all draft recipients are in the configured TEST_MAILBOX_ALLOWLIST."""
     allowed = allowed_recipients()
     return bool(draft.to_addresses) and all(
         item.casefold() in allowed
@@ -379,6 +443,7 @@ def _is_allowlisted(draft: EmailDraft) -> bool:
 
 
 def _transient_smtp_failure(exc: Exception) -> bool:
+    """Identify transient network or SMTP server errors eligible for retry."""
     if isinstance(exc, smtplib.SMTPResponseException):
         return 400 <= exc.smtp_code < 500
     return isinstance(
@@ -395,15 +460,27 @@ def _transient_smtp_failure(exc: Exception) -> bool:
 def send_draft(
     db: Session, draft: EmailDraft, user_id=None, *, sleep=time.sleep
 ) -> bool:
+    """
+    Transmit an approved email draft over SMTP with retry backoff and state tracking.
+    Inputs: db (Session), draft (EmailDraft), user_id (UUID | None), sleep (Callable).
+    Output: bool - True if sent successfully, False otherwise.
+    Effects: sends email over SMTP; updates draft status to 'sent' or 'failed'; records audit logs.
+    Results: delivers clarification request to vendor.
+    """
+    # Step 1: Validate draft status
     if draft.status == "sent":
         raise ValueError("This email draft has already been sent")
     if draft.status == "discarded":
         raise ValueError("This email draft was discarded")
+
+    # Step 2: Enforce test mailbox allowlist safety check
     if not _is_allowlisted(draft):
         draft.blocked_by_allowlist = True
         draft.last_error = "Recipients are not in TEST_MAILBOX_ALLOWLIST"
         return False
     draft.blocked_by_allowlist = False
+
+    # Step 3: Construct MIME email message with thread tracking token
     short_ref = (
         draft.thread_key
         or "[AP-"
@@ -431,6 +508,8 @@ def send_draft(
         f"<html><body><pre>{html.escape(draft.body)}</pre></body></html>",
         subtype="html",
     )
+
+    # Step 4: Transmit via SMTP with exponential backoff on transient errors
     max_attempts = max(1, int(os.getenv("EMAIL_DRAFT_MAX_ATTEMPTS", "3")))
     old_status = draft.status
     old_attempts = draft.attempts
@@ -449,6 +528,8 @@ def send_draft(
                     smtp.starttls()
                     smtp.login(user, password or "")
                 smtp.send_message(message)
+
+            # Step 5: Mark status sent and record audit log
             old = {"status": draft.status, "attempts": draft.attempts - 1}
             draft.status = "sent"
             draft.sent_by = user_id
@@ -502,6 +583,8 @@ def send_draft(
                 sleep(2**attempt)
                 continue
             break
+
+    # Step 6: Mark failed if all retries exhausted
     old = {"status": old_status, "attempts": old_attempts}
     draft.status = "failed"
     _event(
@@ -521,7 +604,6 @@ def send_draft(
 
 def match_reply(db: Session, subject: str, in_reply_to: str | None):
     """Find a sent draft by reference token in the subject or message linkage."""
-
     query = db.query(EmailDraft).filter(EmailDraft.status == "sent")
     predicates = []
     if in_reply_to:
@@ -547,6 +629,7 @@ def record_vendor_reply(
     message_id: str,
     document_id=None,
 ):
+    """Record an incoming email reply linked to a previous draft thread."""
     _event(
         db,
         draft,

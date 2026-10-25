@@ -38,7 +38,14 @@ ALLOWED_TRANSITIONS = {
         "failed",
     },
     "reading": {"verifying", "matching", "failed", "received"},
-    "verifying": {"matching", "match_issues", "no_match", "failed", "received"},
+    "verifying": {
+        "matching",
+        "match_approved",
+        "match_issues",
+        "no_match",
+        "failed",
+        "received",
+    },
     "matching": {
         "match_approved",
         "match_issues",
@@ -124,7 +131,7 @@ def transition_invoice(
         raise HTTPException(status_code=409, detail=f"Invoice is already {to_status}")
 
     invoice.workflow_status = to_status
-    if to_status == "approved":
+    if to_status in {"approved", "match_approved"}:
         invoice.status = "ready_to_pay"
     elif to_status == "rejected":
         invoice.status = "rejected"

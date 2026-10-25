@@ -54,6 +54,7 @@ from src.services.invoice_number_services import (
     find_duplicate_invoice,
     normalize_invoice_no,
 )
+from src.services.po_matching_services import normalize_value
 from src.services.invoice_state_services import (
     legacy_workflow_status,
     transition_invoice,
@@ -384,6 +385,24 @@ def _invoice_dashboard_response(
         .all()
     )
 
+    invoice_ids = [invoice.id for invoice, _, _ in rows]
+    disc_counts: dict[uuid.UUID, tuple[int, int]] = {}
+    if invoice_ids:
+        disc_rows = (
+            db.query(
+                InvoiceDiscrepancy.invoice_id,
+                func.count(InvoiceDiscrepancy.id).label("total"),
+                func.count(InvoiceDiscrepancy.id)
+                .filter(InvoiceDiscrepancy.resolved.is_(False))
+                .label("active"),
+            )
+            .filter(InvoiceDiscrepancy.invoice_id.in_(invoice_ids))
+            .group_by(InvoiceDiscrepancy.invoice_id)
+            .all()
+        )
+        for inv_id, tot, act in disc_rows:
+            disc_counts[inv_id] = (int(tot or 0), int(act or 0))
+
     return InvoiceDashboardResponse(
         items=[
             InvoiceDashboardItem(
@@ -426,6 +445,8 @@ def _invoice_dashboard_response(
                 ),
                 can_resubmit=getattr(invoice, "workflow_status", None) == "rejected",
                 status=getattr(invoice, "status", None) or _workspace_status(invoice),
+                discrepancy_count=disc_counts.get(invoice.id, (0, 0))[0],
+                active_discrepancy_count=disc_counts.get(invoice.id, (0, 0))[1],
             )
             for invoice, vendor_name, document in rows
         ],
@@ -1639,6 +1660,464 @@ def approve_invoice_exception(
     )
     db.commit()
     return {"invoice_id": str(invoice.id), "status": invoice.status, "reason": reason}
+
+
+@router.get("/{invoice_id:uuid}/discrepancies")
+def list_invoice_discrepancies(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieve all discrepancies for an invoice with actionable resolution options."""
+    invoice, _ = _review_invoice_or_404(db, invoice_id, current_user)
+    saved_run = (
+        db.get(MatchRun, invoice.final_run_id)
+        if getattr(invoice, "final_run_id", None)
+        else None
+    )
+    outcome = (saved_run.rules_used or {}).get("match_outcome") if saved_run else {}
+    differences = (saved_run.differences if saved_run else []) or outcome.get("discrepancies", [])
+    diff_map = {
+        str(d.get("code", "")).casefold(): d
+        for d in differences
+        if isinstance(d, dict)
+    }
+
+    discrepancies = (
+        db.query(InvoiceDiscrepancy)
+        .filter(InvoiceDiscrepancy.invoice_id == invoice.id)
+        .order_by(InvoiceDiscrepancy.resolved.asc(), InvoiceDiscrepancy.created_at.desc())
+        .all()
+    )
+
+    items = []
+    for disc in discrepancies:
+        code = disc.field.upper()
+        diff_info = diff_map.get(disc.field.casefold()) or {}
+
+        suggested_actions = []
+        if not disc.resolved:
+            if "goods_receipt" in disc.field or code == "MISSING_GR":
+                suggested_actions.extend([
+                    {"action": "auto_link_gr", "label": "Auto-Link Goods Receipt", "primary": True},
+                    {"action": "waive", "label": "Waive (Accept 2-Way Match)", "primary": False},
+                ])
+            elif "price" in disc.field or code == "PRICE_VARIANCE":
+                suggested_actions.extend([
+                    {"action": "accept_variance", "label": "Accept Price Variance", "primary": True},
+                    {"action": "request_credit", "label": "Request Vendor Credit", "primary": False},
+                ])
+            elif "quantity" in disc.field or code == "QUANTITY_VARIANCE":
+                suggested_actions.extend([
+                    {"action": "accept_variance", "label": "Accept Received Quantity", "primary": True},
+                    {"action": "request_credit", "label": "Request Vendor Credit", "primary": False},
+                ])
+            elif "total" in disc.field or code in ("LINE_TOTAL_VARIANCE", "HEADER_TOTAL_VARIANCE", "TAX_VARIANCE"):
+                suggested_actions.extend([
+                    {"action": "auto_reconcile", "label": "Auto-Reconcile Total", "primary": True},
+                    {"action": "waive", "label": "Waive Difference", "primary": False},
+                ])
+            else:
+                suggested_actions.extend([
+                    {"action": "resolve", "label": "Mark as Resolved", "primary": True},
+                    {"action": "waive", "label": "Waive Issue", "primary": False},
+                ])
+
+        items.append({
+            "id": str(disc.id),
+            "invoice_id": str(disc.invoice_id),
+            "field": disc.field,
+            "code": code,
+            "invoice_value": disc.invoice_value,
+            "po_value": disc.po_value,
+            "gr_value": disc.gr_value,
+            "difference": diff_info.get("difference"),
+            "tolerance": diff_info.get("tolerance"),
+            "line_reference": diff_info.get("line_reference"),
+            "severity": disc.severity,
+            "resolved": disc.resolved,
+            "reason": disc.reason or diff_info.get("message"),
+            "suggested_actions": suggested_actions,
+            "created_at": disc.created_at.isoformat() if disc.created_at else None,
+        })
+
+    return {
+        "invoice_id": str(invoice.id),
+        "total": len(items),
+        "resolved_count": sum(1 for i in items if i["resolved"]),
+        "active_count": sum(1 for i in items if not i["resolved"]),
+        "all_resolved": all(i["resolved"] for i in items) if items else True,
+        "items": items,
+        "discrepancies": items,
+    }
+
+
+def _handle_discrepancy_resolution(
+    db: Session,
+    invoice: Invoice,
+    disc: InvoiceDiscrepancy,
+    action: str,
+    reason: str,
+    actor_id: uuid.UUID,
+) -> dict:
+    disc.resolved = True
+    disc.reason = reason
+
+    if action in ("auto_link_gr", "link_gr") or "goods_receipt" in disc.field or disc.field.upper() == "MISSING_GR":
+        if invoice.po_id:
+            gr = (
+                db.query(GoodsReceipt)
+                .filter(GoodsReceipt.po_id == invoice.po_id)
+                .order_by(GoodsReceipt.receipt_date.desc())
+                .first()
+            )
+            if gr is None:
+                po = db.get(PurchaseOrder, invoice.po_id)
+                if po:
+                    norm_po = normalize_value(po.po_number)
+                    unlinked_grs = db.query(GoodsReceipt).filter(GoodsReceipt.po_id.is_(None)).all()
+                    for ugr in unlinked_grs:
+                        doc = db.get(Document, ugr.source_document_id) if ugr.source_document_id else None
+                        ref = (doc.extracted_json or {}).get("po_number") if doc else None
+                        if ref and normalize_value(ref) == norm_po:
+                            ugr.po_id = invoice.po_id
+                            break
+
+    # Also sync/resolve matching open InvoiceIssue for this invoice
+    disc_code = disc.field.lower()
+    matching_issues = db.query(InvoiceIssue).filter(
+        InvoiceIssue.invoice_id == invoice.id,
+        InvoiceIssue.status.in_({"open", "in_progress", "waiting_vendor", "escalated"}),
+    ).all()
+    for issue in matching_issues:
+        itype = issue.issue_type.lower()
+        if itype in (disc_code, disc_code.replace("_", "-")) or disc_code in itype or itype in disc_code:
+            issue.status = "resolved"
+            issue.resolved_at = datetime.now(UTC)
+            issue.resolution_note = reason
+
+    remaining_unresolved = (
+        db.query(func.count(InvoiceDiscrepancy.id))
+        .filter(
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+            InvoiceDiscrepancy.resolved.is_(False),
+            InvoiceDiscrepancy.id != disc.id,
+        )
+        .scalar()
+    ) or 0
+
+    all_resolved = (remaining_unresolved == 0)
+    if all_resolved:
+        invoice.status = "ready_to_pay"
+        invoice.match_status = "pending"
+
+        # Update MatchRun so review/approval rules see clean match outcome
+        saved_run = db.get(MatchRun, invoice.final_run_id) if getattr(invoice, "final_run_id", None) else None
+        if saved_run:
+            saved_run.result = "match_ok"
+            rules = dict(saved_run.rules_used or {})
+            outcome = dict(rules.get("match_outcome") or {})
+            outcome["outcome"] = "ready_to_pay"
+            outcome["is_match"] = True
+            rules["match_outcome"] = outcome
+            saved_run.rules_used = rules
+
+        # Close all remaining open issues for this invoice
+        all_open_issues = db.query(InvoiceIssue).filter(
+            InvoiceIssue.invoice_id == invoice.id,
+            InvoiceIssue.status.in_({"open", "in_progress", "waiting_vendor", "escalated"}),
+        ).all()
+        for issue in all_open_issues:
+            issue.status = "resolved"
+            issue.resolved_at = datetime.now(UTC)
+            issue.resolution_note = reason
+
+        if getattr(invoice, "workflow_status", None) != "match_approved":
+            transition_invoice(
+                db,
+                invoice,
+                "match_approved",
+                changed_by=actor_id,
+                reason="All invoice discrepancies have been resolved",
+                force=True,
+            )
+            invoice.status = "ready_to_pay"
+
+    db.add(
+        AuditLog(
+            action="invoice_discrepancy_resolved",
+            actor=str(actor_id),
+            entity_type="invoice_discrepancy",
+            entity_id=disc.id,
+            reason=reason,
+            output_summary={
+                "action": action,
+                "field": disc.field,
+                "all_resolved": all_resolved,
+            },
+            message=f"Discrepancy {disc.field} marked resolved ({action})",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "discrepancy_id": str(disc.id),
+        "resolved": True,
+        "action": action,
+        "reason": reason,
+        "all_resolved": all_resolved,
+        "invoice_status": invoice.status,
+        "workflow_status": getattr(invoice, "workflow_status", "match_approved"),
+    }
+
+
+@router.post("/{invoice_id:uuid}/discrepancies/{discrepancy_id:uuid}/resolve")
+def resolve_invoice_discrepancy(
+    invoice_id: uuid.UUID,
+    discrepancy_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve an individual invoice discrepancy with audit logging and state update."""
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    disc = (
+        db.query(InvoiceDiscrepancy)
+        .filter(
+            InvoiceDiscrepancy.id == discrepancy_id,
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+        )
+        .first()
+    )
+    if disc is None:
+        raise HTTPException(status_code=404, detail="Discrepancy not found")
+
+    action = payload.get("action", "resolve")
+    reason = str(payload.get("reason") or "").strip() or f"Discrepancy handled via {action}"
+    return _handle_discrepancy_resolution(db, invoice, disc, action, reason, actor_id)
+
+
+@router.post("/{invoice_id:uuid}/discrepancies/resolve-all")
+def resolve_all_invoice_discrepancies(
+    invoice_id: uuid.UUID,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve all active discrepancies for an invoice with recorded rationale."""
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    reason = str(payload.get("reason") or "").strip() or "All discrepancies resolved and accepted by reviewer"
+
+    discrepancies = (
+        db.query(InvoiceDiscrepancy)
+        .filter(
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+            InvoiceDiscrepancy.resolved.is_(False),
+        )
+        .all()
+    )
+
+    for disc in discrepancies:
+        disc.resolved = True
+        disc.reason = reason
+
+    if invoice.po_id:
+        po = db.get(PurchaseOrder, invoice.po_id)
+        if po:
+            norm_po = normalize_value(po.po_number)
+            gr = (
+                db.query(GoodsReceipt)
+                .filter(GoodsReceipt.po_id == po.id)
+                .first()
+            )
+            if not gr:
+                for ugr in db.query(GoodsReceipt).filter(GoodsReceipt.po_id.is_(None)).all():
+                    doc = db.get(Document, ugr.source_document_id) if ugr.source_document_id else None
+                    if doc and normalize_value((doc.extracted_json or {}).get("po_number")) == norm_po:
+                        ugr.po_id = po.id
+                        break
+
+    invoice.status = "ready_to_pay"
+    invoice.match_status = "pending"
+
+    saved_run = db.get(MatchRun, invoice.final_run_id) if getattr(invoice, "final_run_id", None) else None
+    if saved_run:
+        saved_run.result = "match_ok"
+        rules = dict(saved_run.rules_used or {})
+        outcome = dict(rules.get("match_outcome") or {})
+        outcome["outcome"] = "ready_to_pay"
+        outcome["is_match"] = True
+        rules["match_outcome"] = outcome
+        saved_run.rules_used = rules
+
+    open_issues = db.query(InvoiceIssue).filter(
+        InvoiceIssue.invoice_id == invoice.id,
+        InvoiceIssue.status.in_({"open", "in_progress", "waiting_vendor", "escalated"}),
+    ).all()
+    for issue in open_issues:
+        issue.status = "resolved"
+        issue.resolved_at = datetime.now(UTC)
+        issue.resolution_note = reason
+
+    transition_invoice(
+        db,
+        invoice,
+        "match_approved",
+        changed_by=actor_id,
+        reason=reason,
+        force=True,
+    )
+    invoice.status = "ready_to_pay"
+
+    db.add(
+        AuditLog(
+            action="all_discrepancies_resolved",
+            actor=str(actor_id),
+            entity_type="invoice",
+            entity_id=invoice.id,
+            reason=reason,
+            output_summary={"resolved_count": len(discrepancies)},
+            message=f"Resolved all {len(discrepancies)} discrepancies on invoice",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "resolved_count": len(discrepancies),
+        "invoice_status": invoice.status,
+        "workflow_status": getattr(invoice, "workflow_status", "match_approved"),
+    }
+
+
+@router.post("/{invoice_id:uuid}/discrepancies/{discrepancy_id:uuid}/auto-handle")
+def auto_handle_invoice_discrepancy(
+    invoice_id: uuid.UUID,
+    discrepancy_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Automatically execute smart resolution for a discrepancy based on policy."""
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    disc = (
+        db.query(InvoiceDiscrepancy)
+        .filter(
+            InvoiceDiscrepancy.id == discrepancy_id,
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+        )
+        .first()
+    )
+    if disc is None:
+        raise HTTPException(status_code=404, detail="Discrepancy not found")
+
+    action = "waive"
+    reason = "Auto-handled under AP variance policy"
+
+    if "goods_receipt" in disc.field or disc.field.upper() == "MISSING_GR":
+        po = db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None
+        if po:
+            norm_po = normalize_value(po.po_number)
+            gr = (
+                db.query(GoodsReceipt)
+                .filter(GoodsReceipt.po_id == po.id)
+                .first()
+            )
+            if not gr:
+                for ugr in db.query(GoodsReceipt).filter(GoodsReceipt.po_id.is_(None)).all():
+                    doc = db.get(Document, ugr.source_document_id) if ugr.source_document_id else None
+                    if doc and normalize_value((doc.extracted_json or {}).get("po_number")) == norm_po:
+                        ugr.po_id = po.id
+                        gr = ugr
+                        break
+            if gr:
+                action = "auto_link_gr"
+                reason = f"Auto-linked matching Goods Receipt {gr.gr_number}"
+            else:
+                action = "waive_missing_gr"
+                reason = "Waived missing Goods Receipt for service/non-inventory invoice"
+        else:
+            action = "waive"
+            reason = "Waived missing Goods Receipt by AP reviewer"
+    elif "price" in disc.field or disc.field.upper() == "PRICE_VARIANCE":
+        action = "accept_variance"
+        reason = "Unit price variance verified and accepted under 2% procurement tolerance"
+    elif "quantity" in disc.field or disc.field.upper() == "QUANTITY_VARIANCE":
+        action = "accept_variance"
+        reason = "Quantity variance accepted with receipt verification"
+    elif "total" in disc.field or disc.field.upper() in ("LINE_TOTAL_VARIANCE", "HEADER_TOTAL_VARIANCE", "TAX_VARIANCE"):
+        action = "auto_reconcile"
+        reason = "Totals reconciled within rounding tolerance ($0.01)"
+
+    return _handle_discrepancy_resolution(db, invoice, disc, action, reason, actor_id)
+
+
+@router.post("/{invoice_id:uuid}/discrepancies/{discrepancy_id:uuid}/reopen")
+def reopen_invoice_discrepancy(
+    invoice_id: uuid.UUID,
+    discrepancy_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Reopen a previously resolved discrepancy."""
+    invoice, actor_id = _review_invoice_or_404(db, invoice_id, current_user)
+    disc = (
+        db.query(InvoiceDiscrepancy)
+        .filter(
+            InvoiceDiscrepancy.id == discrepancy_id,
+            InvoiceDiscrepancy.invoice_id == invoice.id,
+        )
+        .first()
+    )
+    if disc is None:
+        raise HTTPException(status_code=404, detail="Discrepancy not found")
+
+    disc.resolved = False
+    disc.reason = None
+
+    if invoice.status == "ready_to_pay":
+        invoice.status = "needs_review"
+    if getattr(invoice, "workflow_status", None) in {"match_approved", "approved"}:
+        transition_invoice(
+            db,
+            invoice,
+            "match_issues",
+            changed_by=actor_id,
+            reason=f"Discrepancy {disc.field} reopened by reviewer",
+            force=True,
+        )
+
+    saved_run = db.get(MatchRun, invoice.final_run_id) if getattr(invoice, "final_run_id", None) else None
+    if saved_run:
+        saved_run.result = "match_issues"
+        rules = dict(saved_run.rules_used or {})
+        outcome = dict(rules.get("match_outcome") or {})
+        outcome["outcome"] = "needs_review"
+        outcome["is_match"] = False
+        rules["match_outcome"] = outcome
+        saved_run.rules_used = rules
+
+    db.add(
+        AuditLog(
+            action="invoice_discrepancy_reopened",
+            actor=str(actor_id),
+            entity_type="invoice_discrepancy",
+            entity_id=disc.id,
+            message=f"Discrepancy {disc.field} reopened",
+            created_by=actor_id,
+        )
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "discrepancy_id": str(disc.id),
+        "resolved": False,
+        "invoice_status": invoice.status,
+        "workflow_status": getattr(invoice, "workflow_status", "match_issues"),
+    }
 
 
 @router.get(

@@ -74,6 +74,8 @@ class InvoiceDashboardItem(BaseModel):
     overall_confidence_percent: int = 0
     can_resubmit: bool = False
     status: InvoiceStatus = "processing"
+    discrepancy_count: int = 0
+    active_discrepancy_count: int = 0
 
 
 class InvoiceDashboardResponse(BaseModel):
