@@ -12,7 +12,31 @@ logger = logging.getLogger(__name__)
 
 # API endpoints
 OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+DEFAULT_EXTRACTION_FALLBACK_MODELS = [
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "meta-llama/llama-3.3-70b-instruct",
+    "mistralai/mistral-small-24b-instruct-2501",
+    "qwen/qwen-2.5-72b-instruct",
+]
+
+
+def _is_openrouter_model(model: str) -> bool:
+    if model.startswith("openrouter/"):
+        return True
+    openrouter_vendors = (
+        "meta-llama/",
+        "mistralai/",
+        "google/",
+        "deepseek/",
+        "anthropic/",
+        "qwen/qwen-2.5-",
+        "openai/gpt-4",
+    )
+    return any(model.startswith(v) for v in openrouter_vendors)
 
 DOCUMENT_TYPES = {"invoice", "po", "goods_receipt", "other"}
 _E2E_PAYLOAD_PATTERN = re.compile(
@@ -172,16 +196,33 @@ def _groq_extract(
     doc_type: str,
     api_key: str,
     model: str,
+    openrouter_api_key: str = "",
 ) -> dict[str, Any]:
-    """Extract structured document fields using a Groq model."""
+    """Extract structured document fields using a Groq or OpenRouter model."""
+    endpoint = GROQ_API_URL
+    auth_key = api_key
+    target_model = model
+
+    if model.startswith("openrouter/"):
+        target_model = model.removeprefix("openrouter/")
+        endpoint = OPENROUTER_CHAT_URL
+        auth_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "") or api_key
+    elif model.startswith("groq/"):
+        target_model = model.removeprefix("groq/")
+        endpoint = GROQ_API_URL
+        auth_key = api_key
+    elif _is_openrouter_model(model):
+        endpoint = OPENROUTER_CHAT_URL
+        auth_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "") or api_key
+
     response = httpx.post(
-        GROQ_API_URL,
+        endpoint,
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {auth_key}",
             "Content-Type": "application/json",
         },
         json={
-            "model": model,
+            "model": target_model,
             "temperature": 0,
             "messages": [
                 {
@@ -224,10 +265,10 @@ def _groq_extract(
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("Groq returned an unexpected response structure") from exc
+        raise ValueError("LLM returned an unexpected response structure") from exc
 
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("Groq returned empty extraction content")
+        raise ValueError("LLM returned empty extraction content")
 
     content = content.strip()
 
@@ -251,7 +292,7 @@ def _groq_extract(
     try:
         result: Any = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError("Groq returned invalid JSON extraction content") from exc
+        raise ValueError("LLM returned invalid JSON extraction content") from exc
 
     if not isinstance(result, dict):
         raise ValueError("Extractor did not return a JSON object")
@@ -263,7 +304,7 @@ def extract_document(
     raw_text: str,
     doc_type: str,
 ) -> dict[str, Any]:
-    """Extract document fields with primary and fallback Groq models."""
+    """Extract document fields with primary and 5 fallback models across Groq and OpenRouter."""
     if _e2e_mock_enabled():
         payload = _e2e_payload(raw_text)
         payload_type = str(payload.get("document_type", "")).lower()
@@ -276,44 +317,79 @@ def extract_document(
         }
         return result
 
-    api_key = os.getenv("GROQ_API_KEY", "")
+    groq_api_key = os.getenv("GROQ_API_KEY", "")
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
     primary_model = os.getenv("GROQ_MODEL", "")
-    fallback_model = os.getenv("GROQ_FALLBACK_MODEL", "")
 
-    if not api_key:
+    if not groq_api_key and not openrouter_api_key:
         raise ValueError("GROQ_API_KEY is not configured")
 
     if not primary_model:
         raise ValueError("GROQ_MODEL is not configured")
 
+    raw_fallbacks = os.getenv("EXTRACTION_FALLBACK_MODELS") or os.getenv("GROQ_FALLBACK_MODELS")
+    if raw_fallbacks:
+        fallback_models = [m.strip() for m in raw_fallbacks.split(",") if m.strip()]
+    else:
+        single_fallback = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
+        if single_fallback and single_fallback not in ("openai/gpt-oss-20b", ""):
+            fallback_models = [single_fallback]
+        elif single_fallback:
+            fallback_models = [single_fallback] + [
+                m for m in DEFAULT_EXTRACTION_FALLBACK_MODELS if m != single_fallback
+            ]
+        else:
+            fallback_models = list(DEFAULT_EXTRACTION_FALLBACK_MODELS)
+
+    # 1. Attempt primary model
     try:
         return _groq_extract(
             raw_text,
             doc_type,
-            api_key,
+            groq_api_key,
             primary_model,
+            openrouter_api_key=openrouter_api_key,
         )
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Primary extraction failed using model %s",
+            "Primary extraction failed using model %s: %s",
             primary_model,
+            exc,
             exc_info=True,
         )
 
-        if not fallback_model or fallback_model == primary_model:
+        if not fallback_models:
             raise
 
-    logger.info(
-        "Retrying extraction with fallback model %s",
-        fallback_model,
-    )
+    # 2. Iterate through fallback models
+    last_exc = None
+    for fallback_model in fallback_models:
+        if not fallback_model or fallback_model == primary_model:
+            continue
+        logger.info(
+            "Retrying extraction with fallback model %s",
+            fallback_model,
+        )
+        try:
+            return _groq_extract(
+                raw_text,
+                doc_type,
+                groq_api_key,
+                fallback_model,
+                openrouter_api_key=openrouter_api_key,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Fallback extraction failed using model %s: %s",
+                fallback_model,
+                exc,
+                exc_info=True,
+            )
 
-    return _groq_extract(
-        raw_text,
-        doc_type,
-        api_key,
-        fallback_model,
-    )
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("All extraction models failed")
 
 
 def _to_decimal(value: Any) -> Decimal | None:

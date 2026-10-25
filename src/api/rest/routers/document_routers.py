@@ -1686,6 +1686,16 @@ def _save_goods_receipt_from_extraction(
     db.flush()
     if po is not None:
         _rematch_waiting_invoices_for_po(db, po)
+    else:
+        raw_po_ref = data.get("po_number") or data.get("order_number")
+        if raw_po_ref:
+            matched_po = db.query(PurchaseOrder).filter(
+                func.lower(func.trim(PurchaseOrder.po_number)) == _normalize_invoice_value(raw_po_ref),
+                PurchaseOrder.is_current.is_(True),
+            ).first()
+            if matched_po:
+                receipt.po_id = matched_po.id
+                _rematch_waiting_invoices_for_po(db, matched_po)
 
 
 def _is_invoice_version_conflict(exc: IntegrityError) -> bool:
@@ -1744,9 +1754,13 @@ def _rematch_waiting_invoices_for_po(
             for item in saved_outcome.get("discrepancies", [])
             if isinstance(item, dict)
         }
-        if invoice.match_status != "waiting_for_po" and not saved_codes.intersection(
-            {"MISSING_PO", "MISSING_GR"}
-        ):
+        should_rematch = (
+            invoice.match_status == "waiting_for_po"
+            or invoice.po_id is None
+            or prior_run is None
+            or bool(saved_codes.intersection({"MISSING_PO", "MISSING_GR"}))
+        )
+        if not should_rematch:
             continue
         invoice.po_id = po.id
         if getattr(invoice, "id", None):
@@ -2621,30 +2635,30 @@ def parse_document(
                         db, saved_invoice, validation_issues
                     )
                     saved_invoice.status = "needs_review"
-                if saved_invoice is not None and requires_verification(
-                    getattr(saved_invoice, "field_confidence", None) or {}
-                ):
-                    if legacy_workflow_status(saved_invoice) != "verifying":
-                        transition_invoice(
-                            db,
-                            saved_invoice,
-                            "verifying",
-                            reason=(
-                                "Confidence unavailable, please verify"
-                                if confidence_unavailable(
-                                    getattr(saved_invoice, "field_confidence", None)
-                                    or {}
-                                )
-                                else (
-                                    "One or more extracted fields need associate "
-                                    "verification"
-                                )
-                            ),
-                        )
-                elif saved_invoice is not None:
+                if saved_invoice is not None:
                     run_match_for_invoice(
-                        db, saved_invoice.id, getattr(document, "created_by", None)
+                        db, saved_invoice.id, getattr(document, "created_by", None), force=True
                     )
+                    if requires_verification(
+                        getattr(saved_invoice, "field_confidence", None) or {}
+                    ):
+                        if legacy_workflow_status(saved_invoice) not in {"verifying", "match_approved", "ready_to_pay"}:
+                            transition_invoice(
+                                db,
+                                saved_invoice,
+                                "verifying",
+                                reason=(
+                                    "Confidence unavailable, please verify"
+                                    if confidence_unavailable(
+                                        getattr(saved_invoice, "field_confidence", None)
+                                        or {}
+                                    )
+                                    else (
+                                        "One or more extracted fields need associate "
+                                        "verification"
+                                    )
+                                ),
+                            )
 
             except IntegrityError as exc:
                 if not _is_invoice_version_conflict(exc):

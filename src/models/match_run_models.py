@@ -26,7 +26,14 @@ class MatchRun(Base):
         ForeignKey("purchase_orders.id"),
     )
     result = mapped_column(
-        ENUM(name="match_result", schema="core", create_type=False),
+        ENUM(
+            "match_ok",
+            "match_issues",
+            "no_match",
+            name="match_result",
+            schema="core",
+            create_type=False,
+        ),
         nullable=False,
     )
     exchange_rate_id: Mapped[uuid.UUID | None] = mapped_column(

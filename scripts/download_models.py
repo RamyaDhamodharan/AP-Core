@@ -29,11 +29,17 @@ def main() -> None:
     logger.info("Downloading Docling models to %s", artifacts_path)
 
     from docling.utils.model_downloader import download_models
+    from docling.models.stages.ocr.rapid_ocr_model import RapidOcrModel
 
     delays = (5, 15, 45, 90)
     for attempt in range(len(delays) + 1):
         try:
             download_models(output_dir=artifacts_path, progress=True)
+            RapidOcrModel.download_models(
+                backend="onnxruntime",
+                local_dir=artifacts_path / "RapidOcr",
+                progress=True,
+            )
             logger.info("Docling model download finished")
             return
         except Exception as exc:
